@@ -133,4 +133,7 @@
                               :executable t
                               :toplevel (lambda ()
                                           (with-simple-restart (abort "Exit cl-harness (aborted)")
-                                            (start-harness nil))))))
+                                            (let ((args (rest sb-ext:*posix-argv*)))
+                                              (if args
+                                                  (run-one-shot (format nil "~{~A~^ ~}" args) nil)
+                                                  (start-harness nil))))))))

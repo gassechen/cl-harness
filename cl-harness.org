@@ -481,27 +481,45 @@ SBCL ni dependencias (equipos donde no se compilan Lisp fácilmente).
 Arranque directo con SBCL + Quicklisp (sin banner ni warnings de cargado; el
 proyecto se encuentra vía =~/quicklisp/local-projects/=):
 
+- **Modo TUI interactivo** (como =opencode=):
+
 #+begin_src shell
 ./run.sh
 #+end_src
 
-Equivale a:
+- **Modo no interactivo, un turno** (como =opencode run "..."=): procesa el
+  mensaje, ejecuta herramientas si el modelo las pide, imprime la respuesta,
+  salva la sesión y sale. Código de salida 0 = OK, 1 = fallo de LLM:
+
+#+begin_src shell
+./run.sh run "verifica bla bla bla"
+#+end_src
+
+- **Config alternativo** (p. ej. endpoint/offline) vía entorno:
+
+#+begin_src shell
+CL_HARNESS_CONFIG=/ruta/config.json ./run.sh run "mensaje"
+#+end_src
+
+=run.sh= equivale a:
 
 #+begin_src shell
 sbcl --noinform --non-interactive \
      --eval '(ql:quickload :cl-harness)' \
-     --eval '(cl-harness:start-harness)'
+     --eval '(cl-harness:start-harness)'        # TUI
+     --eval '(cl-harness:run-one-shot "...")'   # one-shot
 #+end_src
 
 El =--noinform= suprime el banner de SBCL; =ql:quickload= carga cl-harness con
 su propio ASDF (así no se redefine UIOP/ASDF del sistema, que es lo que ensucia
 el arranque con =(require :asdf)=).
 
-O cargar la imagen ejecutable para retomar una sesión directamente (arranque
-tool-agnóstico, la sesión vive en la imagen):
+La imagen ejecutable además acepta los mismos dos modos sobre la sesión que lleva
+en memoria (sin reset):
 
 #+begin_src shell
-./dumps/session-XXXX.core
+./dumps/session-XXXX.core                     # TUI, retoma la sesión
+./dumps/session-XXXX.core "verifica bla bla"  # one-shot, continúa la sesión
 #+end_src
 
 * Referencias
