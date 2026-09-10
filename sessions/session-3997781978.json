@@ -1,0 +1,1 @@
+{"session-id":"session-3997781978","timestamp":3997781978,"facts":[{"type":"command-exec","timestamp":3997781978,"data":{"command":"uname -a","output":"Linux mtk.org 6.18.36 #1 SMP PREEMPT_DYNAMIC Fri Jun 19 17:38:09 CDT 2026 x86_64 Intel(R) Core(TM) i5-8400 CPU @ 2.80GHz GenuineIntel GNU/Linux\n","exit-code":0}}]}

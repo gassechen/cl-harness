@@ -1,0 +1,8 @@
+{
+  "llm_provider": "gemini",
+  "llm_api_key": "TU_GOOGLE_API_KEY",
+  "llm_model": "gemini-3.6-flash",
+  "max_context_facts": 50,
+  "fact_ttl_seconds": 300,
+  "max_facts_per_type": 10
+}

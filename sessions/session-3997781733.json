@@ -1,0 +1,1 @@
+{"session-id":"session-3997781733","timestamp":3997781733,"facts":[{"type":"file-write","timestamp":3997781733,"data":{"path":"/tmp/persist-test.txt","bytes":9}},{"type":"command-exec","timestamp":3997781733,"data":{"command":"echo persist-test","output":"persist-test\n","exit-code":0}}]}

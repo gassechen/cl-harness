@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# cl-harness — Context Management Harness CLI
+# Usage: cl-harness run
+
+SBCL="${SBCL:-sbcl}"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+case "${1:-}" in
+  run)
+    exec "$SBCL" --noinform --load "$HOME/quicklisp/setup.lisp" \
+      --eval '(ql:quickload :cl-harness)' \
+      --eval '(cl-harness:main)' \
+      --end-toplevel-options "$@"
+    ;;
+  version)
+    echo "cl-harness 0.1.0"
+    ;;
+  help|--help|-h)
+    echo "Usage: cl-harness run"
+    echo ""
+    echo "Commands:"
+    echo "  run      Start the interactive harness REPL"
+    echo "  version  Show version"
+    ;;
+  *)
+    echo "Unknown command: ${1:-}"
+    echo "Run 'cl-harness help' for usage."
+    exit 1
+    ;;
+esac

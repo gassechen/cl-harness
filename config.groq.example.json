@@ -1,0 +1,9 @@
+{
+  "llm_provider": "groq",
+  "llm_api_key": "TU_GROQ_API_KEY",
+  "llm_model": "llama-3.1-70b-versatile",
+  "max_context_facts": 50,
+  "fact_ttl_seconds": 300,
+  "max_facts_per_type": 10,
+  "llm_endpoint": "https://api.groq.com/openai/v1/chat/completions"
+}
