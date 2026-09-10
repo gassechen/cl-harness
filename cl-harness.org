@@ -1,0 +1,484 @@
+#+TITLE: cl-harness — Harness de Gestión de Contexto para LLMs
+#+AUTHOR: Proyecto cl-harness
+#+DATE: 2026-09-10
+#+OPTIONS: toc:2 num:t 2:t
+#+LANGUAGE: es
+
+#+begin_export html
+<h1 style="color:#444">cl-harness — Harness de Gestión de Contexto para LLMs</h1>
+#+end_export
+
+* Resumen ejecutivo
+
+**cl-harness** es un harness (armazón/andamiaje) de gestión de contexto para
+asistentes de código basados en LLM, escrito en Common Lisp. Combina un motor de
+producciones *Rete* (la librería [[https://github.com/ldotlisa/Lisa][Lisa]]) con llamadas a proveedores de LLM
+(OpenRouter, Anthropic, OpenAI, Gemini, Groq, Ollama) para decidir, *por turno*,
+qué hechos técnicos se envían al modelo y cuáles se descartan.
+
+Su tesis central es:
+
+> El contexto no se redacta, se *podría*. El costo y el ruido se controlan no
+> resumiendo mejor, sino decidiendo estructuralmente qué hechos son lo
+> suficientemente recientes, repetidos, causales o relevantes como para merecer
+> el presupuesto de tokens.
+
+El resultado medido es una reducción de ~95 % del contexto con respecto a la
+línea base ingenua (todos los hechos verbatim), sin degradar la capacidad del
+LLM de resolver tareas reales, y con persistencia de sesión doble: un *dump*
+legible en disco y un ejecutable ELF standalone que lleva la sesión viva dentro
+de la imagen SBCL.
+
+**Palabras clave:** memoria de sesión, pruning de contexto, Rete/Lisa, tool-use,
+compaction por epochs, persistencia dual, métricas de reducción.
+
+* ¿Qué es este proyecto?
+
+*cl-harness* es un *REPL* interactivo y una librería ASDF. Como REPL, recibe
+instrucciones del usuario, mantiene un estado estructurado (hechos en la memoria
+de trabajo de un motor Rete), construye un bloque de contexto en YAML, lo envía
+a un LLM con herramientas disponibles, ejecuta las herramientas que el modelo
+pida, y registra el resultado todo en la memoria de hechos.
+
+Ejemplo de sesión:
+
+#+begin_example
+╔══════════════════════════════════════════╗
+║  cl-harness — Context Management Harness  ║
+║  Lisa/Rete + LLM · v0.1.0                 ║
+╚══════════════════════════════════════════╝
+Session: session-1893450568
+LLM:     openrouter (cohere/north-mini-code:free)
+TTL:     300 sec · Max facts: 50 · Per-type: 10
+Type :help for commands, :quit to exit.
+
+user> lista los archivos de src
+assistant> [sintetiza usando exec_command + facts de contexto]
+#+end_example
+
+* ¿Por qué existe? (Motivación)
+
+Un harness de LLM "ingenuo" acumula todo lo que ocurre y lo pega verbatim en el
+prompt. A medida que la sesión crece, esto presenta varios problemas:
+
+1. **Costo y latencia**: el costo del prompt crece con el contexto; a partir de
+   cierto tamaño, el retorno marginal es negativo.
+2. **Ruido y deriva**: hechos viejos e irrelevantes compiten por atención con
+   los actuales y degradan la precisión.
+3. **Olvido real**: sin persistencia, un reinicio del proceso pierde todo el
+   estado de la sesión.
+4. **Falta de causalidad**: un contexto plano de "toda la salida" no distingue
+   qué tarea generó qué resultado.
+
+La respuesta de *cl-harness* es gestionar el contexto como una *base de
+conocimiento temporal y causal*:
+
+- **Hechos** atómicos tipados (comandos ejecutados, archivos leídos/escritos,
+  conversación, errores, objetivos/todos, epochs).
+- **Metadatos causales** por turno (*turn-id*, *parent-id*) que registran en qué
+  punto de la conversación se produjo cada hecho.
+- **Reglas Rete** que podan por expiración y deduplicación.
+- **Compartimentación por epochs** (inspirada en
+  *session_context_epoch* de OpenCode) que consolida el historial.
+- **Selección por scoring** estructural+semántico dentro de un presupuesto.
+- **Métricas** que miden la reducción real frente a la línea base.
+
+El resultado es una memoria de trabajo *gestionada*: caduca lo redundante,
+protege lo que no se puede volver a derivar (conversación, errores activos), y
+se promueve lo que el usuario repite o pregunta.
+
+* Arquitectura
+
+#+begin_src text
+                    ┌──────────────────────────────────────────────┐
+                    │                  REPL (repl.lisp)            │
+                    │  user>  ·  comandos : ·  process-turn        │
+                    └─────────────────┬────────────────────────────┘
+                                      │
+                    ┌─────────────────▼────────────────────────────┐
+                    │           process-turn (por turno)           │
+                    │  1. incf *turn-counter*                      │
+                    │  2. assertf hechos (user-input, tool, ...)   │
+                    │  3. snapshot línea base "naive"              │
+                    │  4. build-yaml-context → YAML                │
+                    │  5. call-llm (con tool-use)                  │
+                    │  6. assertf respuesta + métricas             │
+                    └───────┬──────────────────────┬───────────────┘
+                            │                      │
+        ┌───────────────────▼────┐      ┌──────────▼───────────────┐
+        │ Motor Rete (Lisa)      │      │ Llamadas HTTP (llm.lisp) │
+        │ rules.lisp:            │      │ openrouter / openai      │
+        │  prune-expired (TTL)   │      │ anthropic / gemini       │
+        │  dedup-keep-newest     │      │ groq / ollama            │
+        │  prune-superseded-…    │      │  5 iteraciones tool-use  │
+        │ context.lisp:          │      └──────────────────────────┘
+        │  caps por tipo         │
+        │  scoring + selección   │
+        └──────────┬─────────────┘
+                   │
+        ┌──────────▼─────────────────────────────────────────────┐
+        │ Persistencia (persist.lisp)                            │
+        │  dumps/<id>-facts.lisp · sessions/<id>.json            │
+        │  metrics/<id>-metrics.json · <id>.core (ELF standalone)│
+        └────────────────────────────────────────────────────────┘
+#+end_src
+
+** Módulos
+
+| Archivo             | Responsabilidad                                                              |
+|---------------------+-----------------------------------------------------------------------------|
+| =packages.lisp=     | Definición del paquete =:cl-harness=                                          |
+| =config.lisp=       | Carga de =config.json= + valores por defecto + accesores                        |
+| =facts.lisp=        | Templates Lisa (`harness-fact`, `context-slot`), objetivos/todos, epochs, helpers |
+| =rules.lisp=        | Reglas Rete (TTL, dedup, epoch) + helpers de pruning imperativo                  |
+| =context.lisp=      | Render YAML, scoring de relevancia, selección por presupuesto                    |
+| =metrics.lisp=      | Métricas por turno: contexto curado vs naive vs uso real                         |
+| =actions.lisp=      | Primitivas POSIX: =exec-command=, =read-file=, =write-file= → hechos             |
+| =llm.lisp=          | Clientes de proveedores + loop de tool-use                                        |
+| =persist.lisp=      | Dump/restore (Lisp+JSON+metrics) y creación de imagen ejecutable                 |
+| =repl.lisp=         | Loop REPL, comandos =:=, =process-turn=, =start-harness=                         |
+| =main.lisp=         | Punto de entrada =cl-harness:main=                                                 |
+
+Dependencias ASDF: =lisa=, =dexador=, =com.inuoe.jzon=, =bordeaux-threads=,
+=cl-ppcre=, =uiop= (véase =cl-harness.asd=).
+
+* Cómo funciona
+
+** 1. Ingestión de hechos
+
+Todo lo que ocurre se registra como un hecho. Hay dos templates Lisa:
+
+#+begin_src lisp
+(deftemplate harness-fact ()
+  (slot fact-type)
+  (slot timestamp)
+  (slot data))
+#+end_src
+
+Donde =data= es un plist con el payload y los metadatos causales *dentro* del
+plist (no como slots del template), de modo que persistencia, dedup y render
+YAML no necesitan cambios si se agrega metadato:
+
+#+begin_src lisp
+(assert (harness-fact (fact-type "command-exec")
+                      (timestamp (get-universal-time))
+                      (data (list :command cmd :output out :exit-code 0
+                                  :turn-id n :parent-id n))))
+#+end_src
+
+**Tipos de hecho**
+
+| Tipo             | Semántica                              | ¿Caduca? (TTL)      |
+|------------------+----------------------------------------+---------------------|
+| =user-input=     | Mensaje del usuario                    | Nunca               |
+| =llm-response=   | Respuesta del LLM                      | Nunca               |
+| =command-exec=   | Resultado de un comando (exit+output)  | Sí, salvo exit ≠ 0  |
+| =file-read=      | Contenido de un archivo leído          | Sí                  |
+| =file-write=     | Archivo escrito (bytes)                | Sí                  |
+| =agent-todo=     | Objetivo/todo (backward-chaining)      | No (ciclo de vida: pending→completed) |
+| =context-epoch=  | Checkpoint de consolidación            | 1 activo (se reemplaza)               |
+
+Los hechos evocables (evidentials: =command-exec=, =file-read=, =file-write=)
+son *re-derivables*: si caducan, el agente puede volver a ejecutarlos. La
+conversación no es re-derivable y por eso nunca caduca por TTL.
+
+** 2. Reglas Rete (podado)
+
+Se definen tres reglas en *rules.lisp*; dos con salience negativo para que
+corran después del resto del motor:
+
+- **=prune-expired=** (salience -50): retracta hechos evidenciales que cumplen
+  =fact-expired-p=:
+  - comandos con *exit ≠ 0 se conservan siempre* (contexto de error activo);
+  - decaimiento lógico por turnos: caducan si pasaron más de =fact_ttl_turns=
+    turnos desde su *turn-id*;
+  - decaimiento por reloj si =fact_ttl_seconds> 0= (lo configura =config.json=).
+- **=dedup-keep-newest=**: si dos hechos del mismo tipo tienen la misma clave
+  estructural (comando, ruta) *y* el mismo output/exit (o mismo contenido en
+  file-read), el más viejo es redundante y se retracta. Si el output cambió,
+  ambos se conservan (refleja mutación de estado).
+- **=prune-superseded-by-epoch=** (salience -40): si hay un *epoch* activo con
+  *baseline-seq*, se retractan los hechos evidenciales con *turn-id < baseline*,
+  porque el resumen del epoch los consolida (inspirado en
+  *session_context_epoch* de OpenCode).
+
+Además, =build-yaml-context= aplica *caps imperativos por tipo*
+(=retract-oldest-of-type=) para conversación y evidenciales, protegiendo
+siempre a los comandos fallidos.
+
+** 3. Selección por scoring (presupuesto)
+
+Tras el podado, =select-relevant-facts= puntúa cada hecho restante dentro de un
+presupuesto (=max_context_chars=) y un tope (=max_context_facts=). El scoring
+tiene seis términos:
+
+1. *Proximidad al turno actual*: decaimiento exponencial según |turn-id − now|
+   (distancia lógica, no segundos de reloj).
+2. *Garantía de conversación*: =user-input= y =llm-response= reciben bonificación
+   fija (300) para preservar el hilo del diálogo.
+3. *Priorización de errores*: un comando fallido suma 400 (contexto crítico).
+4. *Repetición*: una clave de dedup vista varias veces suma hasta 200 (releer /
+   re-ejecutar lo mismo indica relevancia).
+5. *Coincidencia semántica*: contra palabras clave extraídas del prompt del
+   usuario (stopwords en ES/EN), con 450/400 para la ruta/comando y hasta 320
+   para contenido.
+6. *Dependencia causal*: un *parent-id* presente suma 50 (parte de una cadena).
+
+La idea central del diseño: **Rete decide estructura** (tiempo, repetición,
+dependencia) y **deja el significado al LLM**. La selección *nunca degrada* el
+payload de un hecho que se selecciona: se emite íntegro, salvo un recorte de
+cabeza/cola con aviso explícito para payloads gigantes (=truncate-payload=,
+=fact_ttl… =max_fact_payload_chars=), para que un archivo enorme no devore el
+presupuesto.
+
+** 4. Render YAML agrupado
+
+=grouped-context-string= renderiza el resultado agrupado por *turn-id* (grafo
+de conversación causal), con secciones de cabecera:
+
+#+begin_example
+context:
+  session: session-1893450568
+  epoch:
+    id: epoch-1
+    baseline_turn: 12
+    summary: "Consolidado: SO detectado, 30 líneas, error ls ..."
+  goals:
+    - id: todo-1
+      task: limpiar-tmp
+      status: pending
+      priority: normal
+  turns:
+    3:
+      exec: ls -la -> exit 0
+        output: total 40 ...
+      user: "¿qué SO corre?"
+    4:
+      assistant: "El sistema es Linux 6.18.36 ..."
+#+end_example
+
+Se aplica escaping YAML (=escape-yaml=) para valores con caracteres especiales.
+
+** 5. Loop de tool-use
+
+Los proveedores OpenAI-compatibles usan =call-llm-with-tools=, que hace hasta 5
+iteraciones: si el modelo responde con =tool_calls=, el harness ejecuta la
+herramienta, adjunta el resultado como mensaje de rol =tool= y re-llama. Las
+herramientas expuestas al modelo son:
+
+- =exec_command= (comando shell): delega en =exec-command= → registra hecho.
+- =read_file= (leer archivo): delega en =read-file= → registra hecho.
+- (=write-file= existe como función Lisp: =actions.lisp=, y como comando =:write=
+  del REPL, pero no se expone al loop de herramienta del modelo.)
+
+De este modo *toda* salida observable que el modelo ve pasa también por la
+memoria de hechos y alimenta el pruning de turnos futuros.
+
+** 6. Proveedores
+
+=call-llm= despacha por =llm_provider=:
+
+| Proveedor      | Función                         | Tool-use |
+|----------------+---------------------------------+----------|
+| =anthropic=    | =call-anthropic=                | No (texto) |
+| =ollama=       | =call-ollama= (local)           | No       |
+| =gemini=       | =call-gemini= (generateContent) | Texto (backend) |
+| openai-compat  | =call-llm-with-tools=           | Sí (loop de 5)  |
+| =openrouter=   | openai-compat                    | Sí       |
+| =groq=         | openai-compat                    | Sí       |
+
+Configuración vía =config.json= o variables de entorno
+(=LLM_PROVIDER=, =LLM_API_KEY=, =LLM_MODEL=, =LLM_ENDPOINT=). El proveedor por
+defecto es =anthropic= con =claude-sonnet-4-20250514=; el proyecto se validó con
+OpenRouter + =cohere/north-mini-code:free=.
+
+** 7. Métricas (medir antes de optimizar)
+
+Cada turno registra (=record-context-metrics=):
+
+- *Contexto curado*: caracteres/tokens de lo que realmente se envió (heurística
+  ~4 caracteres/token).
+- *Línea base naive*: snapshot de =naive-context-string= *antes* de que corran
+  las reglas (todos los hechos verbatim, sin TTL ni caps). Capturarla antes es
+  lo que hace que la reducción sea atribuible al pruning real.
+- *Uso real*: =prompt_tokens= / =completion_tokens= reportados por el proveedor
+  (fuente de verdad).
+
+=metrics-summary= imprime la tabla por turno y el total con
+*reduction_pct*; =metrics-to-json= lo vuelca a =metrics/<id>-metrics.json=.
+En las sesiones validadas la reducción fue de ~95 %.
+
+** 8. Persistencia dual
+
+- **=save-session=** escribe tres artefactos en disco:
+  - =dumps/<id>-facts.lisp=: formas Lisp que re-ejecutan los =assert= con
+    =timestamp (get-universal-time)= (los timestamps se *refrescan* al salvar,
+    para que el TTL por reloj no evictee hechos al restaurar sesiones viejas);
+  - =sessions/<id>.json=: estado interoperable (session-id, timestamp, hechos);
+  - =metrics/<id>-metrics.json=: métricas.
+- **=create-session-dump=** (=:dump=) genera un *ejecutable ELF standalone* con
+  =sb-ext:save-lisp-and-die =:executable t= y toplevel
+  =(start-harness nil)=: la sesión vive *dentro* de la imagen (memoria de
+  trabajo de Lisa + hechos), con =refresh-fact-timestamps= antes de salvar y un
+  restart =abort= en el toplevel (recomendación de la doc de SBCL). Este
+  binario corre sin =sbcl= y retoma el REPL con su estado. El dump en disco
+  queda como *fallback* ante imagen corrupta.
+- **=restore-session=** (=:restore ID=) carga un =dumps/<id>-facts.lisp= en el
+  paquete =:cl-harness= (fijando =*package*=, lo que evita fallos de
+  resolución de símbolos sin calificar) y actualiza =*session-id*= para que los
+  siguientes saves sigan usando el id restaurado.
+
+* Configuración
+
+El archivo =config.json= en la raíz del proyecto (secreto de API **no** incluido
+aquí; debe inyectarse por archivo o variable de entorno):
+
+#+begin_src json
+{
+  "llm_provider": "openrouter",
+  "llm_api_key": "<secreto — nunca documentar>",
+  "llm_model": "cohere/north-mini-code:free",
+  "llm_endpoint": "https://openrouter.ai/api/v1/chat/completions",
+  "max_context_facts": 50,
+  "fact_ttl_seconds": 300,
+  "max_facts_per_type": 10
+}
+#+end_src
+
+** Claves y valores por defecto
+
+| Clave                    | Default  | Significado                                             |
+|--------------------------+----------+---------------------------------------------------------|
+| =llm_provider=           | =anthropic= | Proveedor de LLM (openrouter/groq/gemini/ollama…)    |
+| =llm_api_key=            | env       | Key del proveedor                                       |
+| =llm_model=              | =claude-sonnet-4-20250514= | Modelo                          |
+| =llm_endpoint=           | autodetect | Endpoint override                                       |
+| =llm_max_tokens=         | 4000      | Tope de respuesta                                       |
+| =max_context_facts=      | 50        | Tope de hechos seleccionables por turno                 |
+| =fact_ttl_seconds=       | 1800      | TTL de reloj para evidenciales (0 = off)                |
+| =fact_ttl_turns=         | 10        | TTL lógico por turnos                                   |
+| =max_facts_per_type=     | 20        | Cap por tipo de hecho                                   |
+| =max_fact_payload_chars= | 2500      | Recorte de payloads gigantes                            |
+| =max_raw_chars=          | 500       | Cota de muestra "cruda"                                 |
+| =max_context_chars=      | 12000     | Presupuesto del bloque de contexto                      |
+| =sessions_dir=/=dumps_dir=/=metrics_dir= | subdirs del proyecto | Dónde persistir |
+
+* Comandos del REPL
+
+| Comando             | Acción                                                |
+|---------------------+-------------------------------------------------------|
+| =:help=             | Ayuda                                                  |
+| =:quit=             | Salva sesión y sale                                    |
+| =:debug=            | Alterna trazas de depuración                           |
+| =:facts=            | Lista hechos activos en Rete                          |
+| =:rules=            | Lista reglas cargadas                                  |
+| =:save=             | Dump Lisp + JSON + metrics                            |
+| =:restore ID=       | Restaura sesión                                       |
+| =:exec CMD=         | Ejecuta comando shell                                 |
+| =:read PATH=        | Lee archivo                                           |
+| =:write PATH=       | Escribe archivo (pide contenido)                       |
+| =:dump=             | Crea imagen ejecutable con el estado actual            |
+| =:clear=            | Vacía la memoria de hechos                            |
+| =:context=          | Muestra el YAML curado que se enviaría hoy             |
+| =:metrics=          | Muestra tabla de reducción por turno                   |
+| =:model NAME= / =:provider P= | Cambian modelo/proveedor en caliente          |
+
+* Detalles técnicos clave (y trampas del DSL Lisa)
+
+Durante la validación se corrigieron cuatro bugs reales, hoy documentados como
+conocimiento necesario del código:
+
+1. **Salience no es =declare=**: en Lisa la saliencia va en el *lambda-list* de
+   la regla: =(defrule name (:salience -50) ...)=. La forma
+   =(declare (salience -40))= dentro del cuerpo es inválida y las reglas
+   simplemente jamás disparaban.
+2. **Symbol desnudo = literal**: en un patrón de =assert=, =(id id)= guarda el
+   símbolo literal =ID=, no el valor de la variable. Para computar un valor se
+   necesita una expresión no trivial, p. ej. =(id (identity id))=.
+3. **Restore y TTL**: al restaurar sesiones viejas, el primer =run= purgaba los
+   evidenciales (dump con timestamps antiguos ante un TTL por reloj ahora
+   activo). Se resuelve refrescando timestamps en el dump.
+4. **Literal-symbol en retrieve**: patrones como =(id id)= en =retrieve= no
+   matchean nunca; se resuelve filtrando en Lisp puro (=find-todo-by-id=).
+
+Otros hechos operativos verificados:
+
+- =exec-command= usa =uiop:run-program= y registra siempre un hecho con
+  =:exit-code= (0 u ≠ 0). Los errores interactivos esperables de herramientas
+  (USB/sudo/password) son *expected behavior*, no fallos del harness.
+- El toplevel del core ejecutable no hace =restore= (la sesión ya vive en la
+  imagen; restaurar duplicaría hechos o invocaría funciones inexistentes).
+- =:compression= y =:purify= no aplican en esta build de SBCL (2.4.1 sin
+  =:SB-CORE-COMPRESSION=; gencgc hace de =purify= un no-op).
+- Costo local despreciable: ~4 ms construir contexto vs ≥1 s de llamada API
+  (~0.4 % del turno). El pruning Rete *es* la optimización de costos; no hay
+  caching ni cost-tracking por diseño.
+
+* Casos de uso
+
+** Depuración e inspección de sistemas con memoria de sesión
+Investigación de archivos, ejecución de comandos encadenados, error activo
+(comando fallido retenido), y retoma de la tarea entre reinicios de la imagen.
+
+** Codocencia y automatización de tareas largas
+Sesiones de múltiples turnos donde el LLM debe recordar que "ya leyó X",
+"detectó N líneas", "pendiente: limpiar-tmp", y continuar sin re-descubrir
+hechos (validado en vivo con epoch y restore→continue).
+
+** Validación de pruning y presupuesto de contexto
+Como banco de pruebas para comparar contexto curado vs naive y medir reducción
+reproducible por turno (métricas + reduction_pct).
+
+** Demostración de Rete/Lisa aplicado a sistemas LLM
+ejemplo funcional de forward-chaining (Lisa) sobre hechos tipados con TTL,
+dedup y compaction por epochs, integrado con tool-use real.
+
+** Imagen standalone portable
+Despliegue de un binario ELF que retoma una sesión congelada sin instalación de
+SBCL ni dependencias (equipos donde no se compilan Lisp fácilmente).
+
+* Limitaciones conocidas
+
+- Los proveedores no-OpenAI y Anthropic devuelven texto plano sin tool-use
+  (las herramientas se validan con openai-compat / OpenRouter).
+- La compresión de imagen y purify exigen features de SBCL ausentes en esta
+  build.
+- La selección por presupuesto usa heurística de caracteres/tokens (~4 chars);
+  solo el uso reportado por el proveedor es "verdad de tierra".
+- No implementa caching ni cost-tracking por turno (decisión de diseño).
+
+* Validación realizada (resumen)
+
+- *Offline (0 llamadas API)*: lifecycle completo de todos, TTL/dedup/epoch,
+  render YAML, restore, recuperación de imagen rota, benchmark de rendimiento.
+- *En vivo (OpenRouter, ~37 llamadas en ronda cerrada)*: análisis de un sistema
+  con anclas (Linux 6.18.36; =press-a.txt= con 30 líneas) + distractores,
+  epoch creado y confirmado por el LLM, error =ls /no_existe_zz= identificado,
+  compactación que retractó evidenciales < turno 3 en vivo, memoria post‑
+  compactación íntegra sin herramientas, y restore→continue que retomó SO, 30
+  líneas, error y todo pendiente.
+
+* Cómo ejecutar
+
+#+begin_src shell
+# desde el directorio del proyecto, con Quicklisp disponible
+sbcl --non-interactive --eval '(require :asdf)' \
+     --eval '(push #P"<ruta-a-quicklisp/local-projects/" asdf:*central-registry*)' \
+     --eval '(asdf:load-system :cl-harness)' \
+     --eval '(cl-harness:start)'
+#+end_src
+
+O cargar la imagen ejecutable para retomar una sesión:
+
+#+begin_src shell
+./dumps/session-XXXX.core
+#+end_src
+
+* Referencias
+
+- Lisa / Rete: =quicklisp/local-projects/Lisa= (motor de producciones; su
+  =preamble.lisp= arranca el motor automáticamente al cargar).
+- SBCL: =sb-ext:save-lisp-and-die=, =:executable t=, restart =abort=.
+- Inspiración: *session_context_epoch* y *goals/todos* de OpenCode; el patrón
+  *Means-Ends Analysis* de =examples/mab.lisp= de Lisa.
+- Ideario: "Phase 0 — measure before optimizing" (=metrics.lisp=).
