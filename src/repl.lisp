@@ -210,6 +210,26 @@ working context via structured facts. Help them with their task."))
       (format t "~&[DEBUG process-turn] response=~A~%" response))
     response))
 
+(defun run-one-shot (user-message &optional (reset-engine t))
+  "Non-interactive mode (opencode-run style): process a single turn and exit.
+   RESET-ENGINE T starts from an empty working memory (fresh process via
+   run.sh); NIL continues the session already living in a saved core image."
+  (load-config)
+  (when reset-engine
+    (reset))
+  (metrics-reset)
+  (let* ((system-prompt (load-system-prompt))
+         (response (or (process-turn user-message system-prompt)
+                       "[LLM ERROR] empty response")))
+    (format t "~&assistant> ~A~%" response)
+    (save-session)
+    (finish-output)
+    (sb-ext:exit :code (if (or (search "[LLM ERROR]" response :test #'char=)
+                               (search "[LLM API ERROR]" response :test #'char=)
+                               (search "[LLM JSON ERROR]" response :test #'char=))
+                           1
+                           0))))
+
 (defun start-harness (&optional (reset-engine t))
   "Start the interactive REPL loop.
    When RESET-ENGINE is NIL the current Rete state is kept (used when

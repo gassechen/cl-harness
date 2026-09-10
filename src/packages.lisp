@@ -12,6 +12,7 @@
     (:export
      ;; config
      #:*config*
+     #:*config-file*
      #:*session-id*
      #:load-config
      ;; debug
@@ -39,7 +40,8 @@
      #:save-session
      #:restore-session
      #:create-session-dump
-     ;; repl
-     #:start-harness
-     #:stop-harness
-     #:main))
+;; repl
+      #:start-harness
+      #:stop-harness
+      #:run-one-shot
+      #:main))
