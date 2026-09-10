@@ -414,6 +414,24 @@ Otros hechos operativos verificados:
   (~0.4 % del turno). El pruning Rete *es* la optimización de costos; no hay
   caching ni cost-tracking por diseño.
 
+* Seguridad (por diseño)
+
+La seguridad de *cl-harness* **no es responsabilidad del harness**: se delega
+por completo al sistema operativo. Cada agente corre bajo **un usuario Linux
+dedicado** (con su grupo, su home y sus buzones), provisionado externamente
+mediante Ansible. El OS es el que define el perímetro: qué usuario puede tocar
+qué archivos, qué procesos ejecuta y en qué entornos trabaja.
+
+Por eso *cl-harness* **no implementa seguridad "soft" propia**: ni pedidos de
+aprobación por herramienta, ni políticas de proveedor, ni sandbox interno. El
+harness confía en que el usuario del SO bajo el que corre *ya es* el control de
+acceso. Esta separación evita duplicar la seguridad: proteger de nuevo dentro
+del harness contra algo que el OS ya garantizó en el exterior.
+
+La documentación por lo tanto no promete permisos de ejecución, listas de
+proveedores permitidos ni mecanismos de aprobación: el que gobierna es el
+*hard user* del sistema.
+
 * Casos de uso
 
 ** Depuración e inspección de sistemas con memoria de sesión
@@ -460,15 +478,27 @@ SBCL ni dependencias (equipos donde no se compilan Lisp fácilmente).
 
 * Cómo ejecutar
 
+Arranque directo con SBCL + Quicklisp (sin banner ni warnings de cargado; el
+proyecto se encuentra vía =~/quicklisp/local-projects/=):
+
 #+begin_src shell
-# desde el directorio del proyecto, con Quicklisp disponible
-sbcl --non-interactive --eval '(require :asdf)' \
-     --eval '(push #P"<ruta-a-quicklisp/local-projects/" asdf:*central-registry*)' \
-     --eval '(asdf:load-system :cl-harness)' \
-     --eval '(cl-harness:start)'
+./run.sh
 #+end_src
 
-O cargar la imagen ejecutable para retomar una sesión:
+Equivale a:
+
+#+begin_src shell
+sbcl --noinform --non-interactive \
+     --eval '(ql:quickload :cl-harness)' \
+     --eval '(cl-harness:start-harness)'
+#+end_src
+
+El =--noinform= suprime el banner de SBCL; =ql:quickload= carga cl-harness con
+su propio ASDF (así no se redefine UIOP/ASDF del sistema, que es lo que ensucia
+el arranque con =(require :asdf)=).
+
+O cargar la imagen ejecutable para retomar una sesión directamente (arranque
+tool-agnóstico, la sesión vive en la imagen):
 
 #+begin_src shell
 ./dumps/session-XXXX.core

@@ -299,7 +299,9 @@
   (retract-oldest-of-type "file-write" (max-facts-per-type))
   ;; 3. Select the most relevant facts within budget, prioritizing user-message keywords
   (let* ((all-facts (collect-active-facts))
-         (now-turn (or (data-get (fact-data-of (car (last all-facts))) :turn-id)
+         (now-turn (if all-facts
+                       (or (data-get (fact-data-of (car (last all-facts))) :turn-id)
+                           0)
                        0)))
     (when *debug-mode*
       (format t "~&[DEBUG build-yaml-context] active-facts=~A now-turn=~A~%" (length all-facts) now-turn)
