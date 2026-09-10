@@ -432,6 +432,34 @@ La documentación por lo tanto no promete permisos de ejecución, listas de
 proveedores permitidos ni mecanismos de aprobación: el que gobierna es el
 *hard user* del sistema.
 
+* Lo que NO es / NO hace
+
+*cl-harness* es deliberadamente reducido. Resuelve una sola pieza — la gestión
+de contexto de una sesión de LLM (hechos, podado, selección, persistencia) —
+y delega el resto al sistema operativo y a la infraestructura. Marca sus
+fronteras frente a herramientas generalistas tipo opencode:
+
+| Capacidad (opencode)                    | En cl-harness | Por qué |
+|-----------------------------------------+---------------+---------|
+| Multi-agente / subagentes (=task=)      | NO | Un solo harness por proceso y por usuario Linux; no hay subagentes. |
+| Plan mode / build mode (modos)          | NO | Cada turno va directo: contexto → LLM → herramientas. No hay fase "plan" que restrinja cambios. |
+| Permisos por herramienta (allow/ask/deny) | NO | La frontera de confianza es el hard user del SO (ver "Seguridad (por diseño)"); el LLM usa tools sin aprobación dentro del perímetro OS. |
+| Políticas de proveedor (=provider.use=) | NO | Un proveedor por config, conmutable en caliente (=:model= /=:provider=), sin whitelist por política. |
+| Herramientas amplias (edit, MCP, GitHub, LSP, web) | NO | En el loop de tool-use solo se exponen =exec_command= y =read_file=; =write-file= existe como función/comando del REPL pero no se ofrece al modelo. |
+| Undo/redo de cambios + git diffs        | NO | No gestiona el working tree ni snapshots; solo ejecuta los comandos que el LLM elige. |
+| Compartir conversaciones (=/=share=)    | NO | Sin sharing ni enlaces públicos. |
+| Workspace multi-proyecto/multi-sesión navegable | NO | Una sesión activa por proceso; las viejas se retoman con restore/reboot. |
+| Event sourcing / historial de eventos   | NO | La memoria es la working memory de Rete (hechos), no un log de eventos. |
+| Transcripts navegables tipo chat        | NO | Persiste hechos crudos (dump =.lisp= /.json= + imagen), no transcripciones formateadas. |
+| Caching de respuestas                   | NO | Sin caché: el contexto se reconstruye por turno (el pruning Rete es la optimización). |
+| Cost-tracking por turno                 | NO | Solo métricas de reducción (curated vs naive); el uso real lo reporta el proveedor. |
+| SDK / servidor / plugins                | NO | Es una librería + REPL + binario standalone; no expone API para integraciones. |
+
+Esto no es una carencia: es el alcance. El resto lo cubren Ansible (un usuario
+Linux por agente), Gitea (scopes de token por rol) y el propio cl-harness como
+pieza de memoria. cl-harness **no pretende ser opencode** — cubre la capa
+memoria/contexto/poda de un agente y nada más.
+
 * Casos de uso
 
 ** Depuración e inspección de sistemas con memoria de sesión
