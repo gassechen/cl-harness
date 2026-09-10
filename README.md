@@ -269,7 +269,7 @@ memoria de hechos y alimenta el pruning de turnos futuros.
 `call-llm` despacha por `llm_provider`:
 
 | Proveedor     | Función                          | Tool-use |
-|---------------+----------------------------------+----------|
+|---------------|----------------------------------|----------|
 | `anthropic`   | `call-anthropic`                 | No (texto) |
 | `ollama`      | `call-ollama` (local)            | No       |
 | `gemini`      | `call-gemini` (generateContent)  | Texto (backend) |
@@ -356,7 +356,7 @@ aquí; debe inyectarse por archivo o variable de entorno):
 ## Comandos del REPL
 
 | Comando                | Acción                                             |
-|------------------------+---------------------------------------------------|
+|------------------------|---------------------------------------------------|
 | `:help`                | Ayuda                                             |
 | `:quit`                | Salva sesión y sale                               |
 | `:debug`               | Alterna trazas de depuración                      |
@@ -430,7 +430,7 @@ y delega el resto al sistema operativo y a la infraestructura. Marca sus
 fronteras frente a herramientas generalistas tipo opencode:
 
 | Capacidad (opencode)               | En cl-harness | Por qué |
-|------------------------------------+---------------|---------|
+|------------------------------------|---------------|---------|
 | Multi-agente / subagentes (`task`) | NO | Un solo harness por proceso y por usuario Linux; no hay subagentes. |
 | Plan mode / build mode (modos)     | NO | Cada turno va directo: contexto → LLM → herramientas. No hay fase "plan" que restrinja cambios. |
 | Permisos por herramienta (allow/ask/deny) | NO | La frontera de confianza es el hard user del SO (ver "Seguridad (por diseño)"); el LLM usa tools sin aprobación dentro del perímetro OS. |
