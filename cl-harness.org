@@ -274,6 +274,36 @@ herramientas expuestas al modelo son:
 De este modo *toda* salida observable que el modelo ve pasa también por la
 memoria de hechos y alimenta el pruning de turnos futuros.
 
+*** 5b. Streaming en vivo (opencode-style)
+
+Con =llm_stream: true= (por defecto) la respuesta del LLM no llega entera:
+=stream-llm-with-tools= consume los *deltas* SSE a medida que el proveedor los
+emite y los imprime en vivo, con
+
+- el **razonamiento** del modelo (p. ej. =delta.reasoning= en DeepSeek) mientras
+  piensa — visible progresivamente, pero no se acumula en el contexto,
+- el **texto final** (=delta.content=) a medida que se genera,
+- **banners de herramienta** antes/durante la ejecución:
+
+```
+assistant>
+The user is asking how many lines are in the file src/context.lisp. ...
+ ⚙ exec_command {"command": "wc -l src/context.lisp"}
+  ✓ 74 chars received
+
+El archivo `src/context.lisp` tiene **320 líneas**.
+```
+
+El canal de salida de deltas es =(llm-stream-out)=, que usa =*stream-output*=
+si está definido o el =*standard-output*= actual en caso contrario (evita
+streams obsoletos al arrancar desde una imagen SBCL guardada). El loop sigue
+siendo multi-iteración: tras una =tool_calls= se vuelve a pedir respuesta y
+esta también streamea. Los =[LLM ERROR]=/=[LLM API ERROR]= no se guardan como
+hechos y fuerzan exit code 1 en modo one-shot.
+
+=assistant>= se imprime una sola vez por turno: si el stream ya mostró el texto,
+=run-one-shot= y el REPL no lo reimprimen (guard =*llm-streamed*=).
+
 ** 6. Proveedores
 
 =call-llm= despacha por =llm_provider=:
@@ -378,7 +408,8 @@ aquí; debe inyectarse por archivo o variable de entorno):
 | =:read PATH=        | Lee archivo                                           |
 | =:write PATH=       | Escribe archivo (pide contenido)                       |
 | =:dump=             | Crea imagen ejecutable con el estado actual            |
-| =:clear=            | Vacía la memoria de hechos                            |
+| =:clear=            | Vacía la memoria de hechos (working memory de Lisa)     |
+| =:clearall=         | Reset completo: hechos + contadores + métricas + session nuevo |
 | =:context=          | Muestra el YAML curado que se enviaría hoy             |
 | =:metrics=          | Muestra tabla de reducción por turno                   |
 | =:model NAME= / =:provider P= | Cambian modelo/proveedor en caliente          |
@@ -400,6 +431,11 @@ conocimiento necesario del código:
    activo). Se resuelve refrescando timestamps en el dump.
 4. **Literal-symbol en retrieve**: patrones como =(id id)= en =retrieve= no
    matchean nunca; se resuelve filtrando en Lisp puro (=find-todo-by-id=).
+5. **Contadores monótonicos entre rebotes**: el dump persiste
+   =*turn-counter*=/=*todo-counter*=/=*epoch-counter*=, y al reanudar la
+   imagen (=start-harness nil=) o tras =:restore= se continuan, de modo que
+   los =turn-id= (y todos/epochs) no se reutilizan ni colisionan en el
+   render agrupado por turno.
 
 Otros hechos operativos verificados:
 
@@ -515,9 +551,13 @@ proyecto se encuentra vía =~/quicklisp/local-projects/=):
 ./run.sh
 #+end_src
 
+  Cuando se ejecuta desde un terminal interactivo (TTY), =run.sh= usa =rlwrap=
+  automáticamente para habilitar edición de línea e historial de comandos.
+
 - **Modo no interactivo, un turno** (como =opencode run "..."=): procesa el
-  mensaje, ejecuta herramientas si el modelo las pide, imprime la respuesta,
-  salva la sesión y sale. Código de salida 0 = OK, 1 = fallo de LLM:
+  mensaje, ejecuta herramientas si el modelo las pide, imprime la respuesta
+  (streameada en vivo por defecto), salva la sesión y sale. Código de salida
+  0 = OK, 1 = fallo de LLM:
 
 #+begin_src shell
 ./run.sh run "verifica bla bla bla"

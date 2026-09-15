@@ -4,10 +4,25 @@
 (defparameter *session-id*
   (format nil "session-~A" (get-universal-time)))
 
-(defparameter *config-file*
-  (merge-pathnames "config.json" (asdf:system-source-directory :cl-harness)))
+(defparameter *base-dir* nil
+  "Base directory that owns config.json, sessions/, dumps/, metrics/ and
+   system-prompt.txt. NIL = use the directory where the harness runs.")
 
-(defun load-config (&optional (path *config-file*))
+(defun harness-base-dir ()
+  "Directory for the harness artifacts. Priority:
+   CL_HARNESS_DIR env var > *base-dir* > process current working directory."
+  (or *base-dir*
+      (let ((env (uiop:getenv "CL_HARNESS_DIR")))
+        (if (and env (plusp (length env)))
+            (uiop:ensure-directory-pathname env)
+            (uiop:ensure-directory-pathname (uiop:getcwd))))))
+
+(defparameter *config-file* nil
+  "Path to config.json. NIL = default to config.json in the harness run directory.")
+
+(defun load-config (&optional (path (or *config-file*
+                                        (merge-pathnames "config.json"
+                                                         (harness-base-dir)))))
   (if (probe-file path)
       (with-open-file (s path :direction :input)
         (setf *config* (com.inuoe.jzon:parse s)))
@@ -74,14 +89,14 @@
 (defun sessions-dir ()
   (or (config-value "sessions_dir")
       (merge-pathnames "sessions/"
-                       (asdf:system-source-directory :cl-harness))))
+                       (harness-base-dir))))
 
 (defun dumps-dir ()
   (or (config-value "dumps_dir")
       (merge-pathnames "dumps/"
-                       (asdf:system-source-directory :cl-harness))))
+                       (harness-base-dir))))
 
 (defun metrics-dir ()
   (or (config-value "metrics_dir")
       (merge-pathnames "metrics/"
-                       (asdf:system-source-directory :cl-harness))))
+                       (harness-base-dir))))
