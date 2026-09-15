@@ -30,10 +30,17 @@ case "${1:-}" in
          --eval '(cl-harness:run-one-shot (uiop:getenv "CL_HARNESS_RUN"))'
     ;;
   '')
-    exec sbcl --noinform --non-interactive \
-         --eval '(ql:quickload :cl-harness)' \
-         --eval "$CONFIG_OVERRIDE" \
-         --eval '(cl-harness:start-harness)'
+    if [ -t 0 ]; then
+      exec rlwrap sbcl --noinform --non-interactive \
+           --eval '(ql:quickload :cl-harness)' \
+           --eval "$CONFIG_OVERRIDE" \
+           --eval '(cl-harness:start-harness)'
+    else
+      exec sbcl --noinform --non-interactive \
+           --eval '(ql:quickload :cl-harness)' \
+           --eval "$CONFIG_OVERRIDE" \
+           --eval '(cl-harness:start-harness)'
+    fi
     ;;
   *)
     echo "usage: ./run.sh [run \"mensaje\"]" >&2

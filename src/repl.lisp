@@ -7,14 +7,26 @@
 (defparameter *running* nil)
 (defparameter *debug-mode* nil
   "When T, emit detailed debug traces for exec-command, context selection, and LLM calls.")
-(defparameter *system-prompt-path*
-  (merge-pathnames "system-prompt.txt"
-                   (asdf:system-source-directory :cl-harness)))
+(defparameter *system-prompt-path* nil
+  "Explicit path to the system prompt file. NIL = auto-detect.")
+
+(defun system-prompt-path ()
+  "System prompt file. Priority: *system-prompt-path* > env
+   CL_HARNESS_SYSTEM_PROMPT > system-prompt.md > system-prompt.txt in
+   the harness base directory."
+  (or *system-prompt-path*
+      (let ((env (uiop:getenv "CL_HARNESS_SYSTEM_PROMPT")))
+        (if (and env (plusp (length env)))
+            (uiop:parse-native-namestring env)
+            (let ((base (harness-base-dir)))
+              (if (probe-file (merge-pathnames "system-prompt.md" base))
+                  (merge-pathnames "system-prompt.md" base)
+                  (merge-pathnames "system-prompt.txt" base)))))))
 
 (defun load-system-prompt ()
   "Load the system prompt from file."
-  (if (probe-file *system-prompt-path*)
-      (with-open-file (s *system-prompt-path* :direction :input)
+  (if (probe-file (system-prompt-path))
+      (with-open-file (s (system-prompt-path) :direction :input)
         (let ((buf (make-string (file-length s))))
           (read-sequence buf s)
           buf))
@@ -50,7 +62,8 @@ working context via structured facts. Help them with their task."))
   (format t "  :read PATH   Read a file~%")
   (format t "  :write PATH  Write text to a file (prompts for content)~%")
   (format t "  :dump        Create SBCL core image~%")
-  (format t "  :clear       Clear all facts~%")
+  (format t "  :clear       Clear all facts (Lisa working memory)~%")
+  (format t "  :clearall    Full reset: facts + counters + metrics + new session id~%")
   (format t "  :context     Show current YAML context~%")
   (format t "  :metrics     Show per-turn token metrics (Phase 0)~%")
   (format t "  :model NAME  Switch LLM model~%")
@@ -143,6 +156,11 @@ working context via structured facts. Help them with their task."))
        (format t "~&Facts cleared.~%")
        t)
 
+      ((or (string= cmd ":clearall")
+           (string= cmd ":clear-all"))
+       (clear-all)
+       t)
+
       ((string= cmd ":context")
        (format t "~A" (build-yaml-context ""))
        t)
@@ -189,9 +207,15 @@ working context via structured facts. Help them with their task."))
                   ;; so the metrics show the reduction rules really produce.
                   (naive-context-string)))
          (context (build-yaml-context user-message))
+         ;; Signal live output mode before calling LLM so the user sees
+         ;; 'assistant>' while the streaming deltas arrive.
+         (streamed (llm-stream-p))
          (response (handler-case
                         (progn
                           (setf *last-llm-usage* nil)
+                          (when streamed
+                            (format *standard-output* "~&assistant>~%")
+                            (force-output *standard-output*))
                           (call-llm system-prompt context user-message))
                       (error (e) (format nil "[LLM ERROR] ~A" e)))))
     (record-context-metrics context user-message
@@ -206,8 +230,10 @@ working context via structured facts. Help them with their task."))
                                        :turn-id turn
                                        :parent-id turn)))))
     (when *debug-mode*
-      (format t "~&[DEBUG process-turn] turn=~A user=~A context-len=~A~%" turn user-message (length context))
-      (format t "~&[DEBUG process-turn] response=~A~%" response))
+      (format t "~&[DEBUG process-turn] turn=~A user=~A context-len=~A streamed=~A~%"
+              turn user-message (length context) *llm-streamed*)
+      (when (and *llm-streamed* response)
+        (format t "~&[DEBUG process-turn] response-len=~A~%" (length response))))
     response))
 
 (defun run-one-shot (user-message &optional (reset-engine t))
@@ -216,12 +242,14 @@ working context via structured facts. Help them with their task."))
    run.sh); NIL continues the session already living in a saved core image."
   (load-config)
   (when reset-engine
-    (reset))
+    (reset)
+    (reset-turn-counter))
   (metrics-reset)
   (let* ((system-prompt (load-system-prompt))
          (response (or (process-turn user-message system-prompt)
                        "[LLM ERROR] empty response")))
-    (format t "~&assistant> ~A~%" response)
+    (unless *llm-streamed*
+      (format t "~&assistant> ~A~%" response))
     (save-session)
     (finish-output)
     (sb-ext:exit :code (if (or (search "[LLM ERROR]" response :test #'char=)
@@ -236,9 +264,12 @@ working context via structured facts. Help them with their task."))
    booting from a saved SBCL core image)."
   (load-config)
   (when reset-engine
-    (reset))
+    (reset)
+    ;; Fresh engine also starts from turn 0. On an image resume
+    ;; (RESET-ENGINE NIL) the counters captured in the image are kept so
+    ;; turn/todo/epoch ids stay monotonic across reboots.
+    (reset-turn-counter))
   (metrics-reset)
-  (reset-turn-counter)
   (print-welcome)
   (setf *running* t)
   (let ((system-prompt (load-system-prompt)))
@@ -255,9 +286,24 @@ working context via structured facts. Help them with their task."))
                   (setf *running* (handle-command input)))
                  (t
                   (let ((response (process-turn input system-prompt)))
-                    (format t "~&~%assistant> ~A~%~%" response)))))))
+                    (unless *llm-streamed*
+                      (format t "~&~%assistant> ~A~%~%" response))))))))
   (format t "~&Harness stopped.~%"))
 
 (defun stop-harness ()
   "Stop the harness."
   (setf *running* nil))
+
+(defun clear-all ()
+  "Full factory reset: wipe Lisa working memory AND all harness-level state
+   (turn/todo/epoch counters, metrics), then start a fresh session with a new
+   session id. Rules and config are kept. Used to begin something new on top
+   of a binary that may carry state from a previous run."
+  (clear)
+  (reset-turn-counter)
+  (setf *todo-counter* 0)
+  (setf *epoch-counter* 0)
+  (metrics-reset)
+  (setf *session-id* (format nil "session-~A" (get-universal-time)))
+  (format t "~&Session reset. New session: ~A~%" *session-id*)
+  t)

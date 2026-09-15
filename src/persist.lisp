@@ -25,6 +25,11 @@
                        :if-exists :supersede)
       (format s ";;; Session ~A facts dump~%" *session-id*)
       (format s ";;; Generated: ~A~%" (get-universal-time))
+      ;; Persist monotonic counters so turn/todo/epoch ids stay monotonic
+      ;; across image reboots and :restore in fresh processes.
+      (format s "(setf *turn-counter* ~A)~%" *turn-counter*)
+      (format s "(setf *todo-counter* ~A)~%" *todo-counter*)
+      (format s "(setf *epoch-counter* ~A)~%" *epoch-counter*)
       (format s "(defun restore-facts ()~%  (progn~%")
       (dolist (f facts)
         (let ((type (fact-slot f 'fact-type))

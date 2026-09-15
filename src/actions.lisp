@@ -11,12 +11,21 @@
 ;;; evaluates it: (data (list :command ...)). Lexical variables are
 ;;; captured in compiled contexts.
 
-(defun exec-command (command &optional (workdir nil))
+(defun resolve-path (path)
+  "Resolve a RELATIVE PATH against the harness base directory, so the LLM
+   can reference project files without absolute paths."
+  (let ((pn (pathname path)))
+    (if (uiop:absolute-pathname-p pn)
+        pn
+        (merge-pathnames pn (harness-base-dir)))))
+
+(defun exec-command (command &optional (workdir (harness-base-dir)))
   "Execute a shell command, return exit-code and combined output.
-   Registers result as a fact in Rete."
+   Registers result as a fact in Rete. WORKDIR defaults to the harness
+   base directory so commands always run inside the project dir."
   (handler-case
       (let* ((full-cmd (if workdir
-                           (format nil "cd ~A && ~A" workdir command)
+                           (format nil "cd ~S && ~A" (namestring workdir) command)
                            command))
              (output (with-output-to-string (s)
                        (uiop:run-program full-cmd :output s :error-output :interactive))))
@@ -45,34 +54,38 @@
         (list :command command :output output :exit-code -1)))))
 
 (defun read-file (path)
-  "Read a file, return its contents.
+  "Read a file, return its contents (relative paths resolve against the
+   harness base directory).
    Registers as a fact in Rete."
-  (let ((contents
-           (if (probe-file path)
-               (with-open-file (s path :direction :input)
+  (let* ((full (resolve-path path))
+         (contents
+           (if (probe-file full)
+               (with-open-file (s full :direction :input)
                  (let ((buf (make-string (file-length s))))
                    (read-sequence buf s)
                    buf))
-               (format nil "ERROR: File not found: ~A" path))))
+               (format nil "ERROR: File not found: ~A" (namestring full)))))
     (assert (harness-fact (fact-type "file-read")
-                         (timestamp (get-universal-time))
-                         (data (list :path path
-                                     :contents contents
-                                     :turn-id (current-turn-id)
-                                     :parent-id (current-turn-id)))))
-    (list :path path :contents contents)))
+                          (timestamp (get-universal-time))
+                          (data (list :path (namestring full)
+                                      :contents contents
+                                      :turn-id (current-turn-id)
+                                      :parent-id (current-turn-id)))))
+    (list :path (namestring full) :contents contents)))
 
 (defun write-file (path content)
-  "Write content to a file.
+  "Write content to a file (relative paths resolve against the harness
+   base directory).
    Registers as a fact in Rete."
-  (ensure-directories-exist path)
-  (with-open-file (s path :direction :output :if-exists :supersede)
-    (write-string content s))
-  (let ((bytes (length content)))
-    (assert (harness-fact (fact-type "file-write")
-                         (timestamp (get-universal-time))
-                         (data (list :path path
-                                     :bytes bytes
-                                     :turn-id (current-turn-id)
-                                     :parent-id (current-turn-id)))))
-    (list :path path :bytes bytes)))
+  (let ((full (resolve-path path)))
+    (ensure-directories-exist full)
+    (with-open-file (s full :direction :output :if-exists :supersede)
+      (write-string content s))
+    (let ((bytes (length content)))
+      (assert (harness-fact (fact-type "file-write")
+                            (timestamp (get-universal-time))
+                            (data (list :path (namestring full)
+                                        :bytes bytes
+                                        :turn-id (current-turn-id)
+                                        :parent-id (current-turn-id)))))
+      (list :path (namestring full) :bytes bytes))))

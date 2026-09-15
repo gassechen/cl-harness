@@ -43,5 +43,6 @@
 ;; repl
       #:start-harness
       #:stop-harness
+      #:clear-all
       #:run-one-shot
       #:main))
