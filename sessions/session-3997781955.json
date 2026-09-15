@@ -1,1 +1,0 @@
-{"session-id":"session-3997781955","timestamp":3997781955,"facts":[{"type":"file-read","timestamp":3997781955,"data":{"path":"/etc/hostname","contents":"ERROR: File not found: /etc/hostname"}},{"type":"command-exec","timestamp":3997781955,"data":{"command":"echo cli-test","output":"cli-test\n","exit-code":0}}]}
