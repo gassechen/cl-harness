@@ -14,11 +14,13 @@
                  :serial t
                  :components ((:file "packages")
                               (:file "config")
+                              (:file "engines")
                               (:file "facts")
                               (:file "rules")
                               (:file "context")
                               (:file "metrics")
                               (:file "actions")
+                              (:file "background")
                               (:file "llm")
                               (:file "persist")
                               (:file "repl")

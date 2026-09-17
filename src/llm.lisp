@@ -5,28 +5,37 @@
 ;;; ============================================
 
 (defparameter *last-llm-usage* nil
-  "Usage (:prompt N :completion N) of the last successful LLM call.")
+  "Usage (:prompt N :completion N) of the last successful LLM call. For tool
+   loops these are CUMULATIVE totals across all API iterations of the turn.")
+
+(defparameter *last-llm-call-info* nil
+  "Metadata of the most recent LLM turn call:
+   (:iterations N :path PATH) where PATH is one of:
+   :final (normal answer) | :tool-loop (aborted by loop detector) |
+   :api-error | :exhaustion-partial (iterations exhausted, partial text kept) |
+   :exhaustion-error (iterations exhausted, no text).")
 
 (defun llm-stream-p ()
   "Whether to stream LLM responses to stdout as they arrive (opencode-style
    live output with tool-use activity banners). Enabled by default; disable
    with \"llm_stream\": false in config.json."
-  (let ((v (config-value "llm_stream")))
-    (cond ((eq v :false) nil)
-          ((null v) t)
-          (t (not (eq v :false))))))
+  (multiple-value-bind (v present) (config-or-false "llm_stream")
+    (cond ((and present (null v)) nil)
+          (t t))))
 
 (defun capture-usage (resp-obj &optional (prompt-key "prompt_tokens")
                                    (completion-key "completion_tokens"))
-  "Read usage metrics from a parsed API response, if present."
+  "Read usage metrics from a parsed API response, if present. Only updates
+   the global when a usage object exists: streaming chunks that carry no
+   usage must NOT overwrite the accumulated value with NIL."
   (let ((usage (or (gethash "usage" resp-obj)
                    (gethash "usageMetadata" resp-obj))))
-    (setf *last-llm-usage*
-          (and usage
-               (list :prompt (or (gethash prompt-key usage)
-                                 (gethash "promptTokenCount" usage))
-                     :completion (or (gethash completion-key usage)
-                                     (gethash "candidatesTokenCount" usage)))))))
+    (when usage
+      (setf *last-llm-usage*
+            (list :prompt (or (gethash prompt-key usage)
+                              (gethash "promptTokenCount" usage))
+                  :completion (or (gethash completion-key usage)
+                                  (gethash "candidatesTokenCount" usage)))))))
 
 (defun decode-response (raw)
   "Safely decode HTTP response body (string or octets) to a character string."
@@ -109,6 +118,54 @@
       (setf (gethash "type" fn) "function")
       (setf (gethash "function" fn) func)
       (push fn tools))
+    ;; write_file tool
+    (let* ((path-prop (make-hash-table :test 'equal))
+           (content-prop (make-hash-table :test 'equal))
+           (properties (make-hash-table :test 'equal))
+           (params (make-hash-table :test 'equal))
+           (func (make-hash-table :test 'equal))
+           (fn (make-hash-table :test 'equal)))
+      (setf (gethash "type" path-prop) "string")
+      (setf (gethash "description" path-prop) "Absolute or relative path to the file")
+      (setf (gethash "path" properties) path-prop)
+      (setf (gethash "type" content-prop) "string")
+      (setf (gethash "description" content-prop) "Full file contents to write (new files only; large existing files are refused — use edit_file to modify)")
+      (setf (gethash "content" properties) content-prop)
+      (setf (gethash "type" params) "object")
+      (setf (gethash "properties" params) properties)
+      (setf (gethash "required" params) (list "path" "content"))
+      (setf (gethash "name" func) "write_file")
+      (setf (gethash "description" func) "Create a NEW file with the given content (creates parent dirs). If the target already exists, it is overwritten ONLY when small (<= 2000 bytes); an existing file larger than that is REFUSED — for modifying existing files use edit_file with the exact snippet. Use write_file instead of shell heredocs/sed for new files so the change is recorded as a structured fact.")
+      (setf (gethash "parameters" func) params)
+      (setf (gethash "type" fn) "function")
+      (setf (gethash "function" fn) func)
+      (push fn tools))
+    ;; edit_file tool
+    (let* ((path-prop (make-hash-table :test 'equal))
+           (old-prop (make-hash-table :test 'equal))
+           (new-prop (make-hash-table :test 'equal))
+           (properties (make-hash-table :test 'equal))
+           (params (make-hash-table :test 'equal))
+           (func (make-hash-table :test 'equal))
+           (fn (make-hash-table :test 'equal)))
+      (setf (gethash "type" path-prop) "string")
+      (setf (gethash "description" path-prop) "Absolute or relative path to the file")
+      (setf (gethash "path" properties) path-prop)
+      (setf (gethash "type" old-prop) "string")
+      (setf (gethash "description" old-prop) "The exact text to find (must be present in the file, ideally unique)")
+      (setf (gethash "old_string" properties) old-prop)
+      (setf (gethash "type" new-prop) "string")
+      (setf (gethash "description" new-prop) "The replacement text")
+      (setf (gethash "new_string" properties) new-prop)
+      (setf (gethash "type" params) "object")
+      (setf (gethash "properties" params) properties)
+      (setf (gethash "required" params) (list "path" "old_string" "new_string"))
+      (setf (gethash "name" func) "edit_file")
+      (setf (gethash "description" func) "Replace a small exact snippet in a file with new text (surgical edit). Unlike write_file, it does not rewrite the whole file, so it works for any size and costs few tokens. Use this as the PRIMARY way to modify existing files; read_file first to get exact old text.")
+      (setf (gethash "parameters" func) params)
+      (setf (gethash "type" fn) "function")
+      (setf (gethash "function" fn) func)
+      (push fn tools))
     (nreverse tools)))
 
 (defun execute-tool (tool-name arguments)
@@ -118,8 +175,10 @@
      (let ((cmd (gethash "command" arguments)))
        (if cmd
            (let ((result (exec-command cmd)))
-             (format nil "Command: ~A~%Exit code: ~A~%Output:~%~A"
-                     cmd (getf result :exit-code) (getf result :output)))
+             (if (getf result :backgrounded-p)
+                 (format nil "~A" (getf result :message))
+                 (format nil "Command: ~A~%Exit code: ~A~%Output:~%~A"
+                         cmd (getf result :exit-code) (getf result :output))))
            "Error: missing command argument")))
     ((string-equal tool-name "read_file")
      (let ((path (gethash "path" arguments)))
@@ -128,6 +187,30 @@
              (format nil "File: ~A~%Contents:~%~A"
                      path (getf result :contents)))
            "Error: missing path argument")))
+    ((string-equal tool-name "write_file")
+     (let ((path (gethash "path" arguments))
+           (content (gethash "content" arguments)))
+       (if (and path content)
+           (let ((result (write-file path content)))
+             (if (getf result :refused)
+                 (format nil "write_file refused: ~A" (getf result :error))
+                 (format nil "Wrote ~A bytes to ~A"
+                         (getf result :bytes) (getf result :path))))
+           "Error: missing path or content argument")))
+    ((string-equal tool-name "edit_file")
+     (let ((path (gethash "path" arguments))
+           (old-string (gethash "old_string" arguments))
+           (new-string (gethash "new_string" arguments)))
+       (if (and path old-string new-string)
+           (let ((result (edit-file path old-string new-string)))
+             (if (getf result :applied)
+                 (format nil "Edited ~A: replaced ~A chars with ~A chars (~A match~:P found)"
+                         (getf result :path)
+                         (getf result :replaced-chars)
+                         (getf result :new-chars)
+                         (getf result :matches))
+                 (format nil "Edit failed: ~A" (getf result :error))))
+           "Error: missing path, old_string or new_string argument")))
     (t (format nil "Unknown tool: ~A" tool-name))))
 
 ;;; ============================================
@@ -237,6 +320,23 @@
     (setf (gethash "function" tc) fn)
     tc))
 
+(defun truncate-tool-result (text)
+  "Bound a tool result to max-tool-result-chars when it goes back into the
+   intra-turn message pile. Keeps the HEAD and the TAIL of the output (with an
+   explicit omission notice) so a huge file cannot swamp the prompt AND the
+   model can still reach code that lives past the truncation point. The full
+   output stays in the Rete fact; only the copy sent to the model is trimmed."
+  (let ((max (max-tool-result-chars)))
+    (if (and max (plusp max) (> (length text) max))
+        (let* ((head-len (floor (* max 0.6)))
+               (tail-len (floor (* max 0.4)))
+               (omitted (- (length text) head-len tail-len)))
+          (format nil "~A~%~%... [TRUNCATED]: original ~A chars, ~A omitted from the middle. Use read_file/grep/sed to inspect a specific section ...~%~A"
+                  (subseq text 0 head-len)
+                  (length text) omitted
+                  (subseq text (- (length text) tail-len))))
+        text)))
+
 (defun stream-execute-tool-calls (messages tool-buf)
   "Execute all accumulated tool calls, print live banners, append assistant +
    tool messages. Returns the appended MESSAGES list (unchanged when no tools)."
@@ -258,12 +358,14 @@
                    (let* ((name (or (getf acc :name) ""))
                           (args-raw (getf acc :args)))
                      (stream-tool-banner name args-raw)
-                     (let* ((args-obj (handler-case
-                                          (com.inuoe.jzon:parse args-raw)
-                                        (error () (make-hash-table :test 'equal))))
-                            (result-text (execute-tool name args-obj))
-                            (tool-msg (make-hash-table :test 'equal)))
-                       (stream-tool-result result-text)
+(let* ((args-obj (handler-case
+                     (com.inuoe.jzon:parse args-raw)
+                   (error () (make-hash-table :test 'equal))))
+       (raw-text (execute-tool name args-obj))
+       (result-text (truncate-tool-result raw-text))
+       (tool-msg (make-hash-table :test 'equal)))
+  (record-tool-call name raw-text result-text)
+  (stream-tool-result result-text)
                        (setf (gethash "role" tool-msg) "tool")
                        (setf (gethash "content" tool-msg) result-text)
                        (setf (gethash "tool_call_id" tool-msg) (getf acc :id))
@@ -285,67 +387,116 @@
                   context
                   user-message))
     (setf *llm-streamed* t)
-    (dotimes (iteration 5)
-      (let* ((body (build-openai-compat-messages-with-tools
-                    system-prompt context user-message messages))
-             (json-body (progn
-                          (setf (gethash "stream" body) t)
-                          (com.inuoe.jzon:stringify body)))
-             (endpoint (openai-compat-endpoint))
-             (headers (openai-compat-headers)))
-        (when *debug-mode*
-          (format t "~&[DEBUG stream] iteration=~A endpoint=~A body=~A~%"
-                  (1+ iteration) endpoint json-body))
-        (let ((stream
-                (handler-case
-                    (dexador:request endpoint
-                                     :method :post
-                                     :headers headers
-                                     :content json-body
-                                     :want-stream t)
+    (let ((total-text (make-string-output-stream))
+          (tot-prompt 0)
+          (tot-completion 0))
+      (dotimes (iteration (llm-max-tool-iterations))
+        (let* ((body (build-openai-compat-messages-with-tools
+                      system-prompt context user-message messages))
+               (json-body (progn
+                            (setf (gethash "stream" body) t)
+                            (com.inuoe.jzon:stringify body)))
+               (endpoint (openai-compat-endpoint))
+               (headers (openai-compat-headers)))
+          (when *debug-mode*
+            (format t "~&[DEBUG stream] iteration=~A endpoint=~A body=~A~%"
+                    (1+ iteration) endpoint json-body))
+          (let ((stream
+                  (handler-case
+                      (dexador:request endpoint
+                                       :method :post
+                                       :headers headers
+                                       :content json-body
+                                       :want-stream t)
+                    (error (e)
+                      (when *debug-mode*
+                        (format t "~&[DEBUG stream] transport error: ~A~%" e))
+                      (return-from stream-llm-with-tools
+                        (call-llm-with-tools/static
+                         system-prompt context user-message))))))
+            (let ((content-buf (make-string-output-stream))
+                  (tool-buf (make-hash-table :test #'eql))
+                  (api-error nil))
+              (handler-case
+                    (loop for line = (sse-read-line stream)
+                          while (and line (not (eq line :eof)))
+                          for chunk = (parse-sse-data line)
+                          do (when *debug-mode*
+                               (format t "~&[DEBUG sse] line=~A~%" line))
+                          when chunk do
+                            (if (gethash "error" chunk)
+                                (setf api-error
+                                      (gethash "message"
+                                               (if (hash-table-p (gethash "error" chunk))
+                                                   (gethash "error" chunk)
+                                                   chunk)))
+                                (stream-process-chunk chunk content-buf tool-buf)))
                   (error (e)
                     (when *debug-mode*
-                      (format t "~&[DEBUG stream] transport error: ~A~%" e))
-                    (return-from stream-llm-with-tools
-                      (call-llm-with-tools/static
-                       system-prompt context user-message))))))
-          (let ((content-buf (make-string-output-stream))
-                (tool-buf (make-hash-table :test #'eql))
-                (api-error nil))
-            (handler-case
-                  (loop for line = (sse-read-line stream)
-                        while (and line (not (eq line :eof)))
-                        for chunk = (parse-sse-data line)
-                        do (when *debug-mode*
-                             (format t "~&[DEBUG sse] line=~A~%" line))
-                        when chunk do
-                          (if (gethash "error" chunk)
-                              (setf api-error
-                                    (gethash "message"
-                                             (if (hash-table-p (gethash "error" chunk))
-                                                 (gethash "error" chunk)
-                                                 chunk)))
-                              (stream-process-chunk chunk content-buf tool-buf)))
-                (error (e)
-                  (when *debug-mode*
-                    (format t "~&[DEBUG stream] read error: ~A~%" e))))
-            (when api-error
+                      (format t "~&[DEBUG stream] read error: ~A~%" e))))
+              (when api-error
+                (setf *llm-streamed* nil)
+                (setf *last-llm-call-info*
+                      (list :iterations (1+ iteration) :path :api-error))
+                (return-from stream-llm-with-tools
+                  (format nil "[LLM API ERROR] ~A" api-error)))
+              ;; Accumulate per-request usage into CUMULATIVE turn totals, so
+              ;; metrics reflect what the tool loop really cost (each request
+              ;; re-sends the whole growing message pile).
+              (let* ((p (getf *last-llm-usage* :prompt))
+                     (c (getf *last-llm-usage* :completion)))
+                (when (numberp p) (incf tot-prompt p))
+                (when (numberp c) (incf tot-completion c)))
+              (setf *last-llm-usage*
+                    (list :prompt tot-prompt :completion tot-completion))
+              (if (zerop (hash-table-count tool-buf))
+                  (let ((text (get-output-stream-string content-buf)))
+                    (write-string text total-text)
+                    (when (plusp (length text))
+                      (write-char #\Newline (llm-stream-out)))
+                    (finish-output (llm-stream-out))
+                    (setf *last-llm-call-info*
+                          (list :iterations (1+ iteration) :path :final))
+                    (return-from stream-llm-with-tools text))
+                  ;; Preserve any text streamed alongside tool calls so a
+                  ;; partial answer survives iteration exhaustion.
+                  (let ((text (get-output-stream-string content-buf)))
+                    (write-string text total-text)
+                    (setf messages
+                          (stream-execute-tool-calls messages tool-buf))
+                    (let ((warning (tool-loop-warning)))
+                      (when warning
+                        (write-string warning (llm-stream-out))
+                        (write-char #\Newline (llm-stream-out))
+                        (finish-output (llm-stream-out))
+                        (setf *last-llm-call-info*
+                              (list :iterations (1+ iteration) :path :tool-loop))
+                        (return-from stream-llm-with-tools warning)))
+                    (write-char #\Newline (llm-stream-out))
+                    (finish-output (llm-stream-out))))))))
+      ;; Graceful end: report exhaustion explicitly instead of returning NIL
+      ;; silently. If the model STREAMED some content while calling tools, keep
+      ;; it but MARK it as partial (it is NOT a complete answer); otherwise it
+      ;; is a hard error.
+      (let ((text (get-output-stream-string total-text)))
+        (if (plusp (length text))
+            (progn
+              (format (llm-stream-out)
+                      "~&[LLM PARCIAL: se agotaron ~A iteraciones de tool-use sin respuesta final; se conserva lo emitido]~%"
+                      (llm-max-tool-iterations))
+              (finish-output (llm-stream-out))
+              (setf *last-llm-call-info*
+                    (list :iterations (llm-max-tool-iterations)
+                          :path :exhaustion-partial))
+              (format nil "[LLM PARCIAL] ~A iteraciones agotadas sin respuesta final; texto parcial:~%~A"
+                      (llm-max-tool-iterations) text))
+            (progn
               (setf *llm-streamed* nil)
-              (return-from stream-llm-with-tools
-                (format nil "[LLM API ERROR] ~A" api-error)))
-            (if (zerop (hash-table-count tool-buf))
-                (let ((text (get-output-stream-string content-buf)))
-                  (when (plusp (length text))
-                    (write-char #\Newline (llm-stream-out)))
-                  (finish-output (llm-stream-out))
-                  (return-from stream-llm-with-tools text))
-                (progn
-                  (setf messages
-                        (stream-execute-tool-calls messages tool-buf))
-                  (write-char #\Newline (llm-stream-out))
-                  (finish-output (llm-stream-out))))))))
-    (error "stream-llm-with-tools: max iterations")
-    nil))
+              (setf *last-llm-call-info*
+                    (list :iterations (llm-max-tool-iterations)
+                          :path :exhaustion-error))
+              (format nil "[LLM ERROR] reached ~A tool iterations without a final answer"
+                      (llm-max-tool-iterations))))))))
 
 (defun build-openai-compat-messages-with-tools (system-prompt context user-message prior-messages)
   "Build OpenAI-compatible Chat Completions JSON body with tools."
@@ -370,7 +521,9 @@
    model requests tools, execute them and loop until we get a text response or
    reach the max iterations."
   (let ((messages (list (make-hash-table :test 'equal)
-                        (make-hash-table :test 'equal))))
+                        (make-hash-table :test 'equal)))
+        (tot-prompt 0)
+        (tot-completion 0))
     (setf (gethash "role" (first messages)) "system")
     (setf (gethash "content" (first messages)) system-prompt)
     (setf (gethash "role" (second messages)) "user")
@@ -379,8 +532,8 @@
                   "=== CONTEXT (structured facts, Rete-pruned) ==="
                   context
                   user-message))
-    (setf *llm-streamed* nil)
-    (dotimes (iteration 5)
+(setf *llm-streamed* nil)
+    (dotimes (iteration (llm-max-tool-iterations))
       (let* ((body (build-openai-compat-messages-with-tools system-prompt context user-message messages))
              (json-body (com.inuoe.jzon:stringify body))
              (endpoint (openai-compat-endpoint))
@@ -391,14 +544,20 @@
                                (when *debug-mode*
                                  (format t "~&[DEBUG llm] ERROR: ~A~%" e)
                                  (let ((raw (or (ignore-errors (slot-value e 'dexador::response-body))
-                                               (ignore-errors (slot-value e 'response-body)))))
+                                                (ignore-errors (slot-value e 'response-body)))))
                                    (when raw
                                      (format t "~&[DEBUG llm] error-body=~A~%"
                                              (decode-response raw)))))
+                               (setf *last-llm-call-info*
+                                     (list :iterations (1+ iteration)
+                                           :path :transport-error))
                                (return-from call-llm-with-tools/static (format nil "[LLM ERROR] ~A" e)))))
              (response (decode-response raw-response))
              (resp-obj (handler-case (com.inuoe.jzon:parse response)
                          (error (e)
+                           (setf *last-llm-call-info*
+                                 (list :iterations (1+ iteration)
+                                       :path :json-error))
                            (return-from call-llm-with-tools/static (format nil "[LLM JSON ERROR] ~A" e)))))
              (err-obj (when (hash-table-p resp-obj) (gethash "error" resp-obj))))
         (when *debug-mode*
@@ -409,8 +568,14 @@
           (let ((err-msg (or (and (hash-table-p err-obj) (gethash "message" err-obj)) response)))
             (when *debug-mode*
               (format t "~&[DEBUG llm] API ERROR: ~A~%" err-msg))
+            (setf *last-llm-call-info*
+                  (list :iterations (1+ iteration) :path :api-error))
             (return-from call-llm-with-tools/static (format nil "[LLM API ERROR] ~A" err-msg))))
         (capture-usage resp-obj)
+        (let ((p (getf *last-llm-usage* :prompt))
+              (c (getf *last-llm-usage* :completion)))
+          (when (numberp p) (incf tot-prompt p))
+          (when (numberp c) (incf tot-completion c)))
         (let* ((choices (when (hash-table-p resp-obj) (gethash "choices" resp-obj)))
                (msg (when (and choices (plusp (length choices)))
                       (gethash "message" (elt choices 0))))
@@ -429,16 +594,40 @@
                       (format t "~&[DEBUG llm] tool_call id=~A name=~A args=~A~%"
                               tool-call-id tool-name args-raw))
                     (let* ((args-obj (handler-case (com.inuoe.jzon:parse args-raw)
-                                       (error () (make-hash-table :test 'equal))))
-                           (result-text (execute-tool tool-name args-obj))
+                                        (error () (make-hash-table :test 'equal))))
+                           (raw-text (execute-tool tool-name args-obj))
+                           (result-text (truncate-tool-result raw-text))
                            (tool-result-msg (make-hash-table :test 'equal)))
                       (when *debug-mode*
                         (format t "~&[DEBUG llm] tool_result=~A~%" result-text))
+                      (record-tool-call tool-name raw-text result-text)
                       (setf (gethash "role" tool-result-msg) "tool")
                       (setf (gethash "content" tool-result-msg) result-text)
                       (setf (gethash "tool_call_id" tool-result-msg) tool-call-id)
-                      (setf messages (append messages (list tool-result-msg)))))))
-              (return-from call-llm-with-tools/static (when msg (gethash "content" msg)))))))))
+                      (setf messages (append messages (list tool-result-msg))))))
+                ;; Stop the turn early when the model is stuck re-running the
+                ;; same failing command (imperative companion to the Rete rule).
+                (let ((warning (tool-loop-warning)))
+                  (when warning
+                    (setf *last-llm-usage*
+                          (list :prompt tot-prompt :completion tot-completion))
+                    (setf *last-llm-call-info*
+                          (list :iterations (1+ iteration) :path :tool-loop))
+                    (return-from call-llm-with-tools/static warning))))
+              (progn
+                (setf *last-llm-usage*
+                      (list :prompt tot-prompt :completion tot-completion))
+                (setf *last-llm-call-info*
+                      (list :iterations (1+ iteration) :path :final))
+                (return-from call-llm-with-tools/static
+                  (when msg (gethash "content" msg)))))))
+    ;; Graceful end: report exhaustion instead of returning NIL silently.
+    (setf *last-llm-usage*
+          (list :prompt tot-prompt :completion tot-completion))
+    (setf *last-llm-call-info*
+          (list :iterations (llm-max-tool-iterations) :path :exhaustion-error))
+    (format nil "[LLM ERROR] reached ~A tool iterations without a final answer"
+            (llm-max-tool-iterations)))))
 
 
 

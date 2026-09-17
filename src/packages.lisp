@@ -14,6 +14,7 @@
      #:*config*
      #:*config-file*
      #:*session-id*
+     #:new-session-id
      #:load-config
      ;; debug
      #:*debug-mode*
@@ -27,15 +28,33 @@
      #:reset #:run #:clear #:retrieve #:rules #:facts #:get-slot-value
      ;; metrics
      #:metrics-reset #:metrics-summary #:metrics-to-json
-     ;; llm
-     #:call-llm
-     #:llm-provider #:llm-model #:llm-endpoint #:llm-api-key #:llm-max-tokens
+;; llm
+      #:call-llm
+      #:llm-provider #:llm-model #:llm-endpoint #:llm-api-key #:llm-max-tokens
+      #:llm-max-tool-iterations
      #:openrouter-p #:groq-p #:openai-compat-endpoint #:openai-compat-headers
      #:gemini-p #:gemini-endpoint #:gemini-headers #:call-gemini
      ;; actions
      #:exec-command
      #:read-file
      #:write-file
+     ;; background
+     #:start-background
+     #:background-status
+     #:stop-background
+     #:shutdown-background-processes
+     #:background-on-timeout-p
+     ;; dual engines
+     #:*turn-engine*
+     #:*mem-engine*
+     #:with-turn-engine
+     #:with-mem-engine
+     #:reset-turn-engine
+     #:reset-mem-engine
+     #:durable-type-p
+     #:promote-durable-facts
+     #:mem-engine-facts
+     #:boot-memory
      ;; persist
      #:save-session
      #:restore-session
@@ -44,5 +63,6 @@
       #:start-harness
       #:stop-harness
       #:clear-all
-      #:run-one-shot
-      #:main))
+#:run-one-shot
+       #:standalone-toplevel
+       #:main))

@@ -100,6 +100,16 @@
                               ""))))
     (min raw-len (max-fact-payload-chars))))
 
+(defun collect-tool-loops ()
+  "Retrieve all tool-loop warning facts from Rete, newest first. Rendered as a
+   top-level warnings block (like epochs/goals) so they are always visible
+   regardless of the relevance budget."
+  (sort (loop for f in (mapcar #'first
+                               (retrieve (?l) (?l (harness-fact))))
+              when (string= (fact-type-of f) "tool-loop")
+                collect f)
+        #'> :key #'fact-timestamp-of))
+
 (defun tokenize-query (text)
   "Extract lowercase alphanumeric keywords from query, filtering short tokens and common stopwords."
   (when (and text (stringp text))
@@ -152,15 +162,15 @@
          (turn (or (data-get data :turn-id) 0))
          (path (data-get data :path))
          (cmd (data-get data :command))
-         (content (or (data-get data :contents) (data-get data :output) (data-get data :text) ""))
-         (exit-code (data-get data :exit-code)))
+         (content (or (data-get data :contents) (data-get data :output) (data-get data :text) "")))
     (+ ;; 1. Turn proximity (exponential logical decay, NOT clock seconds)
        (let ((turn-dist (abs (- turn now-turn))))
          (max 0 (- 500 (* 60 turn-dist))))
        ;; 2. Conversation guarantee: preserve dialogue thread
        (if (conversation-type-p type) 300 0)
-       ;; 3. Error prioritization: commands that failed are critical context
-       (if (and (string= type "command-exec") exit-code (not (zerop exit-code)))
+       ;; 3. Error prioritization: real errors are critical context
+       (if (and (conserve-errors-p)
+                (real-error-p type data))
            400
            0)
        ;; 4. Frequency of repetition
@@ -254,6 +264,16 @@
             (format s "      priority: ~A~%" (escape-yaml priority))
             (unless (or (null parent) (string= parent "root"))
               (format s "      parent_goal: ~A~%" (escape-yaml parent))))))
+      ;; Render loop warnings (derived by the detect-command-loop Rete rule)
+      (let ((loops (collect-tool-loops)))
+        (when loops
+          (format s "  warnings:~%")
+          (dolist (l loops)
+            (let* ((d (fact-data-of l))
+                   (family (or (data-get d :family) ""))
+                   (count (or (data-get d :count) 3)))
+              (format s "    - loop: ~A failing commands are the same retried attempt (family ~S). STOP re-running variants — change approach.~%"
+                      count family)))))
       ;; Render turns
       (format s "  turns:~%")
       (dolist (turn (sort (loop for k being the hash-keys of groups collect k)
@@ -283,8 +303,35 @@
                    (format s "      wrote: ~A (~A bytes)~%"
                            (escape-yaml (or (data-get data :path) ""))
                            (or (data-get data :bytes) "")))
+                  ((string= type "tool-loop")
+                   ;; Already rendered in the top-level warnings block.
+                   nil)
                   (t
                    (format s "      ?~A: ~S~%" (escape-yaml type) data)))))))))
+
+(defun mem-context-block ()
+  "Render long-term memory (durable facts in the *mem-engine*) as a YAML
+   section appended to every turn's context. Independent of the turn working
+   memory and its TTL/dedup/cap pruning."
+  (let ((facts (mem-engine-facts)))
+    (when facts
+      (with-output-to-string (s)
+        (format s "long_term_memory:~%")
+        (dolist (f (sort facts #'> :key #'fact-timestamp-of))
+          (let* ((type (fact-type-of f))
+                 (data (fact-data-of f)))
+            (cond ((string= type "command-exec")
+                   (format s "  - error: ~A -> exit ~A~%"
+                           (escape-yaml (or (data-get data :command) ""))
+                           (or (data-get data :exit-code) ""))
+                   (format s "    evidence: ~A~%"
+                           (escape-yaml (truncate-payload
+                                         (or (data-get data :output) "")))))
+                  ((string= type "file-write")
+                   (format s "  - action: wrote ~A (~A bytes)~%"
+                           (escape-yaml (or (data-get data :path) ""))
+                           (or (data-get data :bytes) "")))
+                  (t nil))))))))
 
 (defun build-yaml-context (user-message)
   "Build the full YAML context block: run pruning rules, then select the
@@ -317,4 +364,6 @@
         (when *debug-mode*
           (format t "~&[DEBUG build-yaml-context] yaml-length=~A~%" (length yaml))
           (format t "~&[DEBUG build-yaml-context] === YAML START ===~%~A~%~&[DEBUG build-yaml-context] === YAML END ===~%" yaml))
-        yaml))))
+        ;; Append long-term memory (durable facts from the *mem-engine*).
+        (let ((mem (mem-context-block)))
+          (if mem (format nil "~A~%~A" yaml mem) yaml))))))

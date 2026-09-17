@@ -16,6 +16,27 @@
   (merge-pathnames (format nil "~A.json" *session-id*)
                    (sessions-dir)))
 
+(defun mem-session-facts-path ()
+  "Long-term memory dump. Global (not keyed by session id): it carries durable
+   project knowledge across sessions and processes."
+  (merge-pathnames "longterm-mem.lisp" (dumps-dir)))
+
+(defun bounded-fact-data (data)
+  "Return DATA (a plist) with its big payload keys (:text/:contents/:output)
+   clipped to max-fact-payload-chars for persistence. Facts are evidential
+   and re-derivable; persisting full file/command dumps would bloat the
+   session .lisp / .json records with megabytes of raw text. Clipped with the
+   same head+tail marker used when rendering context."
+  (let ((limit (max-fact-payload-chars))
+        (out '()))
+    (loop for (k v) on data by #'cddr
+          do (push k out)
+             (push (if (and (stringp v) (member k '(:contents :output :text)))
+                       (truncate-payload v limit)
+                       v)
+                   out))
+    (nreverse out)))
+
 (defun dump-facts-to-lisp ()
   "Write all current facts to a .lisp file for restore."
   (ensure-dirs)
@@ -33,22 +54,61 @@
       (format s "(defun restore-facts ()~%  (progn~%")
       (dolist (f facts)
         (let ((type (fact-slot f 'fact-type))
-              (data (fact-slot f 'data)))
+              (data (bounded-fact-data (fact-slot f 'data))))
           (format s "    (assert (harness-fact (fact-type ~S)~%"
                   type)
           (format s "                                 (timestamp (get-universal-time))~%")
           (format s "                                 (data (quote ~S))))~%" data)))
       (format s "    t))~%"))))
 
+(defun dump-mem-facts-to-lisp ()
+  "Write durable long-term memory facts to dumps/longterm-mem.lisp for the
+   next boot to reload (project knowledge survives across sessions)."
+  (ensure-dirs)
+  (let ((facts (mem-engine-facts)))
+    (with-open-file (s (mem-session-facts-path)
+                       :direction :output
+                       :if-exists :supersede)
+      (format s ";;; Long-term memory dump~%")
+      (format s ";;; Generated: ~A~%" (get-universal-time))
+      (format s "(defun restore-mem-facts ()~%  (progn~%")
+      (dolist (f facts)
+        (let ((type (fact-type-of f))
+              (data (bounded-fact-data (fact-data-of f))))
+          (format s "    (assert (harness-fact (fact-type ~S)~%"
+                  type)
+          (format s "                                 (timestamp (get-universal-time))~%")
+          (format s "                                 (data (quote ~S))))~%" data)))
+      (format s "    t))~%"))))
+
+(defun load-mem-engine ()
+  "Load the persisted long-term memory dump into the *mem-engine* (if present)."
+  (let ((path (mem-session-facts-path)))
+    (when (probe-file path)
+      (with-mem-engine
+        (let ((*package* (find-package :cl-harness)))
+          (load path))
+        (when (fboundp 'restore-mem-facts)
+          (restore-mem-facts))))))
+
+(defun clear-mem-persistence ()
+  "Drop persisted long-term memory from disk (used by :clearall)."
+  (let ((path (mem-session-facts-path)))
+    (when (probe-file path)
+      (delete-file path)))
+  (reset-mem-engine)
+  t)
+
 (defun facts-to-json-data ()
-  "Return facts as a JSON-compatible plist."
+  "Return facts as a JSON-compatible plist (payloads bounded, see
+   bounded-fact-data)."
   (let ((facts (collect-active-facts)))
     (list :session-id *session-id*
           :timestamp (get-universal-time)
           :facts (mapcar (lambda (f)
 (list :type (fact-slot f 'fact-type)
                                   :timestamp (fact-slot f 'timestamp)
-                                  :data (fact-slot f 'data)))
+                                  :data (bounded-fact-data (fact-slot f 'data))))
                          facts))))
 
 (defun dump-session-json ()
@@ -82,8 +142,9 @@
          (mapcar #'convert-to-json-map data)))))
 
 (defun save-session ()
-  "Full persistence: dump .lisp, dump .json, dump metrics."
+  "Full persistence: dump .lisp, dump long-term memory, dump .json, dump metrics."
   (dump-facts-to-lisp)
+  (dump-mem-facts-to-lisp)
   (dump-session-json)
   (metrics-to-json)
   (format t "~&Session ~A saved.~%" *session-id*))
@@ -106,6 +167,8 @@
               (load path))
             (when (fboundp 'restore-facts)
               (restore-facts))
+            ;; Restore long-term memory into the mem engine as well.
+            (load-mem-engine)
             (format t "~&Session ~A restored.~%" sid))
           (format t "~&No dump found for session ~A.~%" sid)))))
 
