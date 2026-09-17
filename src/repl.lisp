@@ -26,10 +26,7 @@
 (defun load-system-prompt ()
   "Load the system prompt from file."
   (if (probe-file (system-prompt-path))
-      (with-open-file (s (system-prompt-path) :direction :input)
-        (let ((buf (make-string (file-length s))))
-          (read-sequence buf s)
-          buf))
+      (read-file-contents (system-prompt-path))
       "You are a helpful coding assistant. You have access to the user's
 working context via structured facts. Help them with their task."))
 
@@ -117,11 +114,14 @@ working context via structured facts. Help them with their task."))
        t)
 
        ((string= cmd ":exec")
-        (let ((shell-cmd (subseq input (1+ (position #\Space input)))))
-          (format t "~&> ~A~%" shell-cmd)
-          (let ((result (exec-command shell-cmd)))
-            (format t "~A~%" (getf result :output))
-            (format t "(exit: ~A)~%" (getf result :exit-code))))
+        (let ((space (position #\Space input)))
+          (if space
+              (let ((shell-cmd (subseq input (1+ space))))
+                (format t "~&> ~A~%" shell-cmd)
+                (let ((result (exec-command shell-cmd)))
+                  (format t "~A~%" (getf result :output))
+                  (format t "(exit: ~A)~%" (getf result :exit-code))))
+              (format t "~&Usage: :exec COMMAND~%")))
         t)
 
       ((string= cmd ":read")
@@ -152,8 +152,8 @@ working context via structured facts. Help them with their task."))
        t)
 
       ((string= cmd ":clear")
-       (clear)
-       (format t "~&Facts cleared.~%")
+       (reset-turn-engine)
+       (format t "~&Turn working memory cleared (rules kept).~%")
        t)
 
       ((or (string= cmd ":clearall")
@@ -195,6 +195,7 @@ working context via structured facts. Help them with their task."))
   "Single turn: build context → call LLM → register response.
     Records per-turn context metrics (Phase 0) and tags every fact with
     the causal :turn-id / :parent-id metadata (Phase 2)."
+  (setf *loop-alerted-turn* nil)
   (incf *turn-counter*)
   (let* ((turn *turn-counter*)
          ;; Register user input as fact, tagged with its causal turn id
@@ -213,6 +214,7 @@ working context via structured facts. Help them with their task."))
          (response (handler-case
                         (progn
                           (setf *last-llm-usage* nil)
+                          (setf *last-llm-call-info* nil)
                           (when streamed
                             (format *standard-output* "~&assistant>~%")
                             (force-output *standard-output*))
@@ -221,7 +223,9 @@ working context via structured facts. Help them with their task."))
     (record-context-metrics context user-message
                             :naive-str naive
                             :real-prompt (getf *last-llm-usage* :prompt)
-                            :real-completion (getf *last-llm-usage* :completion))
+                            :real-completion (getf *last-llm-usage* :completion)
+                            :llm-iterations (getf *last-llm-call-info* :iterations)
+                            :llm-path (getf *last-llm-call-info* :path))
     ;; Register LLM response as fact (skip error markers)
     (when (and response (not (search "[LLM ERROR]" response :test #'char=)))
       (assert (harness-fact (fact-type "llm-response")
@@ -234,6 +238,8 @@ working context via structured facts. Help them with their task."))
               turn user-message (length context) *llm-streamed*)
       (when (and *llm-streamed* response)
         (format t "~&[DEBUG process-turn] response-len=~A~%" (length response))))
+    ;; End of turn: project durable knowledge into long-term memory.
+    (promote-durable-facts)
     response))
 
 (defun run-one-shot (user-message &optional (reset-engine t))
@@ -242,8 +248,10 @@ working context via structured facts. Help them with their task."))
    run.sh); NIL continues the session already living in a saved core image."
   (load-config)
   (when reset-engine
-    (reset)
-    (reset-turn-counter))
+    ;; Fresh process: reset both engines and reload persisted long-term memory.
+    (boot-memory)
+    (reset-turn-counter)
+    (new-session-id))
   (metrics-reset)
   (let* ((system-prompt (load-system-prompt))
          (response (or (process-turn user-message system-prompt)
@@ -252,11 +260,20 @@ working context via structured facts. Help them with their task."))
       (format t "~&assistant> ~A~%" response))
     (save-session)
     (finish-output)
-    (sb-ext:exit :code (if (or (search "[LLM ERROR]" response :test #'char=)
-                               (search "[LLM API ERROR]" response :test #'char=)
-                               (search "[LLM JSON ERROR]" response :test #'char=))
-                           1
-                           0))))
+    (let ((path (getf *last-llm-call-info* :path))
+          (failed (or (search "[LLM ERROR]" response :test #'char=)
+                      (search "[LLM API ERROR]" response :test #'char=)
+                      (search "[LLM JSON ERROR]" response :test #'char=)
+                      (search "[LLM PARCIAL]" response :test #'char=)
+                      (search "[HARNESS LOOP DETECTOR]" response :test #'char=))))
+      (sb-ext:exit :code (if (or failed
+                                 (member path
+                                         '(:tool-loop :api-error :json-error
+                                                      :transport-error
+                                                      :exhaustion-partial
+                                                      :exhaustion-error)))
+                             1
+                             0)))))
 
 (defun start-harness (&optional (reset-engine t))
   "Start the interactive REPL loop.
@@ -264,18 +281,19 @@ working context via structured facts. Help them with their task."))
    booting from a saved SBCL core image)."
   (load-config)
   (when reset-engine
-    (reset)
-    ;; Fresh engine also starts from turn 0. On an image resume
+    (boot-memory)
+    ;; Fresh engines also start from turn 0. On an image resume
     ;; (RESET-ENGINE NIL) the counters captured in the image are kept so
     ;; turn/todo/epoch ids stay monotonic across reboots.
-    (reset-turn-counter))
+    (reset-turn-counter)
+    (new-session-id))
   (metrics-reset)
   (print-welcome)
   (setf *running* t)
   (let ((system-prompt (load-system-prompt)))
     (loop while *running*
           do (format t "~&user> ")
-             (force-output *standard-input*)
+             (force-output *standard-output*)
              (let ((input (read-line *standard-input* nil nil)))
                (cond
                  ((null input)
@@ -295,11 +313,13 @@ working context via structured facts. Help them with their task."))
   (setf *running* nil))
 
 (defun clear-all ()
-  "Full factory reset: wipe Lisa working memory AND all harness-level state
-   (turn/todo/epoch counters, metrics), then start a fresh session with a new
-   session id. Rules and config are kept. Used to begin something new on top
-   of a binary that may carry state from a previous run."
-  (clear)
+  "Full factory reset: wipe BOTH Lisa engines (turn working memory + persisted
+   long-term memory), reset all harness-level state (turn/todo/epoch counters,
+   metrics), and start a fresh session with a new session id. Rules and config
+   are kept. Used to begin something new on top of a binary that may carry
+   state from a previous run."
+  (reset-turn-engine)
+  (clear-mem-persistence)
   (reset-turn-counter)
   (setf *todo-counter* 0)
   (setf *epoch-counter* 0)
