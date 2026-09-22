@@ -705,10 +705,13 @@
                                               :method :post
                                               :headers headers
                                               :content json-body
+					      :read-timeout 120
                                               :force-binary t))
-               (response (if (stringp raw-response)
-                             raw-response
-                             (coerce raw-response 'string)))
+               ;;(response (if (stringp raw-response)
+               ;;              raw-response
+               ;;              (coerce raw-response 'string)))
+	                      (response (decode-response raw-response))
+	       
                (resp-obj (com.inuoe.jzon:parse response)))
           (when *debug-mode*
             (format t "~&[DEBUG llm] response=~A~%" response))
@@ -806,10 +809,151 @@
       (stream-llm-with-tools system-prompt context user-message)
       (call-llm-with-tools/static system-prompt context user-message)))
 
+
+;;
+;; BATCH MODE
+;;
+(defun get-batch-instructions ()
+  "Instrucciones técnicas para que el LLM emita lotes en S-expressions."
+  (format nil "~%~%<batch_execution_mode>
+  <critical_instruction>
+    You do NOT have interactive tool-use or function calling. 
+    You must plan your entire approach upfront and output ALL required actions in a 
+    SINGLE response as pure Lisp S-expressions.
+  </critical_instruction>
+  <strict_format_rules>
+    <rule>Do NOT use XML tags for your output (e.g., <function_calls>).</rule>
+    <rule>Do NOT use markdown code blocks (e.g., ```lisp).</rule>
+    <rule>Do NOT explain what you are doing.</rule>
+    <rule>Do NOT overthink. If the user asks for a plan, report, or explanation, you MUST FIRST emit actions to read the relevant files and run commands. The harness will execute them and send you the results. THEN you can write the plan in your final response.</rule>
+    <rule>CRITICAL: If the provided context YAML already contains the file contents or command results you need, DO NOT emit actions to read them again. Output your final text answer immediately.</rule>
+    <rule>JUST output the raw Lisp S-expressions.</rule>
+  </strict_format_rules>
+  <available_actions>
+    <action name=\"read-file\">(read-file \"path/to/file\")</action>
+    <action name=\"exec-command\">(exec-command \"shell command here\")</action>
+    <action name=\"write-file\">(write-file \"path/to/file\" \"full file content here\")</action>
+    <action name=\"edit-file\">(edit-file \"path/to/file\" \"exact old string\" \"new string\")</action>
+  </available_actions>
+  <example>
+    (read-file \"src/main.lisp\")
+    (exec-command \"ls -la\")
+  </example>
+</batch_execution_mode>~%~%"))
+
+
+
+;; (defun assert-intention-from-form (form step-id)
+;;   "Convierte una S-expression parseada en un hecho de intención en Rete."
+;;   (when (consp form)
+;;     (let* ((action (first form))
+;;            (args (rest form))
+;;            (data (case action
+;;                    (read-file (list :action :read-file :path (first args)))
+;;                    (exec-command (list :action :exec-command :command (first args)))
+;;                    (write-file (list :action :write-file :path (first args) :content (second args)))
+;;                    (edit-file (list :action :edit-file :path (first args) :old-string (second args) :new-string (third args)))
+;;                    (otherwise nil))))
+;;       (when data
+;; 	(format t "~&[DEBUG parser] Asserting intention: ~A~%" data)
+;;         (assert (harness-fact
+;;                  (fact-type "intention")
+;;                  (timestamp (get-universal-time))
+;;                   (data (append data (list :step step-id :status :pending)))))))))
+
+(defun clean-llm-text (text)
+  "Normaliza el texto del LLM. Traduce tool-use nativo y arregla sintaxis rota."
+  (let ((clean text))
+    ;; 1. Remover code fences de markdown (```lisp, ```, etc.)
+    (setf clean (cl-ppcre:regex-replace-all "```[a-zA-Z]*" clean ""))
+    ;; 2. Remover tags XML sueltos (ej: <exec-command>, </batch_execution_mode>)
+    (setf clean (cl-ppcre:regex-replace-all "</?[a-zA-Z_\\-]+>" clean ""))
+    ;; 3. Arreglar read-filepath path -> (read-file "path")
+    (setf clean (cl-ppcre:regex-replace-all "read-filepath\\s*\"?([^\"\\n<]+)\"?" clean "(read-file \"\\1\")"))
+    ;; 4. Arreglar <exec-command("cmd")> -> (exec-command "cmd")
+    (setf clean (cl-ppcre:regex-replace-all "<exec-command\\(\"(.*?)\"\\)>" clean "(exec-command \"\\1\")"))
+    ;; 5. Arreglar read-file sin paréntesis -> (read-file "path")
+    (setf clean (cl-ppcre:regex-replace-all "(?<!\\()read-file\\s+\"(.*?)\"" clean "(read-file \"\\1\")"))
+    ;; 6. Arreglar exec-command sin paréntesis -> (exec-command "cmd")
+    (setf clean (cl-ppcre:regex-replace-all "(?<!\\()exec-command\\s+\"(.*?)\"" clean "(exec-command \"\\1\")"))
+    clean))
+
+(defun assert-intention-from-form (form step-id)
+  "Convierte una S-expression parseada en un hecho de intención en Rete."
+  (when (consp form)
+    (let* ((action (first form))
+           (args (rest form))
+           ;; Comparamos por nombre de string para evitar problemas de paquetes
+           (data (cond
+                   ((string-equal action "read-file")
+                    (list :action :read-file :path (first args)))
+                   ((string-equal action "exec-command")
+                    (list :action :exec-command :command (first args)))
+                   ((string-equal action "write-file")
+                    (list :action :write-file :path (first args) :content (second args)))
+                   ((string-equal action "edit-file")
+                    (list :action :edit-file :path (first args) :old-string (second args) :new-string (third args)))
+                   (t nil))))
+      (when data
+        (format t "~&[DEBUG parser] Asserting intention: ~A~%" data)
+        (assert (harness-fact
+                 (fact-type "intention")
+                 (timestamp (get-universal-time))
+                 (data (append data (list :step step-id :status :pending)))))))))
+
+
+(defun parse-llm-batch-to-intentions (text)
+  "Escanea el texto del LLM, busca S-expressions y las aserta en Rete con su número de paso."
+  (let ((parsed-something nil))
+    (when (and text (stringp text) (plusp (length text)))
+      (let ((clean-text (clean-llm-text text))) ;; <--- ACÁ LIMPIAMOS
+        (handler-case
+            (loop with pos = 0
+                  for step-id from 1
+                  while (< pos (length clean-text))
+                  do (multiple-value-bind (form new-pos)
+                         (read-from-string clean-text nil :eof :start pos)
+                     (when (eq form :eof) (return))
+                     (when (assert-intention-from-form form step-id)
+                       (setf parsed-something t))
+                     (setf pos new-pos)))
+          (error () nil))))
+    parsed-something))
+
+
+;; (defun parse-llm-batch-to-intentions (text)
+;;   "Escanea el texto del LLM, busca S-expressions y las aserta en Rete con su número de paso."
+;;   (when (and text (stringp text) (plusp (length text)))
+;;     ;; Limpiamos los backticks de markdown que el LLM suele agregar
+;;     (let ((clean-text (remove-if (lambda (c) (char= c #\`)) text)))
+;;       (handler-case
+;;           (loop with pos = 0
+;;                 for step-id from 1
+;;                 while (< pos (length clean-text))
+;;                 do (multiple-value-bind (form new-pos)
+;;                        (read-from-string clean-text nil :eof :start pos)
+;;                      (when (eq form :eof) (return))
+;;                      (assert-intention-from-form form step-id)
+;;                      (setf pos new-pos)))
+;;         (error () nil)))))
+
+;; (defun parse-llm-batch-to-intentions (text)
+;;   "Escanea el texto del LLM, busca S-expressions y las aserta en Rete con su número de paso."
+;;   (when (and text (stringp text) (plusp (length text)))
+;;     (handler-case
+;;         (loop with pos = 0
+;;               for step-id from 1
+;;               while (< pos (length text))
+;;               do (multiple-value-bind (form new-pos)
+;;                      (read-from-string text nil :eof :start pos)
+;;                    (when (eq form :eof) (return))
+;;                    (assert-intention-from-form form step-id)
+;;                    (setf pos new-pos)))
+;;       (error () nil))))
+
+
 (defun call-llm (system-prompt context user-message)
-  "Dispatch to the configured LLM provider.
-    OpenAI-compatible and Gemini providers use a tool-use loop so the model
-    can request exec/read/write actions. Other providers return plain text."
+  "Dispatch to the configured LLM provider."
   (let ((provider (llm-provider)))
     (cond
       ((string-equal provider "anthropic")
@@ -818,4 +962,15 @@
        (call-ollama system-prompt context user-message))
       ((gemini-p)
        (call-gemini system-prompt context user-message))
-      (t (call-llm-with-tools system-prompt context user-message)))))
+            ((string-equal provider "batch")
+       (let* ((full-prompt (concatenate 'string system-prompt (get-batch-instructions)))
+              (llm-text (call-openai-compat full-prompt context user-message)))
+         ;; CAMBIÁ EL FORMAT PARA USAR ~S:
+         (format t "~&[DEBUG call-llm] Texto recibido: ~S~%" llm-text)
+         (parse-llm-batch-to-intentions llm-text)
+     llm-text))
+
+      (t 
+       (call-llm-with-tools system-prompt context user-message)))))
+
+

@@ -519,3 +519,105 @@
                    (string= ?t "file-write"))))
     =>
     (retract ?older)))
+
+
+
+
+;;; ============================================================
+;;; Intention Execution Rules (The Batch Processor)
+;;; ============================================================
+;;; El LLM ya no llama herramientas por el protocolo HTTP.
+;;; Entrega un batch de intenciones en texto, el parser las aserta aquí,
+;;; y estas reglas dispara las funciones POSIX originales.
+;;; Las funciones POSIX (exec-command, read-file, etc.) ya asertan
+;;; los hechos "command-exec", "file-read", etc., sobre los cuales
+;;; tus reglas de pruning y loop detection actúan automáticamente.
+
+(defrule execute-intention-read (:salience 5)
+  (?f (harness-fact (fact-type "intention") (data ?d)))
+  (test (eq (data-get ?d :action) :read-file))
+  =>
+  ;; Llama a tu función original. Ella misma hará el (assert (harness-fact "file-read" ...))
+  (read-file (data-get ?d :path))
+  ;; Retraemos la intención para que no se ejecute de nuevo en el próximo (run)
+  (retract ?f))
+
+(defrule execute-intention-write (:salience 4)
+  (?f (harness-fact (fact-type "intention") (data ?d)))
+  (test (eq (data-get ?d :action) :write-file))
+  =>
+  (write-file (data-get ?d :path) (data-get ?d :content))
+  (retract ?f))
+
+(defrule execute-intention-edit (:salience 4)
+  (?f (harness-fact (fact-type "intention") (data ?d)))
+  (test (eq (data-get ?d :action) :edit-file))
+  =>
+  (edit-file (data-get ?d :path) (data-get ?d :old-string) (data-get ?d :new-string))
+  (retract ?f))
+
+
+(defrule execute-intention-command (:salience 3)
+  (?f (harness-fact (fact-type "intention") (data ?d)))
+  (test (eql (data-get ?d :action) :exec-command))
+  =>
+  (format t "~&[DEBUG rule] Ejecutando comando en Rete...~%") ;; <--- ESTA LÍNEA
+  (exec-command (data-get ?d :command))
+  (retract ?f))
+
+
+
+(defun detect-blind-writes ()
+  "Returns T if a write_file intention lacks a prior read in this turn."
+  (let ((turn (current-turn-id)))
+    (let ((read-paths
+            (loop for f in (mapcar #'first (retrieve (?f) (?f (harness-fact))))
+                  for d = (fact-data-of f)
+                  for type = (fact-type-of f)
+                  when (eql (data-get d :turn-id) turn)
+                    nconc (cond
+                            ((and (string= type "file-read")
+                                  (stringp (data-get d :path)))
+                             (list (path-basename (data-get d :path))))
+                            ((and (string= type "intention")
+                                  (eql (data-get d :action) :read-file)
+                                  (stringp (data-get d :path)))
+                             (list (path-basename (data-get d :path))))
+                            (t nil)))))
+      (loop for f in (mapcar #'first (retrieve (?f) (?f (harness-fact))))
+            for d = (fact-data-of f)
+            for type = (fact-type-of f)
+            when (and (string= type "intention")
+                      (eql (data-get d :action) :write-file)
+                      (eql (data-get d :turn-id) turn))
+              unless (member (path-basename (or (data-get d :path) "")) read-paths :test #'string=)
+                do (assert (harness-fact
+                             (fact-type "batch-abort")
+                             (timestamp (get-universal-time))
+                             (data (list :reason "Blind write attempt"
+                                         :path (data-get d :path)))))
+                   and count t into abort-count
+            finally (return (plusp abort-count))))))
+
+
+
+;;; Si se detecta un aborto, cancelamos todas las intenciones restantes
+(defrule cancel-intentions-on-abort (:salience 20) ; Mayor que las de ejecución
+  (harness-fact (fact-type "batch-abort"))
+  (?f (harness-fact (fact-type "intention")))
+  =>
+  (retract ?f))
+
+;;; ============================================================
+;;; Emergency Brake (Freno de Emerencia para Batch)
+;;; ============================================================
+
+(defrule batch-emergency-brake (:salience 20)
+  (?f (harness-fact (fact-type "command-exec") (data ?d)))
+  (test (and (eql (data-get ?d :turn-id) (current-turn-id))
+             (real-error-p "command-exec" ?d)))
+  (?intent (harness-fact (fact-type "intention") (data ?i-data)))
+  (test (and (eql (data-get ?i-data :turn-id) (current-turn-id))
+             (eql (data-get ?i-data :status) :pending)))
+  =>
+  (retract ?intent))

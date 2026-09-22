@@ -135,7 +135,7 @@
    Registers as a fact in Rete."
   (let* ((full (resolve-path path))
          (contents
-           (if (probe-file full)
+           (if (uiop:file-exists-p full) 
                (read-file-contents full)
                (format nil "ERROR: File not found: ~A" (namestring full)))))
     (assert (harness-fact (fact-type "file-read")
