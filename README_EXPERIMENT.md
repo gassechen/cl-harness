@@ -117,13 +117,17 @@ un informe útil. **No colapsó.**
 
 ## 6. Hallazgos (nuevos, no documentados)
 
-1. **Auto-recuperación de blind-writes, sin regla, por construcción.**
-   El modelo editó archivos sin leerlos y el sistema no colapsó porque
-   `edit-file` es quirúrgico: `old_string not found` = no toca nada y registra
-   el hecho. La regla `detect-blind-writes` existe pero **sigue sin estar
-   conectada** (README §7): hoy la protección es la atomicidad de `edit-file`,
-   no el freno. → **Refuerzo lógico próximo: conectar `detect-blind-writes` a
-   una regla que aserte `batch-abort`.**
+1. **Auto-recuperación de blind-writes, sin regla, por construcción** — el
+   modelo editó archivos sin leerlos y el sistema no colapsó porque `edit-file`
+   es quirúrgico: `old_string not found` = no toca nada y registra el hecho.
+   **RESUELTO (post-experimento):** `detect-blind-writes` quedó conectado al
+   bucle batch en `process-turn` y cubre tanto `write-file` como `edit-file`:
+   una intención de escritura/edición sin lectura previa del archivo en el
+   turno aserta `batch-abort` y `cancel-intentions-on-abort` (salience 20)
+   retracta las intenciones restantes (ver README §7). La atomicidad de
+   `edit-file` sigue siendo la red de seguridad, pero ya existe el freno
+   declarativo (el `.lisp` del experimento refleja el estado anterior al
+   refuerzo).
 
 2. **`batch-emergency-brake` no disparó — y no tenía que disparar.**
    Solo se activa con `command-exec` con error real; aquí el único comando fue
@@ -134,9 +138,11 @@ un informe útil. **No colapsó.**
 
 3. **Métricas ciegas al modo batch.** `llm-iterations: 0` y `tools: false` con
    un turno que **sí** hizo dos pasadas (2 llamadas LLM). El contador de
-   iteraciones y el flag de tools están implementados para el tool-loop HTTP,
-   no para el bucle Rete del batch. → El contador debe sumar las re-llamadas
-   del modo batch.
+   iteraciones y el flag de tools estaban implementados para el tool-loop HTTP,
+   no para el bucle Rete del batch. **RESUELTO (post-experimento):**
+   `process-turn` ahora lleva `batch-iterations` (1 por la llamada inicial + 1
+   por cada re-llamada del bucle) y lo reporta como `llm-iterations` — en este
+   turno habría reportado `2` en vez de `0`.
 
 4. **Modelo distinto por llamada dentro del mismo turno: irrelevante.**
    El plan lo escribió un modelo y la re-lectura + informe final otro. Funcionó
@@ -158,6 +164,8 @@ pipeline solo puede mejorar.
 > Método de validación: "se hace ingeniería para las peores condiciones. Si
 > funciona ahí, mejorando el entorno solo puede mejorar."
 
-Siguientes refuerzos sugeridos (ver §6): conectar `detect-blind-writes`,
-contar iteraciones del modo batch en métricas, y evaluar el freno de emergencia
-frente a errores de edición, no solo de comando.
+Siguientes refuerzos sugeridos (ver §6): ya conectado `detect-blind-writes` a
+`write-file` y `edit-file` (post-experimento), y ya contado el modo batch en
+`llm-iterations` vía `batch-iterations` en `process-turn` (post-experimento);
+el freno de emergencia se decidió mantener solo para errores reales de comando,
+no para fallos de edición (feedback recuperable del bucle, no datos de corte).

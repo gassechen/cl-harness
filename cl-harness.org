@@ -429,10 +429,12 @@ como S-expressions Lisp puras. El flujo:
    - =cancel-intentions-on-abort=: si existe un hecho =batch-abort=, retracta
      todas las intenciones restantes.
 
-=detect-blind-writes= es un helper que detectaría una intención =write-file=
-sin lectura previa del archivo en el turno (para asertar =batch-abort=), pero
-hoy *no está conectado* a ninguna regla: la protección activa es
-=batch-emergency-brake=.
+=detect-blind-writes= (llamada desde =process-turn= en cada ronda del bucle
+batch) detecta una intención =write-file= *o =edit-file=* sin lectura previa
+del archivo en el turno y aserta =batch-abort=; la regla
+=cancel-intentions-on-abort= (salience 20) la consume retractando todas las
+intenciones restantes. Es la protección activa contra reescribir a ciegas
+archivos que el modelo nunca leyó.
 
 ** 8. Streaming en vivo (opencode-style)
 

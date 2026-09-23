@@ -568,7 +568,7 @@
 
 
 (defun detect-blind-writes ()
-  "Returns T if a write_file intention lacks a prior read in this turn."
+  "Returns T if a write_file/edit_file intention lacks a prior read in this turn."
   (let ((turn (current-turn-id)))
     (let ((read-paths
             (loop for f in (mapcar #'first (retrieve (?f) (?f (harness-fact))))
@@ -588,7 +588,8 @@
             for d = (fact-data-of f)
             for type = (fact-type-of f)
             when (and (string= type "intention")
-                      (eql (data-get d :action) :write-file)
+                      (or (eql (data-get d :action) :write-file)
+                          (eql (data-get d :action) :edit-file))
                       (eql (data-get d :turn-id) turn))
               unless (member (path-basename (or (data-get d :path) "")) read-paths :test #'string=)
                 do (assert (harness-fact
@@ -621,3 +622,4 @@
              (eql (data-get ?i-data :status) :pending)))
   =>
   (retract ?intent))
+
