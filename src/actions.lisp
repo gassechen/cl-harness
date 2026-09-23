@@ -203,6 +203,9 @@
                 :replaced-chars (length old-string)
                 :new-chars (length new-string))))))
 
+
+
+
 (defun write-file (path content)
   "Write content to a file (relative paths resolve against the harness
    base directory). Registers as a fact in Rete.
@@ -211,7 +214,10 @@
    exists with significant content, we refuse and point the model to
    edit_file — otherwise weak models re-emit entire big files and truncate
    them mid-way, corrupting the workspace."
-  (let ((full (resolve-path path)))
+  ;; ACÁ AGREGAMOS LA LIMPIEZA DE SALTOS DE LÍNEA:
+  (let* ((full (resolve-path path))
+         (clean-content (cl-ppcre:regex-replace-all "\\\\n" content (string #\Newline)))
+         (clean-content (cl-ppcre:regex-replace-all "\\\\t" clean-content (string #\Tab))))
     (when (probe-file full)
       (let ((size (with-open-file (s full) (file-length s))))
         (when (> size 2000)
@@ -221,9 +227,11 @@
                   :error (format nil "~A already exists (~A bytes). write_file is only for NEW files; to modify an existing file use edit_file with the exact snippet to replace."
                                  (namestring full) size))))))
     (ensure-directories-exist full)
+    ;; ACÁ USAMOS CLEAN-CONTENT EN VEZ DE CONTENT:
     (with-open-file (s full :direction :output :if-exists :supersede)
-      (write-string content s))
-    (let ((bytes (length content)))
+      (write-string clean-content s))
+    ;; ACÁ TAMBIÉN USAMOS CLEAN-CONTENT:
+    (let ((bytes (length clean-content)))
       (assert (harness-fact (fact-type "file-write")
                             (timestamp (get-universal-time))
                             (data (list :path (namestring full)
@@ -231,3 +239,4 @@
                                         :turn-id (current-turn-id)
                                         :parent-id (current-turn-id)))))
       (list :path (namestring full) :bytes bytes))))
+

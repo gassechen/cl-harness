@@ -878,21 +878,23 @@
     (setf clean (cl-ppcre:regex-replace-all "(?<!\\()exec-command\\s+\"(.*?)\"" clean "(exec-command \"\\1\")"))
     clean))
 
+
 (defun assert-intention-from-form (form step-id)
   "Convierte una S-expression parseada en un hecho de intención en Rete."
   (when (consp form)
     (let* ((action (first form))
            (args (rest form))
-           ;; Comparamos por nombre de string para evitar problemas de paquetes
+           ;; ACÁ FORZAMOS QUE TODO SEA STRING (Anticrash por over-escaping del LLM)
+           (str-args (mapcar (lambda (x) (if (stringp x) x (princ-to-string x))) args))
            (data (cond
                    ((string-equal action "read-file")
-                    (list :action :read-file :path (first args)))
+                    (list :action :read-file :path (first str-args)))
                    ((string-equal action "exec-command")
-                    (list :action :exec-command :command (first args)))
+                    (list :action :exec-command :command (first str-args)))
                    ((string-equal action "write-file")
-                    (list :action :write-file :path (first args) :content (second args)))
+                    (list :action :write-file :path (first str-args) :content (second str-args)))
                    ((string-equal action "edit-file")
-                    (list :action :edit-file :path (first args) :old-string (second args) :new-string (third args)))
+                    (list :action :edit-file :path (first str-args) :old-string (second str-args) :new-string (third str-args)))
                    (t nil))))
       (when data
         (format t "~&[DEBUG parser] Asserting intention: ~A~%" data)
@@ -903,10 +905,10 @@
 
 
 (defun parse-llm-batch-to-intentions (text)
-  "Escanea el texto del LLM, busca S-expressions y las aserta en Rete con su número de paso."
+  "Escanea el texto del LLM, busca S-expressions y las aserta en Rete."
   (let ((parsed-something nil))
     (when (and text (stringp text) (plusp (length text)))
-      (let ((clean-text (clean-llm-text text))) ;; <--- ACÁ LIMPIAMOS
+      (let ((clean-text (clean-llm-text text)))
         (handler-case
             (loop with pos = 0
                   for step-id from 1
@@ -918,38 +920,14 @@
                        (setf parsed-something t))
                      (setf pos new-pos)))
           (error () nil))))
+    ;; NUEVO: Si no parseó nada, el LLM dio su respuesta final. Le avisamos a Rete.
+    (unless parsed-something
+      (assert (harness-fact 
+               (fact-type "batch-complete")
+               (timestamp (get-universal-time))
+               (data (list :turn-id (current-turn-id))))))
     parsed-something))
 
-
-;; (defun parse-llm-batch-to-intentions (text)
-;;   "Escanea el texto del LLM, busca S-expressions y las aserta en Rete con su número de paso."
-;;   (when (and text (stringp text) (plusp (length text)))
-;;     ;; Limpiamos los backticks de markdown que el LLM suele agregar
-;;     (let ((clean-text (remove-if (lambda (c) (char= c #\`)) text)))
-;;       (handler-case
-;;           (loop with pos = 0
-;;                 for step-id from 1
-;;                 while (< pos (length clean-text))
-;;                 do (multiple-value-bind (form new-pos)
-;;                        (read-from-string clean-text nil :eof :start pos)
-;;                      (when (eq form :eof) (return))
-;;                      (assert-intention-from-form form step-id)
-;;                      (setf pos new-pos)))
-;;         (error () nil)))))
-
-;; (defun parse-llm-batch-to-intentions (text)
-;;   "Escanea el texto del LLM, busca S-expressions y las aserta en Rete con su número de paso."
-;;   (when (and text (stringp text) (plusp (length text)))
-;;     (handler-case
-;;         (loop with pos = 0
-;;               for step-id from 1
-;;               while (< pos (length text))
-;;               do (multiple-value-bind (form new-pos)
-;;                      (read-from-string text nil :eof :start pos)
-;;                    (when (eq form :eof) (return))
-;;                    (assert-intention-from-form form step-id)
-;;                    (setf pos new-pos)))
-;;       (error () nil))))
 
 
 (defun call-llm (system-prompt context user-message)

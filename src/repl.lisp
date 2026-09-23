@@ -191,56 +191,7 @@ working context via structured facts. Help them with their task."))
        (format t "~&Unknown command: ~A~%" cmd)
        t))))
 
-;; (defun process-turn (user-message system-prompt)
-;;   "Single turn: build context → call LLM → register response.
-;;     Records per-turn context metrics (Phase 0) and tags every fact with
-;;     the causal :turn-id / :parent-id metadata (Phase 2)."
-;;   (setf *loop-alerted-turn* nil)
-;;   (incf *turn-counter*)
-;;   (let* ((turn *turn-counter*)
-;;          ;; Register user input as fact, tagged with its causal turn id
-;;          (naive (progn
-;;                   (assert (harness-fact (fact-type "user-input")
-;;                                        (timestamp (get-universal-time))
-;;                                        (data (list :text user-message
-;;                                                    :turn-id turn))))
-;;                   ;; Snapshot the NAIVE baseline BEFORE pruning rules run,
-;;                   ;; so the metrics show the reduction rules really produce.
-;;                   (naive-context-string)))
-;;          (context (build-yaml-context user-message))
-;;          ;; Signal live output mode before calling LLM so the user sees
-;;          ;; 'assistant>' while the streaming deltas arrive.
-;;          (streamed (llm-stream-p))
-;;          (response (handler-case
-;;                         (progn
-;;                           (setf *last-llm-usage* nil)
-;;                           (setf *last-llm-call-info* nil)
-;;                           (when streamed
-;;                             (format *standard-output* "~&assistant>~%")
-;;                             (force-output *standard-output*))
-;;                           (call-llm system-prompt context user-message))
-;;                       (error (e) (format nil "[LLM ERROR] ~A" e)))))
-;;     (record-context-metrics context user-message
-;;                             :naive-str naive
-;;                             :real-prompt (getf *last-llm-usage* :prompt)
-;;                             :real-completion (getf *last-llm-usage* :completion)
-;;                             :llm-iterations (getf *last-llm-call-info* :iterations)
-;;                             :llm-path (getf *last-llm-call-info* :path))
-;;     ;; Register LLM response as fact (skip error markers)
-;;     (when (and response (not (search "[LLM ERROR]" response :test #'char=)))
-;;       (assert (harness-fact (fact-type "llm-response")
-;;                            (timestamp (get-universal-time))
-;;                            (data (list :text response
-;;                                        :turn-id turn
-;;                                        :parent-id turn)))))
-;;     (when *debug-mode*
-;;       (format t "~&[DEBUG process-turn] turn=~A user=~A context-len=~A streamed=~A~%"
-;;               turn user-message (length context) *llm-streamed*)
-;;       (when (and *llm-streamed* response)
-;;         (format t "~&[DEBUG process-turn] response-len=~A~%" (length response))))
-;;     ;; End of turn: project durable knowledge into long-term memory.
-;;     (promote-durable-facts)
-;;     response))
+
 
 
 (defun process-turn (user-message system-prompt)
@@ -268,23 +219,39 @@ working context via structured facts. Help them with their task."))
                      (error (e) (format nil "[LLM ERROR] ~A" e)))))
 
     ;; --- BUKLE DE EJECUCIÓN BATCH (Máx 5 rondas) ---
+    ;; (when (and (string-equal (llm-provider) "batch")
+    ;;            response
+    ;;            (not (search "[LLM ERROR]" response :test #'char=)))
+    ;;   (loop for i from 1 to 5
+    ;;         while (and response (not (search "[LLM ERROR]" response :test #'char=)))
+    ;;         do (progn
+    ;;              (format t "~&[DEBUG process-turn] Disparando (run) - Ronda ~A...~%" i)
+    ;;              (run) ;; Ejecuta el lote que el LLM mandó
+    ;;              (let ((new-context (build-yaml-context user-message)))
+    ;;                ;; Llama al LLM con los resultados de la ejecución
+    ;;                (setf response (call-llm system-prompt new-context user-message))
+    ;;                ;; Si el LLM no mandó ninguna S-expression, cortamos el bucle
+    ;;                (unless (or (search "(read-file" response :test #'char=)
+    ;;                            (search "(exec-command" response :test #'char=)
+    ;;                            (search "(write-file" response :test #'char=)
+    ;;                            (search "(edit-file" response :test #'char=))
+    ;;                  (return))))))
+
+        ;; --- EJECUCIÓN CONTROLADA POR RETE ---
     (when (and (string-equal (llm-provider) "batch")
                response
                (not (search "[LLM ERROR]" response :test #'char=)))
-      (loop for i from 1 to 5
-            while (and response (not (search "[LLM ERROR]" response :test #'char=)))
+      (loop for i from 1 to 100  ;; Safety net hard limit
+            while (and response 
+                       (not (search "[LLM ERROR]" response :test #'char=))
+                       (not (batch-complete-p))) ;; RETE DECIDE CORTAR
             do (progn
                  (format t "~&[DEBUG process-turn] Disparando (run) - Ronda ~A...~%" i)
-                 (run) ;; Ejecuta el lote que el LLM mandó
+                 (run)
                  (let ((new-context (build-yaml-context user-message)))
-                   ;; Llama al LLM con los resultados de la ejecución
-                   (setf response (call-llm system-prompt new-context user-message))
-                   ;; Si el LLM no mandó ninguna S-expression, cortamos el bucle
-                   (unless (or (search "(read-file" response :test #'char=)
-                               (search "(exec-command" response :test #'char=)
-                               (search "(write-file" response :test #'char=)
-                               (search "(edit-file" response :test #'char=))
-                     (return))))))
+                   (setf response (call-llm system-prompt new-context user-message))))))
+    ;; -------------------------------
+    
       
     (record-context-metrics context user-message
                             :naive-str naive
@@ -306,6 +273,13 @@ working context via structured facts. Help them with their task."))
     (promote-durable-facts)
     response))
 
+
+
+(defun batch-complete-p ()
+  "Retorna T si Rete dice que el batch terminó."
+  (plusp (length (retrieve (?f)
+		   (?f (harness-fact
+			(fact-type "batch-complete")))))))
 
 
 
