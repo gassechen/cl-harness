@@ -199,14 +199,14 @@ working context via structured facts. Help them with their task."))
   (setf *loop-alerted-turn* nil)
   (incf *turn-counter*)
   (let* ((turn *turn-counter*)
-         (batch-iterations 1) ;; <--- NUEVO CONTADOR
+         (batch-iterations 1)
          (naive (progn
                   (assert (harness-fact (fact-type "user-input")
                             (timestamp (get-universal-time))
                             (data (list :text user-message
                                         :turn-id turn))))
                   (naive-context-string)))
-         (context (build-yaml-context user-message))
+         (context (build-yaml-context user-message)) ;; <--- ACÁ SE GENERA EL DUMP INICIAL
          (streamed (llm-stream-p))
          (response (handler-case
                        (progn
@@ -217,7 +217,6 @@ working context via structured facts. Help them with their task."))
                            (force-output *standard-output*))
                          (call-llm system-prompt context user-message))
                      (error (e) (format nil "[LLM ERROR] ~A" e)))))
-
     
     ;; --- EJECUCIÓN CONTROLADA POR RETE ---
     (when (and (string-equal (llm-provider) "batch")
@@ -231,17 +230,16 @@ working context via structured facts. Help them with their task."))
                  (format t "~&[DEBUG process-turn] Disparando (run) - Ronda ~A...~%" i)
                  (detect-blind-writes)
                  (run)
-                 (let ((new-context (build-yaml-context user-message)))
+                 (let ((new-context (build-yaml-context user-message))) ;; <--- ACÁ SE GENERA EL DUMP ACTUALIZADO
                    (setf response (call-llm system-prompt new-context user-message))
-                   (incf batch-iterations))))) ;; <--- SUMAMOS 1
+                   (incf batch-iterations))))) 
     ;; -------------------------------
     
-    ;; Le pasamos el contador real a las métricas
     (record-context-metrics context user-message
                             :naive-str naive
                             :real-prompt (getf *last-llm-usage* :prompt)
                             :real-completion (getf *last-llm-usage* :completion)
-                            :llm-iterations batch-iterations ;; <--- ACÁ LO USAMOS
+                            :llm-iterations batch-iterations
                             :llm-path (getf *last-llm-call-info* :path))
     (when (and response (not (search "[LLM ERROR]" response :test #'char=)))
       (assert (harness-fact (fact-type "llm-response")
@@ -259,12 +257,14 @@ working context via structured facts. Help them with their task."))
 
 
 
-(defun batch-complete-p ()
-  "Retorna T si Rete dice que el batch terminó."
-  (plusp (length (retrieve (?f)
-		   (?f (harness-fact
-			(fact-type "batch-complete")))))))
 
+(defun batch-complete-p (&optional (turn *turn-counter*))
+  "Retorna T si Rete dice que el batch del turno actual terminó."
+  (some (lambda (f)
+          (eql (data-get (fact-slot f 'data) :turn-id) turn))
+        (mapcar #'first
+                (retrieve (?f) (?f (harness-fact
+                                    (fact-type "batch-complete")))))))
 
 
 

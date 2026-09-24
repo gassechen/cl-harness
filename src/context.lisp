@@ -224,9 +224,10 @@
       (format t "~&[DEBUG select-relevant-facts] final-selected=~A total-used=~A~%" (length selected) used))
     (nreverse selected)))
 
-(defun grouped-context-string (facts)
-  "Render facts grouped by causal :turn-id (Phase 2 conversation graph),
-   including active epoch checkpoints and agent goals/todos."
+
+
+(defun grouped-context-string (facts now-turn)
+  "Render facts grouped by causal :turn-id, separating past from current turn."
   (let ((groups (make-hash-table :test #'eql))
         (epoch (current-epoch))
         (todos (collect-active-todos)))
@@ -240,74 +241,164 @@
                (setf (gethash turn groups)
                      (sort cells #'< :key #'car)))
              groups)
-    (with-output-to-string (s)
-      (format s "context:~%")
-      (format s "  session: ~A~%" (escape-yaml *session-id*))
-      ;; Render epoch baseline snapshot if present (OpenCode session_context_epoch)
-      (when epoch
-        (format s "  epoch:~%")
-        (format s "    id: ~A~%" (escape-yaml (get-slot-value epoch 'id)))
-        (format s "    baseline_turn: ~A~%" (get-slot-value epoch 'baseline-seq))
-        (format s "    summary: ~A~%" (escape-yaml (get-slot-value epoch 'summary))))
-      ;; Render goals / todos (mab.lisp backward-chaining goal tree)
-      (when todos
-        (format s "  goals:~%")
-        (dolist (td todos)
-          (let ((id (get-slot-value td 'id))
-                (task (get-slot-value td 'task))
-                (status (get-slot-value td 'status))
-                (priority (get-slot-value td 'priority))
-                (parent (get-slot-value td 'parent-id)))
-            (format s "    - id: ~A~%" (escape-yaml id))
-            (format s "      task: ~A~%" (escape-yaml task))
-            (format s "      status: ~A~%" (escape-yaml status))
-            (format s "      priority: ~A~%" (escape-yaml priority))
-            (unless (or (null parent) (string= parent "root"))
-              (format s "      parent_goal: ~A~%" (escape-yaml parent))))))
-      ;; Render loop warnings (derived by the detect-command-loop Rete rule)
-      (let ((loops (collect-tool-loops)))
-        (when loops
-          (format s "  warnings:~%")
-          (dolist (l loops)
-            (let* ((d (fact-data-of l))
-                   (family (or (data-get d :family) ""))
-                   (count (or (data-get d :count) 3)))
-              (format s "    - loop: ~A failing commands are the same retried attempt (family ~S). STOP re-running variants — change approach.~%"
-                      count family)))))
-      ;; Render turns
-      (format s "  turns:~%")
-      (dolist (turn (sort (loop for k being the hash-keys of groups collect k)
-                          #'<))
-        (format s "    ~A:~%" turn)
-        (dolist (cell (gethash turn groups))
-          (let ((type (cadr cell))
-                (data (cddr cell)))
-            (cond ((string= type "user-input")
-                   (format s "      user: ~A~%"
-                           (escape-yaml (or (data-get data :text) ""))))
-                  ((string= type "llm-response")
-                   (format s "      assistant: ~A~%"
-                           (escape-yaml (or (data-get data :text) ""))))
-                  ((string= type "command-exec")
-                   (format s "      exec: ~A -> exit ~A~%"
-                           (escape-yaml (or (data-get data :command) ""))
-                           (or (data-get data :exit-code) ""))
-                   (format s "        output: ~A~%"
-                           (escape-yaml (truncate-payload (or (data-get data :output) "")))))
-                  ((string= type "file-read")
-                   (format s "      read: ~A~%"
-                           (escape-yaml (or (data-get data :path) "")))
-                   (format s "        contents: ~A~%"
-                           (escape-yaml (truncate-payload (or (data-get data :contents) "")))))
-                  ((string= type "file-write")
-                   (format s "      wrote: ~A (~A bytes)~%"
-                           (escape-yaml (or (data-get data :path) ""))
-                           (or (data-get data :bytes) "")))
-                  ((string= type "tool-loop")
-                   ;; Already rendered in the top-level warnings block.
-                   nil)
-                  (t
-                   (format s "      ?~A: ~S~%" (escape-yaml type) data)))))))))
+    
+    (flet ((render-fact (s type data)
+             "Helper local para renderizar un hecho en YAML."
+             (cond ((string= type "user-input")
+                    (format s "      user: ~A~%" (escape-yaml (or (data-get data :text) ""))))
+                   ((string= type "llm-response")
+                    (format s "      assistant: ~A~%" (escape-yaml (or (data-get data :text) ""))))
+                   ((string= type "command-exec")
+                    (format s "      exec: ~A -> exit ~A~%" (escape-yaml (or (data-get data :command) "")) (or (data-get data :exit-code) ""))
+                    (format s "        output: ~A~%" (escape-yaml (truncate-payload (or (data-get data :output) "")))))
+                   ((string= type "file-read")
+                    (format s "      read: ~A~%" (escape-yaml (or (data-get data :path) "")))
+                    (format s "        contents: ~A~%" (escape-yaml (truncate-payload (or (data-get data :contents) "")))))
+                   ((string= type "file-write")
+                    (format s "      wrote: ~A (~A bytes)~%" (escape-yaml (or (data-get data :path) "")) (or (data-get data :bytes) "")))
+                   ((string= type "tool-loop") nil)
+                   (t (format s "      ?~A: ~S~%" (escape-yaml type) data)))))
+      
+      (with-output-to-string (s)
+        (format s "context:~%")
+        (format s "  session: ~A~%" (escape-yaml *session-id*))
+        
+        ;; Render epoch baseline snapshot if present
+        (when epoch
+          (format s "  epoch:~%")
+          (format s "    id: ~A~%" (escape-yaml (get-slot-value epoch 'id)))
+          (format s "    baseline_turn: ~A~%" (get-slot-value epoch 'baseline-seq))
+          (format s "    summary: ~A~%" (escape-yaml (get-slot-value epoch 'summary))))
+        
+        ;; Render goals / todos
+        (when todos
+          (format s "  goals:~%")
+          (dolist (td todos)
+            (let ((id (get-slot-value td 'id))
+                  (task (get-slot-value td 'task))
+                  (status (get-slot-value td 'status))
+                  (priority (get-slot-value td 'priority))
+                  (parent (get-slot-value td 'parent-id)))
+              (format s "    - id: ~A~%" (escape-yaml id))
+              (format s "      task: ~A~%" (escape-yaml task))
+              (format s "      status: ~A~%" (escape-yaml status))
+              (format s "      priority: ~A~%" (escape-yaml priority))
+              (unless (or (null parent) (string= parent "root"))
+                (format s "      parent_goal: ~A~%" (escape-yaml parent))))))
+        
+        ;; Render loop warnings
+        (let ((loops (collect-tool-loops)))
+          (when loops
+            (format s "  warnings:~%")
+            (dolist (l loops)
+              (let* ((d (fact-data-of l))
+                     (family (or (data-get d :family) ""))
+                     (count (or (data-get d :count) 3)))
+                (format s "    - loop: ~A failing commands are the same retried attempt (family ~S). STOP re-running variants — change approach.~%"
+                        count family)))))
+        
+        ;; Render PAST TURNS (Historia cerrada)
+        (format s "  prior_turns:~%")
+        (dolist (turn (sort (loop for k being the hash-keys of groups collect k) #'<))
+          (when (< turn now-turn)
+            (format s "    ~A:~%" turn)
+            (dolist (cell (gethash turn groups))
+              (render-fact s (cadr cell) (cddr cell)))))
+        
+        ;; Render CURRENT TURN (Lo que está pasando ahora)
+        (when (> now-turn 0)
+          (format s "  current_turn:~%")
+          (format s "    number: ~A~%" now-turn)
+          (format s "    events:~%")
+          (dolist (cell (gethash now-turn groups))
+            (render-fact s (cadr cell) (cddr cell))))))))
+
+
+
+;; (defun grouped-context-string (facts)
+;;   "Render facts grouped by causal :turn-id (Phase 2 conversation graph),
+;;    including active epoch checkpoints and agent goals/todos."
+;;   (let ((groups (make-hash-table :test #'eql))
+;;         (epoch (current-epoch))
+;;         (todos (collect-active-todos)))
+;;     (dolist (f facts)
+;;       (let* ((type (fact-type-of f))
+;;              (data (fact-data-of f))
+;;              (turn (or (data-get data :turn-id) 0))
+;;              (ts (fact-timestamp-of f)))
+;;         (push (cons ts (cons type data)) (gethash turn groups))))
+;;     (maphash (lambda (turn cells)
+;;                (setf (gethash turn groups)
+;;                      (sort cells #'< :key #'car)))
+;;              groups)
+;;     (with-output-to-string (s)
+;;       (format s "context:~%")
+;;       (format s "  session: ~A~%" (escape-yaml *session-id*))
+;;       ;; Render epoch baseline snapshot if present (OpenCode session_context_epoch)
+;;       (when epoch
+;;         (format s "  epoch:~%")
+;;         (format s "    id: ~A~%" (escape-yaml (get-slot-value epoch 'id)))
+;;         (format s "    baseline_turn: ~A~%" (get-slot-value epoch 'baseline-seq))
+;;         (format s "    summary: ~A~%" (escape-yaml (get-slot-value epoch 'summary))))
+;;       ;; Render goals / todos (mab.lisp backward-chaining goal tree)
+;;       (when todos
+;;         (format s "  goals:~%")
+;;         (dolist (td todos)
+;;           (let ((id (get-slot-value td 'id))
+;;                 (task (get-slot-value td 'task))
+;;                 (status (get-slot-value td 'status))
+;;                 (priority (get-slot-value td 'priority))
+;;                 (parent (get-slot-value td 'parent-id)))
+;;             (format s "    - id: ~A~%" (escape-yaml id))
+;;             (format s "      task: ~A~%" (escape-yaml task))
+;;             (format s "      status: ~A~%" (escape-yaml status))
+;;             (format s "      priority: ~A~%" (escape-yaml priority))
+;;             (unless (or (null parent) (string= parent "root"))
+;;               (format s "      parent_goal: ~A~%" (escape-yaml parent))))))
+;;       ;; Render loop warnings (derived by the detect-command-loop Rete rule)
+;;       (let ((loops (collect-tool-loops)))
+;;         (when loops
+;;           (format s "  warnings:~%")
+;;           (dolist (l loops)
+;;             (let* ((d (fact-data-of l))
+;;                    (family (or (data-get d :family) ""))
+;;                    (count (or (data-get d :count) 3)))
+;;               (format s "    - loop: ~A failing commands are the same retried attempt (family ~S). STOP re-running variants — change approach.~%"
+;;                       count family)))))
+;;       ;; Render turns
+;;       (format s "  turns:~%")
+;;       (dolist (turn (sort (loop for k being the hash-keys of groups collect k)
+;;                           #'<))
+;;         (format s "    ~A:~%" turn)
+;;         (dolist (cell (gethash turn groups))
+;;           (let ((type (cadr cell))
+;;                 (data (cddr cell)))
+;;             (cond ((string= type "user-input")
+;;                    (format s "      user: ~A~%"
+;;                            (escape-yaml (or (data-get data :text) ""))))
+;;                   ((string= type "llm-response")
+;;                    (format s "      assistant: ~A~%"
+;;                            (escape-yaml (or (data-get data :text) ""))))
+;;                   ((string= type "command-exec")
+;;                    (format s "      exec: ~A -> exit ~A~%"
+;;                            (escape-yaml (or (data-get data :command) ""))
+;;                            (or (data-get data :exit-code) ""))
+;;                    (format s "        output: ~A~%"
+;;                            (escape-yaml (truncate-payload (or (data-get data :output) "")))))
+;;                   ((string= type "file-read")
+;;                    (format s "      read: ~A~%"
+;;                            (escape-yaml (or (data-get data :path) "")))
+;;                    (format s "        contents: ~A~%"
+;;                            (escape-yaml (truncate-payload (or (data-get data :contents) "")))))
+;;                   ((string= type "file-write")
+;;                    (format s "      wrote: ~A (~A bytes)~%"
+;;                            (escape-yaml (or (data-get data :path) ""))
+;;                            (or (data-get data :bytes) "")))
+;;                   ((string= type "tool-loop")
+;;                    ;; Already rendered in the top-level warnings block.
+;;                    nil)
+;;                   (t
+;;                    (format s "      ?~A: ~S~%" (escape-yaml type) data)))))))))
 
 (defun mem-context-block ()
   "Render long-term memory (durable facts in the *mem-engine*) as a YAML
@@ -333,37 +424,28 @@
                            (or (data-get data :bytes) "")))
                   (t nil))))))))
 
+
 (defun build-yaml-context (user-message)
   "Build the full YAML context block: run pruning rules, then select the
    most structurally and semantically relevant facts."
-  ;; 1. Fire TTL + dedup rules
   (run)
-  ;; 2. Enforce per-type caps imperatively
   (retract-oldest-of-type "user-input" (max-facts-per-type))
   (retract-oldest-of-type "llm-response" (max-facts-per-type))
   (retract-oldest-of-type "command-exec" (max-facts-per-type))
   (retract-oldest-of-type "file-read" (max-facts-per-type))
   (retract-oldest-of-type "file-write" (max-facts-per-type))
-  ;; 3. Select the most relevant facts within budget, prioritizing user-message keywords
   (let* ((all-facts (collect-active-facts))
          (now-turn (if all-facts
                        (or (data-get (fact-data-of (car (last all-facts))) :turn-id)
                            0)
                        0)))
     (when *debug-mode*
-      (format t "~&[DEBUG build-yaml-context] active-facts=~A now-turn=~A~%" (length all-facts) now-turn)
-      (dolist (f all-facts)
-        (format t "~&[DEBUG build-yaml-context]   fact type=~A ts=~A turn-id=~A raw-chars=~A~%"
-                (fact-type-of f) (fact-timestamp-of f)
-                (or (data-get (fact-data-of f) :turn-id) 0)
-                (fact-raw-chars f))))
+      (format t "~&[DEBUG build-yaml-context] active-facts=~A now-turn=~A~%" (length all-facts) now-turn))
     (let ((selected (select-relevant-facts all-facts now-turn :query user-message)))
-      (when *debug-mode*
-        (format t "~&[DEBUG build-yaml-context] selected-facts=~A~%" (length selected)))
-      (let ((yaml (grouped-context-string selected)))
+      (let ((yaml (grouped-context-string selected now-turn)))
+        ;; DUMP AUTOMÁTICO AQUÍ:
         (when *debug-mode*
-          (format t "~&[DEBUG build-yaml-context] yaml-length=~A~%" (length yaml))
-          (format t "~&[DEBUG build-yaml-context] === YAML START ===~%~A~%~&[DEBUG build-yaml-context] === YAML END ===~%" yaml))
-        ;; Append long-term memory (durable facts from the *mem-engine*).
+          (with-open-file (s "debug.yaml" :direction :output :if-exists :supersede)
+            (write-string yaml s)))
         (let ((mem (mem-context-block)))
           (if mem (format nil "~A~%~A" yaml mem) yaml))))))

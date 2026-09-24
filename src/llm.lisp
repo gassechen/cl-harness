@@ -814,32 +814,26 @@
 ;; BATCH MODE
 ;;
 (defun get-batch-instructions ()
-  "Instrucciones técnicas para que el LLM emita lotes en S-expressions."
-  (format nil "~%~%<batch_execution_mode>
-  <critical_instruction>
-    You do NOT have interactive tool-use or function calling. 
-    You must plan your entire approach upfront and output ALL required actions in a 
-    SINGLE response as pure Lisp S-expressions.
-  </critical_instruction>
-  <strict_format_rules>
-    <rule>Do NOT use XML tags for your output (e.g., <function_calls>).</rule>
-    <rule>Do NOT use markdown code blocks (e.g., ```lisp).</rule>
-    <rule>Do NOT explain what you are doing.</rule>
-    <rule>Do NOT overthink. If the user asks for a plan, report, or explanation, you MUST FIRST emit actions to read the relevant files and run commands. The harness will execute them and send you the results. THEN you can write the plan in your final response.</rule>
-    <rule>CRITICAL: If the provided context YAML already contains the file contents or command results you need, DO NOT emit actions to read them again. Output your final text answer immediately.</rule>
-    <rule>JUST output the raw Lisp S-expressions.</rule>
-  </strict_format_rules>
-  <available_actions>
-    <action name=\"read-file\">(read-file \"path/to/file\")</action>
-    <action name=\"exec-command\">(exec-command \"shell command here\")</action>
-    <action name=\"write-file\">(write-file \"path/to/file\" \"full file content here\")</action>
-    <action name=\"edit-file\">(edit-file \"path/to/file\" \"exact old string\" \"new string\")</action>
-  </available_actions>
-  <example>
-    (read-file \"src/main.lisp\")
-    (exec-command \"ls -la\")
-  </example>
-</batch_execution_mode>~%~%"))
+  "Instrucciones batch."
+  (format nil "~%
+<batch_execution_mode>
+  <rules>
+    <rule>Output ONLY S-expressions. No XML, no markdown, no explanations.</rule>
+    <rule>If the context already contains what you need, respond with text and stop.</rule>
+    <rule>Do NOT repeat actions already present in the context.</rule>
+    <rule>For write-file with multi-line content or content containing quotes, use a heredoc (any variant: &lt;&lt;EOF, &lt;&lt;&lt;EOF, &lt;&lt;'EOF'). The content is written verbatim, no escaping needed.</rule>
+  </rules>
+  <actions>
+    <action>(read-file \"path\")</action>
+    <action>(exec-command \"cmd\")</action>
+    <action>(write-file \"path\" \"content\")</action>
+    <action>(write-file \"path\" &lt;&lt;EOF
+content
+EOF
+)</action>
+    <action>(edit-file \"path\" \"old\" \"new\")</action>
+  </actions>
+</batch_execution_mode>~%"))
 
 
 
@@ -861,22 +855,120 @@
 ;;                  (timestamp (get-universal-time))
 ;;                   (data (append data (list :step step-id :status :pending)))))))))
 
+(defun escape-for-lisp (s)
+  "Escapa S para que sea válido dentro de un string Lisp."
+  (with-output-to-string (out)
+    (loop for c across s do
+      (case c
+        (#\" (write-string "\\\"" out))
+        (#\\ (write-string "\\\\" out))
+        (t   (write-char c out))))))
+
+
+
+(defun preprocess-heredocs (text)
+  "Convierte (write-file \"path\" <<DELIM ... DELIM) en un string Lisp.
+   Acepta las variantes que el LLM manda sin avisar:
+     <<EOF   <<<EOF   <<'EOF'   <<<'EOF'   <<\"EOF\"   <<<\"EOF\"   << EOF"
+  (let ((result text)
+        (pos 0))
+    (loop
+      (let ((wf-pos (search "(write-file" result :start2 pos)))
+        (when (null wf-pos) (return result))
+        (let* ((path-q1 (position #\" result :start wf-pos))
+               (path-q2 (and path-q1 (position #\" result :start (1+ path-q1))))
+               (hd-base (and path-q2 (search "<<" result :start2 (1+ path-q2)))))
+          (cond
+            ((null hd-base)
+             (setf pos (1+ wf-pos)))
+            (t
+             (let* ((after-lt (+ hd-base 2))
+                    (delim-start
+                      (cond
+                        ;; <<<EOF  ->  saltear el < extra
+                        ((and (< after-lt (length result))
+                              (char= (char result after-lt) #\<))
+                         (1+ after-lt))
+                        ;; <<'EOF' o <<"EOF"  ->  saltear la comilla
+                        ((and (< after-lt (length result))
+                              (or (char= (char result after-lt) #\')
+                                  (char= (char result after-lt) #\")))
+                         (1+ after-lt))
+                        ;; <<EOF  ->  directo
+                        (t after-lt)))
+                    (delim-end (or (position #\Newline result :start delim-start)
+                                   (length result)))
+                    (delim (string-trim '(#\Space #\Tab #\Return #\' #\" #\<)
+                                        (subseq result delim-start delim-end)))
+                    (content-start (if (< delim-end (length result))
+                                       (1+ delim-end)
+                                       delim-end))
+                    (close-pattern (format nil "~%~A" delim))
+                    (close-pos (and (plusp (length delim))
+                                    (search close-pattern result :start2 content-start))))
+               (cond
+                 ((null close-pos)
+                  (setf pos (1+ wf-pos)))
+                 (t
+                  (let* ((content (subseq result content-start close-pos))
+                         (escaped (escape-for-lisp content))
+                         (before  (subseq result 0 (1+ path-q2)))
+                         (after   (subseq result (+ close-pos 1 (length delim))))
+                         (new-result (concatenate 'string
+                                                  before
+                                                  " \"" escaped "\""
+                                                  after)))
+                    (setf result new-result)
+                    (setf pos (+ (1+ path-q2) 3 (length escaped))))))))))))))
+
+
+(defun fix-c-escapes (text)
+  "Convierte secuencias de escape estilo C (\\n, \\t) a sus equivalentes reales.
+   Necesario porque el reader de CL interpreta \\n como la letra 'n'."
+  (let ((result text))
+    (setf result (cl-ppcre:regex-replace-all "\\\\n" result (string #\Newline)))
+    (setf result (cl-ppcre:regex-replace-all "\\\\t" result (string #\Tab)))
+    result))
+
+
+
 (defun clean-llm-text (text)
   "Normaliza el texto del LLM. Traduce tool-use nativo y arregla sintaxis rota."
   (let ((clean text))
-    ;; 1. Remover code fences de markdown (```lisp, ```, etc.)
+    ;; 1. Remover code fences de markdown
     (setf clean (cl-ppcre:regex-replace-all "```[a-zA-Z]*" clean ""))
-    ;; 2. Remover tags XML sueltos (ej: <exec-command>, </batch_execution_mode>)
+    ;; 2. Remover tags XML simples (<exec-command>, </batch_execution_mode>)
     (setf clean (cl-ppcre:regex-replace-all "</?[a-zA-Z_\\-]+>" clean ""))
-    ;; 3. Arreglar read-filepath path -> (read-file "path")
+    ;; 3. read-filepath path -> (read-file "path")
     (setf clean (cl-ppcre:regex-replace-all "read-filepath\\s*\"?([^\"\\n<]+)\"?" clean "(read-file \"\\1\")"))
-    ;; 4. Arreglar <exec-command("cmd")> -> (exec-command "cmd")
+    ;; 4. <exec-command("cmd")> -> (exec-command "cmd")
     (setf clean (cl-ppcre:regex-replace-all "<exec-command\\(\"(.*?)\"\\)>" clean "(exec-command \"\\1\")"))
-    ;; 5. Arreglar read-file sin paréntesis -> (read-file "path")
+    ;; 5. read-file sin paréntesis -> (read-file "path")
     (setf clean (cl-ppcre:regex-replace-all "(?<!\\()read-file\\s+\"(.*?)\"" clean "(read-file \"\\1\")"))
-    ;; 6. Arreglar exec-command sin paréntesis -> (exec-command "cmd")
+    ;; 6. exec-command sin paréntesis -> (exec-command "cmd")
     (setf clean (cl-ppcre:regex-replace-all "(?<!\\()exec-command\\s+\"(.*?)\"" clean "(exec-command \"\\1\")"))
+    ;; 7. Tool-use nativo: read_file(path='...') -> (read-file "...")
+    (setf clean (cl-ppcre:regex-replace-all "read_file\\(path='([^']+)'\\)" clean "(read-file \"\\1\")"))
+    ;; 8. Tool-use nativo: exec_command(command='...') -> (exec-command "...")
+    (setf clean (cl-ppcre:regex-replace-all "exec_command\\(command='([^']+)'\\)" clean "(exec-command \"\\1\")"))
+    ;; 9. Tool-use nativo: write_file(path='...', content='...') -> (write-file "..." "...")
+    (setf clean (cl-ppcre:regex-replace-all "write_file\\(path='([^']+)',\\s*content='([^']*)'\\)" clean "(write-file \"\\1\" \"\\2\")"))
+    ;; 10. Limpiar tokens especiales de tool-call (después de traducir, no antes)
+    (setf clean (cl-ppcre:regex-replace-all "<\\|tool_call_start\\|>" clean ""))
+    (setf clean (cl-ppcre:regex-replace-all "<\\|tool_call_end\\|>" clean ""))
+    (setf clean (cl-ppcre:regex-replace-all "<\\|/?tool_calls?\\|>" clean ""))
+    (setf clean (cl-ppcre:regex-replace-all "<\\|/?function_calls?\\|>" clean ""))
+    ;; 11. Corchetes sueltos de listas tool-call [a, b] -> a b
+    (setf clean (cl-ppcre:regex-replace-all "\\[\\s*" clean " "))
+    (setf clean (cl-ppcre:regex-replace-all "\\s*\\]" clean " "))
+    ;; 12. Comas separadoras entre S-expressions -> espacio
+    (setf clean (cl-ppcre:regex-replace-all "\\)\\s*,\\s*\\(" clean ") ("))
+    ;; 13. Convertir escapes tipo C en strings simples (antes del heredoc)
+    (setf clean (fix-c-escapes clean))
+    ;; 14. Extraer heredocs VERBATIM (el contenido no se toca)
+    (setf clean (preprocess-heredocs clean))
     clean))
+
 
 
 (defun assert-intention-from-form (form step-id)
