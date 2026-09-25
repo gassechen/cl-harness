@@ -648,11 +648,15 @@
       (setf (gethash "messages" msg) messages))
     msg))
 
-(defun build-openai-compat-messages (system-prompt context user-message)
+(defun build-openai-compat-messages (system-prompt context user-message &optional (json-object-p nil))
   "Build OpenAI-compatible Chat Completions JSON body."
   (let ((msg (make-hash-table :test 'equal)))
     (setf (gethash "model" msg) (llm-model))
     (setf (gethash "max_tokens" msg) (llm-max-tokens))
+    (when json-object-p
+      (let ((response-format (make-hash-table :test 'equal)))
+        (setf (gethash "type" response-format) "json_object")
+        (setf (gethash "response_format" msg) response-format)))
     (let ((messages (list (make-hash-table :test 'equal)
                           (make-hash-table :test 'equal))))
       (setf (gethash "role" (first messages)) "system")
@@ -690,9 +694,9 @@
         (let ((block (elt content 0)))
           (gethash "text" block))))))
 
-(defun call-openai-compat (system-prompt context user-message)
+(defun call-openai-compat (system-prompt context user-message &optional (json-object-p nil))
   "Call OpenAI-compatible API (OpenAI, OpenRouter, etc.)."
-  (let* ((body (build-openai-compat-messages system-prompt context user-message))
+  (let* ((body (build-openai-compat-messages system-prompt context user-message json-object-p))
          (json-body (com.inuoe.jzon:stringify body))
          (endpoint (openai-compat-endpoint))
          (headers (openai-compat-headers)))
@@ -814,211 +818,243 @@
 ;; BATCH MODE
 ;;
 (defun get-batch-instructions ()
-  "Instrucciones batch."
-  (format nil "~%
-<batch_execution_mode>
-  <rules>
-    <rule>Output ONLY S-expressions. No XML, no markdown, no explanations.</rule>
-    <rule>If the context already contains what you need, respond with text and stop.</rule>
-    <rule>Do NOT repeat actions already present in the context.</rule>
-    <rule>For write-file with multi-line content or content containing quotes, use a heredoc (any variant: &lt;&lt;EOF, &lt;&lt;&lt;EOF, &lt;&lt;'EOF'). The content is written verbatim, no escaping needed.</rule>
-  </rules>
-  <actions>
-    <action>(read-file \"path\")</action>
-    <action>(exec-command \"cmd\")</action>
-    <action>(write-file \"path\" \"content\")</action>
-    <action>(write-file \"path\" &lt;&lt;EOF
-content
-EOF
-)</action>
-    <action>(edit-file \"path\" \"old\" \"new\")</action>
-  </actions>
-</batch_execution_mode>~%"))
+  "Instructions for JSON ToolUse batches executed by Rete."
+  (format nil "
+batch_execution_mode:
+  goal: Plan the entire task upfront and emit every required action in one JSON response.
+  output:
+    - Return exactly one JSON object. Do not use Markdown, comments, or text outside the object.
+    - This is a machine-readable protocol: never emit reasoning, prose, or explanations before or after the JSON object.
+    - The first non-whitespace character of the response must be \"{\" and the last must be \"}\".
+    - Use the ToolUse-compatible shape: {\"tool_calls\":[{\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"file.py\"}}}],\"response\":\"\"}.
+    - Allowed function names: read_file, write_file, edit_file, exec_command.
+    - Arguments must be a JSON object with exactly the fields required by that function.
+    - For a final answer with no more actions, return {\"tool_calls\":[],\"response\":\"the final answer\"}.
+  rules:
+    - Emit actions, not descriptions. Order tool_calls from first action to last.
+    - Do not repeat actions already present in the context.
+    - Before write_file or edit_file on an existing path, include a read_file action for that path in the same batch; never overwrite a file you have not read.
+    - read_file arguments: {\"path\":\"absolute or relative path\"}.
+    - write_file arguments: {\"path\":\"new file path\",\"content\":\"full file content\"}.
+    - edit_file arguments: {\"path\":\"existing file path\",\"old_string\":\"non-empty exact text currently in the file\",\"new_string\":\"replacement text\"}.
+    - old_string MUST be non-empty and must match existing file content exactly. To insert text, replace a non-empty existing anchor and include that anchor in new_string.
+    - new_string may be empty to delete the matched text. write_file content may also be empty.
+    - exec_command arguments: {\"command\":\"shell command\"}.
+    - JSON strings encode multiline content with \\n and tabs with \\t.
+  examples:
+    read: |
+      {\"tool_calls\":[{\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"math_utils.py\"}}}]}
+    edit: |
+      {\"tool_calls\":[{\"id\":\"call-2\",\"type\":\"function\",\"function\":{\"name\":\"edit_file\",\"arguments\":{\"path\":\"math_utils.py\",\"old_string\":\"def factorial(n):\",\"new_string\":\"def factorial(n):\\n    ...\"}}}]}
+    final: |
+      {\"tool_calls\":[],\"response\":\"All requested work is complete.\"}
+~%"))
 
 
-
-;; (defun assert-intention-from-form (form step-id)
-;;   "Convierte una S-expression parseada en un hecho de intención en Rete."
-;;   (when (consp form)
-;;     (let* ((action (first form))
-;;            (args (rest form))
-;;            (data (case action
-;;                    (read-file (list :action :read-file :path (first args)))
-;;                    (exec-command (list :action :exec-command :command (first args)))
-;;                    (write-file (list :action :write-file :path (first args) :content (second args)))
-;;                    (edit-file (list :action :edit-file :path (first args) :old-string (second args) :new-string (third args)))
-;;                    (otherwise nil))))
-;;       (when data
-;; 	(format t "~&[DEBUG parser] Asserting intention: ~A~%" data)
-;;         (assert (harness-fact
-;;                  (fact-type "intention")
-;;                  (timestamp (get-universal-time))
-;;                   (data (append data (list :step step-id :status :pending)))))))))
-
-(defun escape-for-lisp (s)
-  "Escapa S para que sea válido dentro de un string Lisp."
-  (with-output-to-string (out)
-    (loop for c across s do
-      (case c
-        (#\" (write-string "\\\"" out))
-        (#\\ (write-string "\\\\" out))
-        (t   (write-char c out))))))
+(defun batch-blank-string-p (value)
+  (or (null value)
+      (and (stringp value)
+           (zerop (length (string-trim '(#\Space #\Tab #\Newline #\Return) value))))))
 
 
-
-(defun preprocess-heredocs (text)
-  "Convierte (write-file \"path\" <<DELIM ... DELIM) en un string Lisp.
-   Acepta las variantes que el LLM manda sin avisar:
-     <<EOF   <<<EOF   <<'EOF'   <<<'EOF'   <<\"EOF\"   <<<\"EOF\"   << EOF"
-  (let ((result text)
-        (pos 0))
-    (loop
-      (let ((wf-pos (search "(write-file" result :start2 pos)))
-        (when (null wf-pos) (return result))
-        (let* ((path-q1 (position #\" result :start wf-pos))
-               (path-q2 (and path-q1 (position #\" result :start (1+ path-q1))))
-               (hd-base (and path-q2 (search "<<" result :start2 (1+ path-q2)))))
-          (cond
-            ((null hd-base)
-             (setf pos (1+ wf-pos)))
-            (t
-             (let* ((after-lt (+ hd-base 2))
-                    (delim-start
-                      (cond
-                        ;; <<<EOF  ->  saltear el < extra
-                        ((and (< after-lt (length result))
-                              (char= (char result after-lt) #\<))
-                         (1+ after-lt))
-                        ;; <<'EOF' o <<"EOF"  ->  saltear la comilla
-                        ((and (< after-lt (length result))
-                              (or (char= (char result after-lt) #\')
-                                  (char= (char result after-lt) #\")))
-                         (1+ after-lt))
-                        ;; <<EOF  ->  directo
-                        (t after-lt)))
-                    (delim-end (or (position #\Newline result :start delim-start)
-                                   (length result)))
-                    (delim (string-trim '(#\Space #\Tab #\Return #\' #\" #\<)
-                                        (subseq result delim-start delim-end)))
-                    (content-start (if (< delim-end (length result))
-                                       (1+ delim-end)
-                                       delim-end))
-                    (close-pattern (format nil "~%~A" delim))
-                    (close-pos (and (plusp (length delim))
-                                    (search close-pattern result :start2 content-start))))
-               (cond
-                 ((null close-pos)
-                  (setf pos (1+ wf-pos)))
-                 (t
-                  (let* ((content (subseq result content-start close-pos))
-                         (escaped (escape-for-lisp content))
-                         (before  (subseq result 0 (1+ path-q2)))
-                         (after   (subseq result (+ close-pos 1 (length delim))))
-                         (new-result (concatenate 'string
-                                                  before
-                                                  " \"" escaped "\""
-                                                  after)))
-                    (setf result new-result)
-                    (setf pos (+ (1+ path-q2) 3 (length escaped))))))))))))))
+(defun batch-sequence-list (value)
+  (cond ((listp value) value)
+        ((vectorp value) (coerce value 'list))
+        (t nil)))
 
 
-(defun fix-c-escapes (text)
-  "Convierte secuencias de escape estilo C (\\n, \\t) a sus equivalentes reales.
-   Necesario porque el reader de CL interpreta \\n como la letra 'n'."
-  (let ((result text))
-    (setf result (cl-ppcre:regex-replace-all "\\\\n" result (string #\Newline)))
-    (setf result (cl-ppcre:regex-replace-all "\\\\t" result (string #\Tab)))
-    result))
+(defun batch-sequence-p (value)
+  (or (listp value) (vectorp value)))
 
 
-
-(defun clean-llm-text (text)
-  "Normaliza el texto del LLM. Traduce tool-use nativo y arregla sintaxis rota."
-  (let ((clean text))
-    ;; 1. Remover code fences de markdown
-    (setf clean (cl-ppcre:regex-replace-all "```[a-zA-Z]*" clean ""))
-    ;; 2. Remover tags XML simples (<exec-command>, </batch_execution_mode>)
-    (setf clean (cl-ppcre:regex-replace-all "</?[a-zA-Z_\\-]+>" clean ""))
-    ;; 3. read-filepath path -> (read-file "path")
-    (setf clean (cl-ppcre:regex-replace-all "read-filepath\\s*\"?([^\"\\n<]+)\"?" clean "(read-file \"\\1\")"))
-    ;; 4. <exec-command("cmd")> -> (exec-command "cmd")
-    (setf clean (cl-ppcre:regex-replace-all "<exec-command\\(\"(.*?)\"\\)>" clean "(exec-command \"\\1\")"))
-    ;; 5. read-file sin paréntesis -> (read-file "path")
-    (setf clean (cl-ppcre:regex-replace-all "(?<!\\()read-file\\s+\"(.*?)\"" clean "(read-file \"\\1\")"))
-    ;; 6. exec-command sin paréntesis -> (exec-command "cmd")
-    (setf clean (cl-ppcre:regex-replace-all "(?<!\\()exec-command\\s+\"(.*?)\"" clean "(exec-command \"\\1\")"))
-    ;; 7. Tool-use nativo: read_file(path='...') -> (read-file "...")
-    (setf clean (cl-ppcre:regex-replace-all "read_file\\(path='([^']+)'\\)" clean "(read-file \"\\1\")"))
-    ;; 8. Tool-use nativo: exec_command(command='...') -> (exec-command "...")
-    (setf clean (cl-ppcre:regex-replace-all "exec_command\\(command='([^']+)'\\)" clean "(exec-command \"\\1\")"))
-    ;; 9. Tool-use nativo: write_file(path='...', content='...') -> (write-file "..." "...")
-    (setf clean (cl-ppcre:regex-replace-all "write_file\\(path='([^']+)',\\s*content='([^']*)'\\)" clean "(write-file \"\\1\" \"\\2\")"))
-    ;; 10. Limpiar tokens especiales de tool-call (después de traducir, no antes)
-    (setf clean (cl-ppcre:regex-replace-all "<\\|tool_call_start\\|>" clean ""))
-    (setf clean (cl-ppcre:regex-replace-all "<\\|tool_call_end\\|>" clean ""))
-    (setf clean (cl-ppcre:regex-replace-all "<\\|/?tool_calls?\\|>" clean ""))
-    (setf clean (cl-ppcre:regex-replace-all "<\\|/?function_calls?\\|>" clean ""))
-    ;; 11. Corchetes sueltos de listas tool-call [a, b] -> a b
-    (setf clean (cl-ppcre:regex-replace-all "\\[\\s*" clean " "))
-    (setf clean (cl-ppcre:regex-replace-all "\\s*\\]" clean " "))
-    ;; 12. Comas separadoras entre S-expressions -> espacio
-    (setf clean (cl-ppcre:regex-replace-all "\\)\\s*,\\s*\\(" clean ") ("))
-    ;; 13. Convertir escapes tipo C en strings simples (antes del heredoc)
-    (setf clean (fix-c-escapes clean))
-    ;; 14. Extraer heredocs VERBATIM (el contenido no se toca)
-    (setf clean (preprocess-heredocs clean))
-    clean))
+(defun batch-json-text (text)
+  (if (and (stringp text) (plusp (length text)))
+      (let ((clean (string-trim '(#\Space #\Tab #\Newline #\Return) text)))
+        (when (and (>= (length clean) 6)
+                   (string= "```" (subseq clean 0 3)))
+          (let ((newline (position #\Newline clean)))
+            (when newline
+              (setf clean (string-trim '(#\Space #\Tab #\Newline #\Return)
+                                       (subseq clean (1+ newline))))
+              (when (and (>= (length clean) 3)
+                         (string= "```" (subseq clean (- (length clean) 3))))
+                (setf clean (string-trim '(#\Space #\Tab #\Newline #\Return)
+                                         (subseq clean 0 (- (length clean) 3))))))))
+        clean)
+      ""))
 
 
+(defun parse-batch-json (text)
+  (let ((json (batch-json-text text)))
+    (cond
+      ((zerop (length json))
+       (values nil "empty batch response"))
+      (t
+       (handler-case
+           (values (com.inuoe.jzon:parse json) nil)
+         (error (e)
+           (values nil (format nil "invalid JSON: ~A" e))))))))
 
-(defun assert-intention-from-form (form step-id)
-  "Convierte una S-expression parseada en un hecho de intención en Rete."
-  (when (consp form)
-    (let* ((action (first form))
-           (args (rest form))
-           ;; ACÁ FORZAMOS QUE TODO SEA STRING (Anticrash por over-escaping del LLM)
-           (str-args (mapcar (lambda (x) (if (stringp x) x (princ-to-string x))) args))
-           (data (cond
-                   ((string-equal action "read-file")
-                    (list :action :read-file :path (first str-args)))
-                   ((string-equal action "exec-command")
-                    (list :action :exec-command :command (first str-args)))
-                   ((string-equal action "write-file")
-                    (list :action :write-file :path (first str-args) :content (second str-args)))
-                   ((string-equal action "edit-file")
-                    (list :action :edit-file :path (first str-args) :old-string (second str-args) :new-string (third str-args)))
-                   (t nil))))
-      (when data
-        (format t "~&[DEBUG parser] Asserting intention: ~A~%" data)
-        (assert (harness-fact
-                 (fact-type "intention")
-                 (timestamp (get-universal-time))
-                 (data (append data (list :step step-id :status :pending)))))))))
+
+(defun batch-tool-name-p (name)
+  (and (stringp name)
+       (member name '("read_file" "write_file" "edit_file" "exec_command")
+               :test #'string=)))
+
+
+(defun normalize-batch-tool-call (call index)
+  (unless (hash-table-p call)
+    (return-from normalize-batch-tool-call
+      (values nil (format nil "tool_call ~A must be an object" index))))
+  (let* ((function (gethash "function" call))
+         (type (gethash "type" call))
+         (name nil)
+         (arguments nil))
+    (when (and type
+               (not (or (and (stringp type) (string= type "function"))
+                        (batch-tool-name-p type))))
+      (return-from normalize-batch-tool-call
+        (values nil (format nil "tool_call ~A.type is invalid" index))))
+    (when (hash-table-p function)
+      (setf name (gethash "name" function)
+            arguments (gethash "arguments" function)))
+    (when (or (null name) (not (stringp name)))
+      (setf name (or (gethash "name" call)
+                     (and (batch-tool-name-p type) type))))
+    (when (null arguments)
+      (setf arguments (gethash "arguments" call)))
+    (unless (stringp name)
+      (return-from normalize-batch-tool-call
+        (values nil (format nil "tool_call ~A function name must be a string" index))))
+    (when (stringp arguments)
+      (multiple-value-bind (parsed parse-error)
+          (parse-batch-json arguments)
+        (if parse-error
+            (return-from normalize-batch-tool-call
+              (values nil (format nil "tool_call ~A.arguments must be valid JSON" index)))
+            (setf arguments parsed))))
+    (unless (hash-table-p arguments)
+      (return-from normalize-batch-tool-call
+        (values nil (format nil "tool_call ~A.arguments must be an object" index))))
+    (let ((path (gethash "path" arguments))
+          (content (gethash "content" arguments))
+          (command (gethash "command" arguments))
+          (old-string (gethash "old_string" arguments))
+          (new-string (gethash "new_string" arguments)))
+      (cond
+        ((string= name "read_file")
+         (if (batch-blank-string-p path)
+             (values nil (format nil "tool_call ~A requires a non-empty path" index))
+             (values (list :action :read-file :path path) nil)))
+        ((string= name "write_file")
+         (cond
+           ((batch-blank-string-p path)
+            (values nil (format nil "tool_call ~A requires a non-empty path" index)))
+           ((not (stringp content))
+            (values nil (format nil "tool_call ~A requires string content" index)))
+           (t (values (list :action :write-file :path path :content content) nil))))
+        ((string= name "edit_file")
+         (cond
+           ((batch-blank-string-p path)
+            (values nil (format nil "tool_call ~A requires a non-empty path" index)))
+           ((batch-blank-string-p old-string)
+            (values nil (format nil "tool_call ~A requires a non-empty old_string" index)))
+           ((not (stringp new-string))
+            (values nil (format nil "tool_call ~A requires string new_string" index)))
+           (t (values (list :action :edit-file
+                            :path path
+                            :old-string old-string
+                            :new-string new-string)
+                      nil))))
+        ((string= name "exec_command")
+         (if (batch-blank-string-p command)
+             (values nil (format nil "tool_call ~A requires a non-empty command" index))
+             (values (list :action :exec-command :command command) nil)))
+        (t
+         (values nil (format nil "tool_call ~A has unsupported function ~S" index name)))))))
+
+
+(defun normalize-batch-tool-calls (calls)
+  (let ((normalized '()))
+    (loop for call in (batch-sequence-list calls)
+          for index from 1
+          do (multiple-value-bind (data error)
+                 (normalize-batch-tool-call call index)
+               (if error
+                   (return-from normalize-batch-tool-calls
+                     (values nil error))
+                   (push data normalized))))
+    (values (nreverse normalized) nil)))
+
+
+(defun assert-batch-intention (data step-id)
+  (assert (harness-fact
+           (fact-type "intention")
+           (timestamp (get-universal-time))
+           (data (append data
+                         (list :turn-id (current-turn-id)
+                               :parent-id (current-turn-id)
+                               :step step-id
+                               :status :pending)))))
+  t)
+
+
+(defun call-batch-llm (system-prompt context user-message)
+  (let ((full-prompt (concatenate 'string system-prompt
+                                   (get-batch-instructions)))
+        (last-error nil)
+        (retry-message user-message))
+    (dotimes (attempt 2)
+      (let ((llm-text (call-openai-compat full-prompt context retry-message t)))
+        (multiple-value-bind (parsed final-response parse-error)
+            (parse-llm-batch-to-intentions llm-text)
+          (declare (ignore parsed))
+          (if parse-error
+              (setf last-error parse-error
+                    retry-message
+                    (format nil
+                            "~A~%~%The previous response was rejected as invalid batch JSON: ~A~%Return only one valid JSON object using the batch_execution_mode contract. Do not include reasoning, Markdown, or explanatory text."
+                            user-message
+                            parse-error))
+              (return-from call-batch-llm
+                (if final-response final-response llm-text)))))
+      (when *debug-mode*
+        (format t "~&[DEBUG call-llm] BATCH_JSON_RETRY ~D: ~A~%"
+                (1+ attempt) last-error)))
+    (format nil "[LLM ERROR] BATCH_JSON_INVALID: ~A" last-error)))
 
 
 (defun parse-llm-batch-to-intentions (text)
-  "Escanea el texto del LLM, busca S-expressions y las aserta en Rete."
-  (let ((parsed-something nil))
-    (when (and text (stringp text) (plusp (length text)))
-      (let ((clean-text (clean-llm-text text)))
-        (handler-case
-            (loop with pos = 0
-                  for step-id from 1
-                  while (< pos (length clean-text))
-                  do (multiple-value-bind (form new-pos)
-                         (read-from-string clean-text nil :eof :start pos)
-                     (when (eq form :eof) (return))
-                     (when (assert-intention-from-form form step-id)
-                       (setf parsed-something t))
-                     (setf pos new-pos)))
-          (error () nil))))
-    ;; NUEVO: Si no parseó nada, el LLM dio su respuesta final. Le avisamos a Rete.
-    (unless parsed-something
-      (assert (harness-fact 
-               (fact-type "batch-complete")
-               (timestamp (get-universal-time))
-               (data (list :turn-id (current-turn-id))))))
-    parsed-something))
+  "Parse and validate a ToolUse JSON batch, then assert Rete intentions."
+  (multiple-value-bind (payload error)
+      (parse-batch-json text)
+    (if error
+        (values nil nil error)
+        (cond
+          ((not (hash-table-p payload))
+           (values nil nil "batch JSON root must be an object"))
+          ((not (batch-sequence-p (gethash "tool_calls" payload)))
+           (values nil nil "batch JSON requires a tool_calls array"))
+          (t
+           (multiple-value-bind (intentions normalization-error)
+               (normalize-batch-tool-calls (gethash "tool_calls" payload))
+             (if normalization-error
+                 (values nil nil normalization-error)
+                 (if intentions
+                     (progn
+                       (loop for data in intentions
+                             for step-id from 1
+                             do (assert-batch-intention data step-id))
+                       (values t nil nil))
+                     (let ((response (gethash "response" payload "")))
+                       (unless (stringp response)
+                         (return-from parse-llm-batch-to-intentions
+                           (values nil nil "batch JSON response must be a string")))
+                       (assert (harness-fact
+                                (fact-type "batch-complete")
+                                (timestamp (get-universal-time))
+                                (data (list :turn-id (current-turn-id)))))
+                       (values nil response nil))))))))))
 
 
 
@@ -1032,13 +1068,8 @@ EOF
        (call-ollama system-prompt context user-message))
       ((gemini-p)
        (call-gemini system-prompt context user-message))
-            ((string-equal provider "batch")
-       (let* ((full-prompt (concatenate 'string system-prompt (get-batch-instructions)))
-              (llm-text (call-openai-compat full-prompt context user-message)))
-         ;; CAMBIÁ EL FORMAT PARA USAR ~S:
-         (format t "~&[DEBUG call-llm] Texto recibido: ~S~%" llm-text)
-         (parse-llm-batch-to-intentions llm-text)
-     llm-text))
+      ((string-equal provider "batch")
+       (call-batch-llm system-prompt context user-message))
 
       (t 
        (call-llm-with-tools system-prompt context user-message)))))
