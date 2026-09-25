@@ -752,7 +752,7 @@ dependencias.
   - memoria larga usada entre corridas (el modelo citó traces de fallos previos)
     y persistida en `dumps/longterm-mem.lisp` (errores reales + escrituras).
 
-- **Stress de batch con `llm_model: "auto"` (2026-09-25)**:
+- **Stress de batch con `llm_model: "auto"` (2026-09-25)** — detalle en [`EXPERIMENTS/batch-freellm-auto-2026-09-25/`](EXPERIMENTS/batch-freellm-auto-2026-09-25/):
   - Se ejecutó el prompt de creación de un mini proyecto Python con archivos,
     tests y verificaciones mediante `python3 -m unittest test_math_utils.py` y
     `python3 main.py`.

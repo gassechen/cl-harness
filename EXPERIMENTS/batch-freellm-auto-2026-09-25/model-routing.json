@@ -1,0 +1,11 @@
+{
+  "experiment": "batch-freellm-auto-2026-09-25",
+  "requested_model": "auto",
+  "total_calls": 5,
+  "model_counts": {
+    "nvidia/nemotron-3-ultra-550b-a55b": 4,
+    "meta/muse-glimmer-30b": 1
+  },
+  "source": "response.model",
+  "note": "El harness no persiste response.model en sus métricas; este resumen fue capturado durante la corrida."
+}
