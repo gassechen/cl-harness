@@ -1,0 +1,136 @@
+{
+  "experimento": "context-growth-8turns-2026-09-25",
+  "session": "session-3999340228",
+  "model": "nvidia/nemotron-3-ultra-550b-a55b",
+  "provider": "batch",
+  "proyecto_inicial": {
+    "bytes": 2794,
+    "modulos": 1,
+    "funciones": 3,
+    "tests": 9
+  },
+  "proyecto_final": {
+    "bytes": 8080,
+    "modulos": 3,
+    "funciones": 10,
+    "tests": 26
+  },
+  "curva_por_turno": [
+    {
+      "turno": 1,
+      "user_chars": 216,
+      "contexto_tokens": 82,
+      "naive_tokens": 83,
+      "reduccion_pct": 1.2,
+      "prompt_tokens_real": 1761,
+      "iteraciones": 2
+    },
+    {
+      "turno": 2,
+      "user_chars": 211,
+      "contexto_tokens": 956,
+      "naive_tokens": 1173,
+      "reduccion_pct": 18.5,
+      "prompt_tokens_real": 2800,
+      "iteraciones": 3
+    },
+    {
+      "turno": 3,
+      "user_chars": 192,
+      "contexto_tokens": 1732,
+      "naive_tokens": 2036,
+      "reduccion_pct": 14.93,
+      "prompt_tokens_real": 3151,
+      "iteraciones": 2
+    },
+    {
+      "turno": 4,
+      "user_chars": 184,
+      "contexto_tokens": 1929,
+      "naive_tokens": 2572,
+      "reduccion_pct": 25.0,
+      "prompt_tokens_real": 3295,
+      "iteraciones": 3
+    },
+    {
+      "turno": 5,
+      "user_chars": 188,
+      "contexto_tokens": 1925,
+      "naive_tokens": 4153,
+      "reduccion_pct": 53.65,
+      "prompt_tokens_real": 3292,
+      "iteraciones": 2
+    },
+    {
+      "turno": 6,
+      "user_chars": 185,
+      "contexto_tokens": 1720,
+      "naive_tokens": 4819,
+      "reduccion_pct": 64.31,
+      "prompt_tokens_real": 2938,
+      "iteraciones": 3
+    },
+    {
+      "turno": 7,
+      "user_chars": 171,
+      "contexto_tokens": 1761,
+      "naive_tokens": 5509,
+      "reduccion_pct": 68.03,
+      "prompt_tokens_real": 2795,
+      "iteraciones": 2
+    },
+    {
+      "turno": 8,
+      "user_chars": 159,
+      "contexto_tokens": 1729,
+      "naive_tokens": 5330,
+      "reduccion_pct": 67.56,
+      "prompt_tokens_real": 2807,
+      "iteraciones": 2
+    }
+  ],
+  "totales": {
+    "turns": 8,
+    "context-tokens": 11834,
+    "naive-tokens": 25675,
+    "reduction-pct": 53.908473,
+    "real-prompt-tokens": 22839,
+    "real-turns": 8,
+    "llm-iterations": 19
+  },
+  "yaml_por_etapa": [
+    {
+      "etapa": 1,
+      "chars": 6927,
+      "lineas": 176
+    },
+    {
+      "etapa": 2,
+      "chars": 7612,
+      "lineas": 204
+    },
+    {
+      "etapa": 3,
+      "chars": 7598,
+      "lineas": 178
+    },
+    {
+      "etapa": 4,
+      "chars": 6547,
+      "lineas": 143
+    }
+  ],
+  "facts_finales_por_tipo": {
+    "batch-complete": 8,
+    "command-exec": 8,
+    "file-read": 8,
+    "llm-response": 8,
+    "user-input": 8
+  },
+  "facts_finales_total": 40,
+  "notas": [
+    "context-tokens/naive-tokens son heuristicos (1 token ~ 4 chars).",
+    "prompt_tokens_real es acumulativo por turno: suma las iteraciones del tool loop de ese turno.",
+    "El contexto curado se satura en 40 facts = max_facts_per_type (8) x 5 tipos con datos."
+  ]
+}

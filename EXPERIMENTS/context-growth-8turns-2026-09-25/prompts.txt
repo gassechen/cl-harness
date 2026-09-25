@@ -1,0 +1,14 @@
+Turno 1, solo lectura: lee math_utils.py, test_math_utils.py y main.py con read_file y responde en espanol con un resumen de las funciones publicas existentes y el numero total de tests. No modifiques ningun archivo.
+Turno 2: ejecuta con exec_command el comando python3 stage.py gcd, luego ejecuta python3 -m unittest -v, luego lee math_utils.py con read_file y responde en espanol que funcion se agrego y cuantos tests pasaron.
+:context
+Turno 3: ejecuta con exec_command el comando python3 stage.py is_perfect_square, luego ejecuta python3 -m unittest -v, luego lee math_utils.py con read_file y responde en espanol el resultado.
+Turno 4: ejecuta con exec_command el comando python3 stage.py sum_range, luego ejecuta python3 -m unittest -v, luego lee math_utils.py con read_file y responde en espanol el resultado.
+:context
+Turno 5: ejecuta con exec_command el comando python3 stage.py prime_factors, luego ejecuta python3 -m unittest -v, luego lee math_utils.py con read_file y responde en espanol el resultado.
+Turno 6: ejecuta con exec_command el comando python3 stage.py text_utils, luego ejecuta python3 -m unittest -v, luego lee text_utils.py con read_file y responde en espanol el resultado.
+:context
+Turno 7: ejecuta con exec_command el comando python3 stage.py main_demo, luego ejecuta python3 main.py, luego lee main.py con read_file y responde en espanol el resultado.
+Turno 8: ejecuta python3 -m unittest -v y python3 main.py con exec_command y responde en espanol con el resumen final del proyecto: modulos, funciones y tests.
+:context
+:metrics
+:quit

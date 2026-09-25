@@ -15,12 +15,13 @@ El experimento tiene dos objetivos independientes:
 
 1. **Compatibilidad:** permitir que un modelo sin ToolUse nativo exprese un plan
    JSON y que las reglas de Rete lo ejecuten sin depender de una API de tools.
-2. **Eficiencia:** medir si el lote reduce el total de tokens de entrada frente
-   al tool-loop nativo. Esto es una hipótesis y requiere una corrida pareada; no
-   se debe inferir solo del tamaño del contexto local.
+2. **Eficiencia de contexto:** medir si el YAML generado por Rete reduce los
+   tokens enviados frente al contexto `naive`, independientemente de si la
+   acción se planificó mediante batch o ToolUse nativo. Esto es una hipótesis
+   condicional: depende de los hechos sobrevivientes, las reglas de poda y el
+   tamaño de la tarea.
 
-La corrida actual cubre el primer objetivo y deja una línea base para el
-segundo. Se comprobaron además:
+La corrida actual permite observar ambos objetivos. Se comprobaron además:
 
 - `response_format: {"type":"json_object"}`;
 - normalización de ToolUse canónico y flatten (`gpt-oss`);
@@ -99,24 +100,36 @@ The 10th Fibonacci number is 55
 En una repetición del stress test se produjo un `502` transitorio del endpoint;
 el flujo batch lo recuperó y volvió a cerrar el turno correctamente.
 
-### 4.1. Medición de tokens
+### 4.1. Rete/YAML frente a `naive`
 
-La corrida batch de `session-3999334880` registró:
+Las métricas del harness separan el contexto que Rete renderiza como YAML del
+snapshot `naive` previo a la poda. `reduction_pct` positivo significa que el
+YAML ocupa menos tokens; uno negativo significa que el overhead de serializar
+los hechos supera al baseline.
 
-| Métrica | Batch observado | ToolUse nativo comparable |
-|---|---:|---:|
-| `real-prompt-tokens` | 2572 | Pendiente |
-| `completion-tokens` | 404 | Pendiente |
-| Llamadas al proveedor | 5 | Pendiente |
+| Corrida | `context-tokens` (Rete) | `naive-tokens` | `reduction_pct` | Lectura |
+|---|---:|---:|---:|---|
+| [`session-3999154036`](../batch-freellm-2026-09-23/metrics/session-3999154036-metrics.json) | 29 | 41 | **+29,27%** | YAML más compacto |
+| [`session-3999080576`](../../metrics/session-3999080576-metrics.json) | 39 | 50 | **+22,00%** | YAML más compacto |
+| [`session-3999334880`](./metrics/session-3999334880-metrics.json) | 265 | 195 | **-35,90%** | YAML más grande |
 
-Estos valores no demuestran ahorro por sí solos. Para cerrar el segundo
-objetivo hay que ejecutar el mismo prompt, con los mismos límites y un modelo
-equivalente, en dos directorios limpios: `llm_provider: "batch"` y
-`openai-compat` con ToolUse nativo. Se deben comparar `prompt_tokens` y
-`completion-tokens` acumulados del proveedor, además de llamadas, resultado y
-latencia; no comparar `context-tokens` con `prompt-tokens`, porque son métricas
-distintas. Si `auto` rota modelos, hay que fijar el modelo o registrar el
-`response.model` de cada llamada.
+La corrida larga de este experimento no muestra ahorro: el prompt y los hechos
+dominaron más que la poda. Esto confirma que Rete puede reducir el contexto, pero
+que la reducción es condicional y no automática. `real-prompt-tokens` mide el
+consumo real del proveedor y es una métrica distinta de esta comparación.
+
+Esta medición no depende de batch ni de ToolUse: para una comparación justa solo
+se compara `build-yaml-context` (Rete) contra `naive-context-string` con la misma
+tarea. Si se desea además medir el costo total del proveedor, hay que fijar el
+mismo `response.model` y comparar los tokens acumulados de ambas ramas.
+
+### 4.2. Fidelidad al cambiar de modelo
+
+El mismo estado serializado permite que un modelo distinto reconstruya el
+contexto sin cargar todos los archivos de texto plano ni depender de la memoria
+de la conversación. Esa propiedad se probó para la tarea del experimento; no
+significa que el YAML sea ilimitadamente completo, porque Rete sigue aplicando
+podas, TTL, límites por tipo y truncado de payloads.
 
 ## 5. Routing de modelos
 
@@ -156,6 +169,8 @@ prompt desde un directorio de trabajo limpio.
 
 El harness mantuvo la separación entre planificación y ejecución cuando `auto`
 cambió de modelo dentro del mismo turno. La corrida demuestra compatibilidad
-con la ruta JSON sin ToolUse nativo y la robustez del protocolo; todavía no
-permite afirmar un ahorro de tokens frente al tool-loop nativo. Ese veredicto
-requiere la comparación pareada descrita en la sección 4.1.
+con la ruta JSON sin ToolUse nativo y que el estado YAML permite reconstruir el
+contexto. La medición de Rete muestra un ahorro potencial, pero condicional:
+`+29,27%` y `+22,00%` en corridas cortas y `-35,90%` en la corrida larga. No
+se debe atribuir esa diferencia al modo batch; depende de la poda, del formato
+y del volumen de hechos.

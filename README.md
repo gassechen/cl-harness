@@ -389,10 +389,12 @@ memoria de hechos y alimenta el pruning de turnos futuros.
 
 Con `llm_provider: "batch"` no hay tool-use nativo HTTP: `call-batch-llm` pide al modelo
 un lote de acciones compatible con ToolUse y lo convierte en intenciones Rete.
-El objetivo del modo es doble: permitir modelos que no exponen ToolUse nativo
-y medir, en una comparación pareada, si el total de tokens del lote es menor
-que el del tool-loop nativo. La compatibilidad ya está validada; el ahorro de
-tokens es una hipótesis hasta contar con una corrida nativa equivalente.
+La compresión de contexto no depende del modo de ejecución: Rete y
+`build-yaml-context` son compartidos por batch y ToolUse nativo. El objetivo de
+la experimentación es, por un lado, permitir modelos que no exponen ToolUse
+nativo y, por otro, medir `context-tokens` (YAML curado) contra
+`naive-tokens`. La compatibilidad ya está validada; el ahorro de contexto es
+una hipótesis condicional hasta medir una corrida comparable.
 
 La respuesta canónica tiene esta forma:
 
@@ -528,12 +530,14 @@ Cada turno registra (`record-context-metrics`):
 tabla por herramienta; `metrics-to-json` vuelca todo a
 `metrics/<id>-metrics.json`.
 
-> **Caveat honesto:** `reduction_pct` compara el contexto curado contra el
-> snapshot naive **previo al podado**, pero el contexto final además incluye el
-> bloque `long_term_memory:` (que el naive no tiene). Por eso el porcentaje
-> puede ser **negativo** y no debe leerse como "ahorro real". La métrica de
-> ahorro real sigue siendo el uso reportado por el proveedor. El costo real lo
-> domina el **tool-loop** (iteraciones × pila), no el estimador.
+> **Caveat honesto:** `reduction_pct` compara el contexto curado por Rete contra
+> el snapshot naive **previo al podado**, pero el contexto final además incluye
+> el bloque `long_term_memory:` (que el naive no tiene). Por eso puede ser
+> **negativo** y no debe leerse como "ahorro real". Hay corridas con `+29,27%`
+> o `+22,00%` y una corrida larga con `-35,90%`: la reducción depende de la poda,
+> del formato y del volumen de hechos. Esta métrica es independiente de batch y
+> ToolUse. Para comparar costo total entre transportes hay que usar el mismo
+> `response.model` y medir los tokens acumulados reportados por el proveedor.
 
 ### 12. Persistencia
 
@@ -772,8 +776,28 @@ dependencias.
   - Resultado: **9/9 tests**, salida coherente de `main.py` y respuesta final sin
     `BATCH_JSON_INVALID`. El modelo efectivo se obtiene del campo `model` de la
     respuesta del proveedor; la captura de esta prueba lo registró por llamada.
-  - Esta corrida valida compatibilidad y deja la línea base de tokens; no incluye
-    una rama nativa comparable, por lo que todavía no afirma ahorro.
+  - La corrida también registra Rete/YAML frente a `naive`: `265` vs `195`
+    tokens de contexto (`-35,90%` en este caso); la reducción es condicional y
+    no depende de que el modo sea batch o ToolUse.
+
+- **Crecimiento de contexto en 8 turnos (2026-09-25)** — detalle en
+  [`EXPERIMENTS/context-growth-8turns-2026-09-25/`](EXPERIMENTS/context-growth-8turns-2026-09-25/):
+  - Una sola sesión (REPL alimentado por `prompts.txt`, no `run-one-shot`, que
+    reinicia memoria y métricas en cada proceso) con el proyecto creciendo turno a
+    turno: 2 794 → 8 080 bytes, 3 → 10 funciones, 9 → 26 tests.
+  - `context-tokens` (Rete/YAML) queda en la banda 1 720–1 930 desde el turno 4,
+    mientras `naive` crece de 83 a 5 330: la reducción pasa de `+1,20%` a
+    `+68,03%` y el total de la sesión es `+53,91%`.
+  - `prompt-tokens` real del proveedor tampoco crece (~1 761 → ~2 800): el costo
+    por turno deja de aumentar aunque el proyecto acumule historial.
+  - La saturación la impone `max_facts_per_type` (8) y no `max_context_chars`
+    (10 000): al final había 40 hechos = 5 tipos × 8, y el YAML se estabiliza en
+    ~7 k caracteres. El `-35,90%` de la corrida de un turno era una propiedad del
+    proyecto chico, no de Rete.
+  - El crecimiento lo aplicaron scripts idempotentes ejecutados con
+    `exec_command`, no el modelo: en dos intentos previos el modelo devolvió
+    respuestas vacías, duplicó una función y quedó atascado en un bucle de
+    herramientas.
 
 ## Cómo ejecutar
 
