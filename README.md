@@ -4,8 +4,8 @@
 asistentes de código basados en LLM, escrito en Common Lisp. Combina **dos
 motores de producciones Rete** (la librería [Lisa](https://github.com/ldotlisa/Lisa))
 con llamadas a proveedores de LLM (OpenRouter, Anthropic, OpenAI, Gemini, Groq,
-Ollama) —y un **modo batch** que ejecuta S-expressions preplanificadas contra
-las reglas del motor Rete— para decidir, *por turno*, qué hechos técnicos se
+Ollama) —y un **modo batch** que ejecuta lotes JSON compatibles con ToolUse
+contra las reglas del motor Rete— para decidir, *por turno*, qué hechos técnicos se
 envían al modelo y cuáles se descartan — y para conservar, entre sesiones, un
 **segundo motor de memoria a largo plazo**.
 
@@ -26,7 +26,7 @@ La arquitectura tiene dos memorias simbólicas separadas:
 
 **Palabras clave:** memoria de sesión, memoria a largo plazo, dos motores
 Rete/Lisa, pruning de contexto, detección de loops, tool-use, ejecución en
-background, modo batch (intenciones preplanificadas), persistencia, métricas de
+background, modo batch (intenciones JSON preplanificadas), persistencia, métricas de
 reducción.
 
 ## ¿Qué es este proyecto?
@@ -104,7 +104,7 @@ el conocimiento durable del proyecto.
                     │  3. snapshot línea base "naive"              │
                     │  4. build-yaml-context → YAML (+ long_term)  │
                     │  5. call-llm (tool-use + loop detector /     │
-                    │     batch: parser de S-expressions)          │
+                    │     batch: parser JSON ToolUse)               │
                     │  6. (batch) bucle (run)+re-llamada hasta     │
                     │     batch-complete                           │
                     │  7. assert respuesta + métricas              │
@@ -119,9 +119,10 @@ el conocimiento durable del proyecto.
         │  prune-superseded-…    │      │  loop tool-use +         │
         │  detect-command-loop   │      │  detección de loops      │
         │  detect-read-triple    │      │  (tool-loop-warning)     │
-        │  execute-intention-*   │      │  batch: clean-llm-text + │
-        │  batch-emergency-brake │      │  parse-llm-batch-to-     │
-        │  cancel-intentions-…   │      │  intentions (S-expr)     │
+        │  execute-intention-*   │      │  batch: response JSON +  │
+        │  batch-emergency-brake │      │  normalización ToolUse + │
+        │  cancel-intentions-…   │      │  parse-llm-batch-to-     │
+        │                        │      │  intentions               │
         │ context.lisp:          │      └──────────────────────────┘
         │  caps por tipo         │
         │  scoring + selección   │      ┌──────────────────────────┐
@@ -384,43 +385,58 @@ resultado como mensaje de rol `tool` y re-llama. Las herramientas expuestas son:
 De este modo *toda* salida observable que el modelo ve pasa también por la
 memoria de hechos y alimenta el pruning de turnos futuros.
 
-### 7. Modo batch (intenciones en Rete)
+### 7. Modo batch (intenciones JSON en Rete)
 
-Con `llm_provider: "batch"` no hay tool-use HTTP: `call-llm` pide al modelo que
-planifique de antemano y entregue **todas** sus acciones en una sola respuesta
-como S-expressions Lisp puras. El flujo:
+Con `llm_provider: "batch"` no hay tool-use nativo HTTP: `call-batch-llm` pide al modelo
+un lote de acciones compatible con ToolUse y lo convierte en intenciones Rete.
+La respuesta canónica tiene esta forma:
 
-1. `call-llm` apenda el bloque `<batch_execution_mode>` al system prompt, llama
-   al proveedor OpenAI-compat con herramientas **desactivadas** y
-   `parse-llm-batch-to-intentions` escanea la respuesta:
-   - `clean-llm-text` normaliza el texto (quita code fences, tags XML sueltos,
-     arregla `read-file`/`exec-command` sin paréntesis);
-   - cada S-expression válida (`(read-file "…")`, `(exec-command "…")`,
-     `(write-file "…" "…")`, `(edit-file "…" "…" "…")`) se aserta como un hecho
-     `intention` con `:action`, args y `:status :pending`;
-   - si no se parsea ninguna S-expression, se aserta `batch-complete` (la
-     respuesta era el texto final del modelo).
-2. `process-turn`, en modo batch, entra en un bucle Rete-controlado: dispara
-   `(run)`, reconstruye el contexto y re-llama al LLM hasta que existe
-   `batch-complete` (o se agota un safety-net de 100 rondas). Cada `(run)` hace
-   que las reglas `execute-intention-read/write/edit/command` llamen a las
-   funciones POSIX originales (`read-file`, `write-file`, `edit-file`,
-   `exec-command`) y retracten la intención (las funciones re-asertan los
-   hechos `file-read`/`file-write`/`command-exec`/… de siempre, que alimentan
-   pruning y loop-detection sin cambios).
-3. **Frenos de emergencia** (salience 20, corren antes que las de ejecución):
-   - `batch-emergency-brake`: si en el turno actual existe un `command-exec` con
-     *error real*, retracta todas las `intention` `:pending` — no se sigue
-     escribiendo sobre un proyecto fallido;
-   - `cancel-intentions-on-abort`: si existe un hecho `batch-abort`, retracta
-     todas las intenciones restantes.
+```json
+{
+  "tool_calls": [
+    {
+      "id": "call-1",
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "arguments": {"path": "math_utils.py"}
+      }
+    }
+  ],
+  "response": ""
+}
+```
 
-`detect-blind-writes` (llamada desde `process-turn` en cada ronda del bucle
-batch) detecta una intención `write-file` **o `edit-file`** sin lectura previa
-del archivo en el turno y aserta `batch-abort`; la regla
-`cancel-intentions-on-abort` (salience 20) la consume retractando todas las
-intenciones restantes. Es la protección activa contra reescribir a ciegas
-archivos que el modelo nunca leyó.
+Para una respuesta final sin acciones se usa `{"tool_calls":[],"response":"..."}`.
+Las funciones permitidas son `read_file`, `write_file`, `edit_file` y
+`exec_command`. El normalizador también acepta la variante flatten que pueden
+emitir los modelos `gpt-oss` (`type: "read_file"` con `arguments` al mismo
+nivel) y argumentos codificados como string JSON.
+
+El flujo es:
+
+1. `call-batch-llm` agrega las instrucciones `batch_execution_mode` al prompt y
+   solicita `response_format: {"type":"json_object"}` al endpoint compatible.
+   Si la respuesta no es JSON o no cumple el contrato, reintenta una vez con una
+   instrucción correctiva; nunca crea intenciones parciales a partir de un lote
+   inválido.
+2. `parse-llm-batch-to-intentions` normaliza y valida todo el lote antes de
+   asertarlo. Valida rutas, tipos de argumentos y, especialmente,
+   `edit_file.old_string` no vacío. Las intenciones se asertan con `:turn-id`,
+   `:parent-id`, `:step` y `:status :pending`.
+3. `process-turn` ejecuta `(run)`, las reglas `execute-intention-*` llaman a las
+   funciones POSIX originales y retractan cada intención. Luego reconstruye el
+   contexto y vuelve a llamar al modelo hasta encontrar `batch-complete` (con un
+   safety-net de 100 rondas).
+4. **Frenos de emergencia** (salience 20): `batch-emergency-brake` cancela
+   intenciones pendientes cuando aparece un error real de comando, y
+   `cancel-intentions-on-abort` consume cualquier `batch-abort`.
+
+`detect-blind-writes` se ejecuta en cada ronda: un `write_file` o `edit_file`
+sobre un archivo existente sin una lectura previa genera `batch-abort` y evita
+reescribir archivos a ciegas. Las lecturas, escrituras y comandos siguen
+alimentando los mismos hechos, reglas de podado y detección de loops que el
+modo normal.
 
 ### 8. Streaming en vivo (opencode-style)
 
@@ -479,7 +495,7 @@ el directorio base.
 | openai-compat | `call-llm-with-tools` (streaming) | Sí (`llm_max_tool_iterations`) |
 | `openrouter`  | openai-compat                    | Sí       |
 | `groq`        | openai-compat                    | Sí       |
-| `batch`       | openai-compat sin tools + parser de S-expressions → intenciones en Rete (§7) | No (batch preplanificado) |
+| `batch`       | openai-compat JSON + parser ToolUse → intenciones en Rete (§7) | No (lote preplanificado) |
 
 Configuración vía `config.json` o variables de entorno (`LLM_PROVIDER`,
 `LLM_MODEL`, `LLM_ENDPOINT` vía `config.lisp`; la API key por env es
@@ -735,6 +751,22 @@ dependencias.
   - **arreglar un `TemplateNotFound`** de Jinja y relanzar → `GET /` = 200;
   - memoria larga usada entre corridas (el modelo citó traces de fallos previos)
     y persistida en `dumps/longterm-mem.lisp` (errores reales + escrituras).
+
+- **Stress de batch con `llm_model: "auto"` (2026-09-25)**:
+  - Se ejecutó el prompt de creación de un mini proyecto Python con archivos,
+    tests y verificaciones mediante `python3 -m unittest test_math_utils.py` y
+    `python3 main.py`.
+  - El mismo turno realizó 5 llamadas al endpoint; el campo `model` de las
+    respuestas reportó `nvidia/nemotron-3-ultra-550b-a55b` (4) y
+    `meta/muse-glimmer-30b` (1). `auto` puede cambiar de modelo entre rondas,
+    incluso dentro de un mismo turno.
+  - Se ejercitaron `response_format: json_object`, reintento de respuesta
+    inválida, normalización ToolUse canónica/flatten, lecturas, escrituras y
+    comandos. En una repetición hubo un `502` transitorio del endpoint y el
+    flujo batch se recuperó.
+  - Resultado: **9/9 tests**, salida coherente de `main.py` y respuesta final sin
+    `BATCH_JSON_INVALID`. El modelo efectivo se obtiene del campo `model` de la
+    respuesta del proveedor; la captura de esta prueba lo registró por llamada.
 
 ## Cómo ejecutar
 
