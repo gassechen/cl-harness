@@ -1,19 +1,7 @@
 context:
-  session: session-3999329534
+  session: session-3999355039
   prior_turns:
   current_turn:
     number: 1
     events:
-      user: "Creá un mini proyecto Python en el directorio actual con esta estructura:n1. Un archivo math_utils.py con tres funciones: factorial(n), is_prime(n), y fibonacci(n).n2. Un archivo test_math_utils.py con tests para las tres funciones, cubriendo casos normales y casos borde (n=0, n=1, negativos).n3. Un archivo main.py que importe math_utils y demuestre las tres funciones con ejemplos.n4. Corré los tests con python3 -m unittest test_math_utils.py.n5. Si algún test falla, corregí math_utils.py y volvé a correr.n6. Corré main.py y verificá que imprime resultados coherentes.n7. Reportá: qué funciones implementaste, cuántos tests pasaron, y el output de main.py."
-      exec: python3 -m unittest test_math_utils.py -> exit 0
-        output: ".........
-----------------------------------------------------------------------
-Ran 9 tests in 0.000s
-
-OK
-"
-      exec: python3 main.py -> exit 0
-        output: "Factorial of 5 is 120
-Is 29 a prime? Yes
-The 10th Fibonacci number is 55
-"
+      user: Escribe el archivo a.txt con el texto hola.

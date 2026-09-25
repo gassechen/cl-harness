@@ -5,15 +5,37 @@
 ;;; ============================================
 
 (defparameter *last-llm-usage* nil
-  "Usage (:prompt N :completion N) of the last successful LLM call. For tool
-   loops these are CUMULATIVE totals across all API iterations of the turn.")
+  "Usage (:prompt N :completion N :model \"m\") of the last successful LLM call.
+   For tool loops these are CUMULATIVE totals across all API iterations of the
+   turn (the tool-loop paths aggregate them explicitly).")
+
+(defparameter *llm-call-log* nil
+  "One record per provider API request made during the current turn:
+   (:prompt N :completion N :model \"m\" :endpoint \"url\" :attempt N).
+   This is the per-CALL token accounting: a turn that loops N times shows N
+   entries, so a runaway loop is visible as a growing list instead of a single
+   cumulative number. Snapshot and reset by record-context-metrics.")
+
+(defparameter *llm-response-model* nil
+  "Model reported by the provider for the last response, when it reports one
+   (OpenAI-compatible: \"model\"; Gemini: \"modelVersion\").")
+
+(defun response-model-of (resp-obj)
+  "The model identifier a provider response reports, or NIL."
+  (when (hash-table-p resp-obj)
+    (or (gethash "model" resp-obj)
+        (gethash "modelVersion" resp-obj)
+        (gethash "model_name" resp-obj))))
 
 (defparameter *last-llm-call-info* nil
   "Metadata of the most recent LLM turn call:
    (:iterations N :path PATH) where PATH is one of:
    :final (normal answer) | :tool-loop (aborted by loop detector) |
    :api-error | :exhaustion-partial (iterations exhausted, partial text kept) |
-   :exhaustion-error (iterations exhausted, no text).")
+   :exhaustion-error (iterations exhausted, no text).
+   En modo batch (ver PROCESS-TURN) el valor es :ITERATIONS (se agoto
+   BATCH-MAX-ITERATIONS), :BATCH-REPEATED (el modelo pidio el mismo lote) o
+   :LLM-ERROR (el proveedor fallo en una ronda).")
 
 (defun llm-stream-p ()
   "Whether to stream LLM responses to stdout as they arrive (opencode-style
@@ -23,19 +45,35 @@
     (cond ((and present (null v)) nil)
           (t t))))
 
-(defun capture-usage (resp-obj &optional (prompt-key "prompt_tokens")
-                                   (completion-key "completion_tokens"))
+(defun capture-usage (resp-obj &key (prompt-key "prompt_tokens")
+                               (completion-key "completion_tokens")
+                               (log t))
   "Read usage metrics from a parsed API response, if present. Only updates
    the global when a usage object exists: streaming chunks that carry no
-   usage must NOT overwrite the accumulated value with NIL."
+   usage must NOT overwrite the accumulated value with NIL.
+   With LOG (the default), each response that carries usage is appended to
+   *llm-call-log*, which is what makes per-call token accounting possible.
+   The streaming path passes :log nil because it calls this once per chunk."
   (let ((usage (or (gethash "usage" resp-obj)
-                   (gethash "usageMetadata" resp-obj))))
+                   (gethash "usageMetadata" resp-obj)))
+        (model (response-model-of resp-obj)))
+    (when model
+      (setf *llm-response-model* model))
     (when usage
-      (setf *last-llm-usage*
-            (list :prompt (or (gethash prompt-key usage)
-                              (gethash "promptTokenCount" usage))
-                  :completion (or (gethash completion-key usage)
-                                  (gethash "candidatesTokenCount" usage)))))))
+      (let ((prompt (or (gethash prompt-key usage)
+                        (gethash "promptTokenCount" usage)))
+            (completion (or (gethash completion-key usage)
+                            (gethash "candidatesTokenCount" usage))))
+        (setf *last-llm-usage*
+              (list :prompt prompt
+                    :completion completion
+                    :model (or model *llm-response-model*)))
+        (when log
+          (push (list :prompt prompt
+                      :completion completion
+                      :model (or model *llm-response-model*)
+                      :endpoint (llm-endpoint))
+                *llm-call-log*))))))
 
 (defun decode-response (raw)
   "Safely decode HTTP response body (string or octets) to a character string."
@@ -46,6 +84,113 @@
     ((vectorp raw)
      (map 'string #'code-char raw))
     (t (format nil "~A" raw))))
+
+;;; --- HTTP transport: bounded retry with exponential backoff ---
+;;;
+;;; A provider POST is the only network call the harness makes, and it is not
+;;; idempotent from the provider's point of view (it bills tokens), so retries
+;;; must be BOUNDED and must only cover failures that can plausibly succeed on
+;;; a second try: 429 (rate limit), 5xx (server-side) and transport errors
+;;; (DNS, connection reset, read timeout). A 400/401/403/404 means the request
+;;; itself is wrong: retrying it only burns quota, so it is re-signalled at once.
+
+(defun retryable-http-status-p (status)
+  "TRUE for transient HTTP statuses worth another attempt: 429 and 5xx.
+   FALSE for every other 4xx (bad request, auth, not found) and for 2xx/3xx."
+  (and (integerp status)
+       (or (= status 429)
+           (and (>= status 500) (<= status 599)))))
+
+(defun http-error-status (condition)
+  "The HTTP status carried by a dexador error, or NIL when there is none."
+  (handler-case
+      (let ((status (dexador:response-status condition)))
+        (when (integerp status) status))
+    (error () nil)))
+
+(defun retry-delay-seconds (attempt)
+  "Exponential backoff for ATTEMPT (1 = delay before the second try), with
+   jitter and a 30s ceiling. Returns 0 when the backoff base is 0."
+  (let* ((base (float (or (llm-http-backoff-seconds) 0) 1.0))
+         (ceiling-seconds 30.0)
+         (delay (if (zerop base) 0.0 (min ceiling-seconds (* base (expt 2 (1- attempt))))))
+         (jitter (if (zerop delay) 0.0 (* delay 0.25 (random 1.0)))))
+    (+ delay jitter)))
+
+(defun wait-before-http-retry (attempt reason)
+  "Sleep the backoff for ATTEMPT, logging it when debug mode is on."
+  (let ((delay (retry-delay-seconds attempt)))
+    (when *debug-mode*
+      (format t "~&[DEBUG llm] HTTP_RETRY attempt=~D wait=~,1Fs reason=~A~%"
+              (1+ attempt) delay reason))
+    (unless (zerop delay)
+      (sleep delay))
+    delay))
+
+(defun call-with-retry (thunk
+                         &key (attempts (max 1 (llm-http-attempts)))
+                              (retryable-p #'retryable-http-status-p))
+  "Call THUNK up to ATTEMPTS times, retrying transient failures with the
+   exponential backoff of WAIT-BEFORE-HTTP-RETRY.
+
+   A failure is worth another try when it carries NO HTTP status (transport:
+   DNS, connection reset, read timeout) or when RETRYABLE-P accepts its status.
+   RETRYABLE-P defaults to RETRYABLE-HTTP-STATUS-P, so 429 and 5xx are retried
+   and a 400/401/403/404 re-signals the original condition at once: the request
+   itself is wrong, retrying it only burns quota.
+
+   THUNK is a parameter (not the dexador call itself) so the policy can be
+   tested offline: the suite passes a thunk that raises a synthetic
+   DEXADOR::HTTP-REQUEST-FAILED and counts the attempts, no socket involved.
+
+   The loop uses an explicit DONE flag instead of `(return (funcall thunk))`:
+   with a RETURN inside a HANDLER-CASE that covers the whole LOOP body, this
+   compiler folds the RETURN away and the loop always runs to the end."
+  (let ((tries (max 1 attempts))
+        (last-error nil)
+        (result nil)
+        (done nil))
+    (loop for attempt from 1 to tries
+          while (not done)
+          do (handler-case
+                 (setf result (funcall thunk)
+                       done t)
+               (error (e)
+                 (setf last-error e)
+                 (let ((status (http-error-status e)))
+                   (if (and (< attempt tries)
+                            (or (null status) (funcall retryable-p status)))
+                       (wait-before-http-retry
+                        attempt
+                        (if status
+                            (format nil "HTTP ~D" status)
+                            (class-name (class-of e))))
+                       (error e))))))
+    (if done
+        result
+        (error "llm request failed after ~D attempt~D: ~A"
+               tries (if (= tries 1) "" "s") last-error))))
+
+
+(defun dexador-post-with-retry (endpoint headers content
+                               &key want-stream (read-timeout (llm-http-read-timeout)))
+  "POST CONTENT to ENDPOINT, retrying TRANSIENT failures with exponential
+   backoff. Returns the raw response body (or the live stream when WANT-STREAM).
+   Re-signals the original condition when the failure is not retryable or when
+   all attempts are exhausted, so callers keep their existing error handling.
+   With WANT-STREAM the response must stay a CHARACTER stream because the SSE
+   reader calls READ-LINE on it; a gray/binary stream has no READ-LINE method
+   and the streaming turn would silently come back empty. Non-streaming callers
+   keep the binary body they already decode themselves."
+  (call-with-retry
+   (lambda ()
+     (dexador:request endpoint
+                      :method :post
+                      :headers headers
+                      :content content
+                      :read-timeout read-timeout
+                      :want-stream want-stream
+                      :force-binary (not want-stream)))))
 
 (defun openrouter-p ()
   (string-equal (llm-provider) "openrouter"))
@@ -204,7 +349,9 @@
        (if (and path old-string new-string)
            (let ((result (edit-file path old-string new-string)))
              (if (getf result :applied)
-                 (format nil "Edited ~A: replaced ~A chars with ~A chars (~A match~:P found)"
+                 ;; Sin "~:P": en este Lisp las directivas "~:" no consumen
+                 ;; argumento, asi que el plural nunca se aplicaba.
+                 (format nil "Edited ~A: replaced ~A chars with ~A chars (~A match(es) found)"
                          (getf result :path)
                          (getf result :replaced-chars)
                          (getf result :new-chars)
@@ -273,7 +420,7 @@
   (let ((choices (and (hash-table-p chunk) (gethash "choices" chunk)))
         (finish nil))
     (when (hash-table-p chunk)
-      (capture-usage chunk))
+      (capture-usage chunk :log nil))
     (when (and choices (plusp (length choices)))
       (let* ((choice (elt choices 0))
              (delta (and (hash-table-p choice) (gethash "delta" choice))))
@@ -403,11 +550,10 @@
                     (1+ iteration) endpoint json-body))
           (let ((stream
                   (handler-case
-                      (dexador:request endpoint
-                                       :method :post
-                                       :headers headers
-                                       :content json-body
-                                       :want-stream t)
+                      (dexador-post-with-retry endpoint
+                                               headers
+                                               json-body
+                                               :want-stream t)
                     (error (e)
                       (when *debug-mode*
                         (format t "~&[DEBUG stream] transport error: ~A~%" e))
@@ -539,7 +685,7 @@
              (endpoint (openai-compat-endpoint))
              (headers (openai-compat-headers))
              (raw-response (handler-case
-                               (dexador:request endpoint :method :post :headers headers :content json-body :force-binary t)
+                               (dexador-post-with-retry endpoint headers json-body)
                              (error (e)
                                (when *debug-mode*
                                  (format t "~&[DEBUG llm] ERROR: ~A~%" e)
@@ -682,13 +828,13 @@
   "Call Anthropic Messages API, return assistant text."
   (let* ((body (build-anthropic-messages system-prompt context user-message))
          (json-body (com.inuoe.jzon:stringify body))
-         (response (dexador:request (anthropic-endpoint)
-                                         :method :post
-                                         :headers (anthropic-headers)
-                                         :content json-body
-                                         :force-binary t))
+         (response (dexador-post-with-retry (anthropic-endpoint)
+                                            (anthropic-headers)
+                                            json-body))
          (resp-obj (com.inuoe.jzon:parse response)))
-    (capture-usage resp-obj "input_tokens" "output_tokens")
+    (capture-usage resp-obj
+                   :prompt-key "input_tokens"
+                   :completion-key "output_tokens")
     (let ((content (gethash "content" resp-obj)))
       (when (and content (plusp (length content)))
         (let ((block (elt content 0)))
@@ -705,16 +851,11 @@
       (format t "~&[DEBUG llm] headers=~A~%" headers)
       (format t "~&[DEBUG llm] body=~A~%" json-body))
     (handler-case
-        (let* ((raw-response (dexador:request endpoint
-                                              :method :post
-                                              :headers headers
-                                              :content json-body
-					      :read-timeout 120
-                                              :force-binary t))
-               ;;(response (if (stringp raw-response)
-               ;;              raw-response
-               ;;              (coerce raw-response 'string)))
-	                      (response (decode-response raw-response))
+        (let* ((raw-response (dexador-post-with-retry endpoint
+                                                     headers
+                                                     json-body
+                                                     :read-timeout 120))
+               (response (decode-response raw-response))
 	       
                (resp-obj (com.inuoe.jzon:parse response)))
           (when *debug-mode*
@@ -744,11 +885,9 @@
                   system-prompt context user-message))
     (setf (gethash "stream" body) nil)
     (let* ((json-body (com.inuoe.jzon:stringify body))
-           (raw-response (dexador:request endpoint
-                                               :method :post
-                                               :headers '(("Content-Type" . "application/json"))
-                                               :content json-body
-                                               :force-binary t))
+           (raw-response (dexador-post-with-retry endpoint
+                                                  '(("Content-Type" . "application/json"))
+                                                  json-body))
            (response (if (stringp raw-response)
                          raw-response
                          (coerce raw-response 'string)))
@@ -786,10 +925,7 @@
         (format t "~&[DEBUG llm] gemini endpoint=~A~%" endpoint)
         (format t "~&[DEBUG llm] gemini body=~A~%" json-body))
       (handler-case
-          (let* ((raw-response (dexador:request endpoint
-                                                :method :post
-                                                :headers headers
-                                                :content json-body))
+          (let* ((raw-response (dexador-post-with-retry endpoint headers json-body))
                  (response (if (stringp raw-response)
                                raw-response
                                (coerce raw-response 'string)))

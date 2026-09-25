@@ -97,8 +97,12 @@ Is 29 a prime? Yes
 The 10th Fibonacci number is 55
 ```
 
-En una repetición del stress test se produjo un `502` transitorio del endpoint;
-el flujo batch lo recuperó y volvió a cerrar el turno correctamente.
+En una repetición del stress test se produjo un `502` transitorio del endpoint y
+el turno terminó de todos modos. **No se registró cuál fue el mecanismo de
+recuperación**, así que este dato no debe leerse como evidencia de recuperación
+automática: en la corrida de entonces el harness todavía no reintentaba los
+`5xx`. La política explícita de reintentos (§Política de reintentos HTTP del
+README principal) se añadió después, con su propia suite offline.
 
 ### 4.1. Rete/YAML frente a `naive`
 

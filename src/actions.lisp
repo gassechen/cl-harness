@@ -40,8 +40,15 @@
 (defun sh-quote (s)
   "Single-quote a string for /bin/sh, escaping embedded single quotes.
    Enables wrapping a whole command with `sh -c '...'` even when the command
-   itself contains double quotes (python -c \"...\") or single quotes."
-  (format nil "'~A'" (cl-ppcre:regex-replace-all "'" s "'\\''")))
+   itself contains double quotes (python -c \"...\") or single quotes.
+   El reemplazo usa una FUNCIÓN: en la cadena de reemplazo de cl-ppcre, `\\`
+   inicia una referencia al grupo, así que pasar \"'\\\\''\" a secas no escapaba
+   nada y `(sh-quote \"it's\")` devolvía `'it's's'`, que /bin/sh parte en tres
+   palabras."
+  (format nil "'~A'"
+          (cl-ppcre:regex-replace-all "'" s (lambda (m &rest registers)
+                                            (declare (ignore m registers))
+                                            "'\\''"))))
 
 (defun strip-cd-prefix (command)
   "Drop a leading `cd ABSOLUTE &&` the model often emits, since the harness
@@ -160,48 +167,66 @@
   "Replace the first exact occurrence of OLD-STRING with NEW-STRING in PATH,
    rewriting the file in place. Pure CL (SEARCH + CONCATENATE), no external
    dependencies, so files of any size survive intact.
+   Guard: an EMPTY OLD-STRING is rejected. (SEARCH \"\" ...) returns 0, which
+   would silently PREPEND NEW-STRING to the file instead of replacing anything
+   — a quiet corruption of the user's source. The guard lives in the ACTION,
+   not in the batch validator, so it protects every caller (batch mode, native
+   tool-use mode and direct calls).
    Registers as a fact in Rete."
-  (let* ((full (resolve-path path))
-         (contents (if (probe-file full)
-                       (read-file-contents full)
-                       (return-from edit-file
-                         (list :path (namestring full) :error "File not found"))))
-         (pos (search old-string contents)))
-    (if (null pos)
-        (progn
-          (assert (harness-fact (fact-type "file-edit")
-                                (timestamp (get-universal-time))
-                                (data (list :path (namestring full)
-                                            :applied nil
-                                            :reason "old_string not found"
-                                            :turn-id (current-turn-id)
-                                            :parent-id (current-turn-id)))))
-          (list :path (namestring full) :applied nil
-                :error (format nil "old_string not found in ~A"
-                               (namestring full))))
-        (let* ((new-contents
-                 (concatenate 'string
-                              (subseq contents 0 pos)
-                              new-string
-                              (subseq contents (+ pos (length old-string)))))
-               (hits (count-occurrences contents old-string)))
-          (ensure-directories-exist full)
-          (with-open-file (s full :direction :output :if-exists :supersede)
-            (write-string new-contents s))
-          (assert (harness-fact (fact-type "file-edit")
-                                (timestamp (get-universal-time))
-                                (data (list :path (namestring full)
-                                            :applied t
-                                            :replaced-chars (length old-string)
-                                            :new-chars (length new-string)
-                                            :matches hits
-                                            :turn-id (current-turn-id)
-                                            :parent-id (current-turn-id)))))
-          (list :path (namestring full)
-                :applied t
-                :matches hits
-                :replaced-chars (length old-string)
-                :new-chars (length new-string))))))
+  (let* ((full (resolve-path path)))
+    (when (zerop (length old-string))
+      (assert (harness-fact (fact-type "file-edit")
+                            (timestamp (get-universal-time))
+                            (data (list :path (namestring full)
+                                        :applied nil
+                                        :reason "old_string must not be empty"
+                                        :turn-id (current-turn-id)
+                                        :parent-id (current-turn-id)))))
+      (return-from edit-file
+        (list :path (namestring full)
+              :applied nil
+              :error (format nil "old_string must not be empty: an empty old_string cannot identify what to replace in ~A. Replace a non-empty exact snippet instead (and keep that snippet inside new_string when inserting)."
+                             (namestring full)))))
+    (let* ((contents (if (probe-file full)
+                         (read-file-contents full)
+                         (return-from edit-file
+                           (list :path (namestring full) :error "File not found"))))
+           (pos (search old-string contents)))
+      (if (null pos)
+          (progn
+            (assert (harness-fact (fact-type "file-edit")
+                                  (timestamp (get-universal-time))
+                                  (data (list :path (namestring full)
+                                              :applied nil
+                                              :reason "old_string not found"
+                                              :turn-id (current-turn-id)
+                                              :parent-id (current-turn-id)))))
+            (list :path (namestring full) :applied nil
+                  :error (format nil "old_string not found in ~A"
+                                 (namestring full))))
+          (let* ((new-contents
+                   (concatenate 'string
+                                (subseq contents 0 pos)
+                                new-string
+                                (subseq contents (+ pos (length old-string)))))
+                 (hits (count-occurrences contents old-string)))
+            (ensure-directories-exist full)
+            (with-open-file (s full :direction :output :if-exists :supersede)
+              (write-string new-contents s))
+            (assert (harness-fact (fact-type "file-edit")
+                                  (timestamp (get-universal-time))
+                                  (data (list :path (namestring full)
+                                              :applied t
+                                              :replaced-chars (length old-string)
+                                              :new-chars (length new-string)
+                                              :matches hits
+                                              :turn-id (current-turn-id)
+                                              :parent-id (current-turn-id)))))
+            (list :path (namestring full)
+                  :applied t
+                  :matches hits
+                  :replaced-chars (length old-string)
+                  :new-chars (length new-string)))))))
 
 
 

@@ -5,5 +5,10 @@
   "max_context_facts": 50,
   "fact_ttl_seconds": 300,
   "max_facts_per_type": 10,
-  "llm_endpoint": "https://api.groq.com/openai/v1/chat/completions"
+  "llm_endpoint": "https://api.groq.com/openai/v1/chat/completions",
+  "llm_http_attempts": 3,
+  "llm_http_backoff_seconds": 1.0,
+  "llm_http_read_timeout": 120,
+  "batch_max_iterations": 8,
+  "batch_repeat_tolerance": 1
 }

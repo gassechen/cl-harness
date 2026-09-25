@@ -4,6 +4,10 @@
 ;;; Context builder — YAML output
 ;;; ============================================
 
+;;; Defined with DEFVAR in repl.lisp (loaded later); declared here so the debug
+;;; traces below compile without "undefined variable" warnings.
+(defvar *debug-mode* nil)
+
 (defun escape-yaml (s)
   "Escape a string for YAML scalar values."
   (if (or (null s) (string= s ""))

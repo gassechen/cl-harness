@@ -140,8 +140,42 @@
 
 (defun llm-max-tool-iterations ()
   "Max tool-use iterations per turn before giving up. Configurable so long
-   multi-step tasks (write + verify) can finish inside a single turn."
+   multi-step tasks (write + verify) can finish inside a single turn.
+   Applies to the NATIVE TOOL-USE paths only: in batch mode the loop lives in
+   process-turn and is bounded by BATCH-MAX-ITERATIONS instead."
   (or (config-value "llm_max_tool_iterations") 12))
+
+(defun batch-max-iterations ()
+  "Max LLM round-trips per turn in BATCH mode (one round-trip = run the rules
+   over the asserted intentions, rebuild the context, call the LLM again).
+   Default 8: enough for write + verify + fix, small enough that a model stuck
+   in a tool loop cannot burn an unbounded number of API calls. Set to 0 to
+   disable the cap (not recommended)."
+  (or (config-value "batch_max_iterations") 8))
+
+(defun batch-repeat-tolerance ()
+  "How many times the SAME batch (identical tool_calls) may be requested in one
+   turn before the turn is aborted. Default 1: the second identical request is
+   the model repeating a failing call instead of reacting to the tool result.
+   Set to 0 to disable repeat detection."
+  (or (config-value "batch_repeat_tolerance") 1))
+
+(defun llm-http-attempts ()
+  "Total number of HTTP attempts (1 = no retry) for provider calls. Retries
+   only happen for 429 and 5xx responses and for transport errors; a 4xx that
+   is not 429 is never retried, since retrying a bad request only wastes the
+   quota. Default 3."
+  (or (config-value "llm_http_attempts") 3))
+
+(defun llm-http-backoff-seconds ()
+  "Base delay for the exponential backoff between HTTP attempts. The wait is
+   base * 2^(attempt-1) plus jitter, and is capped at 30s. Default 1.0.
+   Set to 0 to retry immediately (useful in tests)."
+  (or (config-value "llm_http_backoff_seconds") 1.0))
+
+(defun llm-http-read-timeout ()
+  "Read timeout (seconds) for provider calls. 0 disables. Default 120."
+  (or (config-value "llm_http_read_timeout") 120))
 
 (defun sessions-dir ()
   (or (config-value "sessions_dir")

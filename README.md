@@ -29,6 +29,10 @@ Rete/Lisa, pruning de contexto, detección de loops, tool-use, ejecución en
 background, modo batch (intenciones JSON preplanificadas), persistencia, métricas de
 reducción.
 
+> **Alcance y límites:** el inventario completo de lo que el harness hace y de lo
+> que no hace, con referencias `archivo:línea` y la deuda técnica priorizada, está
+> en [`INFORME-CAPACIDADES.md`](./INFORME-CAPACIDADES.md).
+
 ## ¿Qué es este proyecto?
 
 *cl-harness* es un *REPL* interactivo y una librería ASDF. Como REPL, recibe
@@ -433,8 +437,13 @@ El flujo es:
    `:parent-id`, `:step` y `:status :pending`.
 3. `process-turn` ejecuta `(run)`, las reglas `execute-intention-*` llaman a las
    funciones POSIX originales y retractan cada intención. Luego reconstruye el
-   contexto y vuelve a llamar al modelo hasta encontrar `batch-complete` (con un
-   safety-net de 100 rondas).
+   contexto y vuelve a llamar al modelo hasta encontrar `batch-complete`. El
+   bucle tiene dos topes configurables: `batch_max_iterations` (default 8, 0 =
+   sin tope) y `batch_repeat_tolerance` (default 1), que corta cuando el modelo
+   vuelve a pedir *exactamente* el mismo lote — señal de que no reaccionó al
+   resultado de las herramientas. Al abortar se registra
+   `*last-llm-call-info*` con `:path` `:iterations`, `:batch-repeated` o
+   `:llm-error`, y el corte se imprime en el log.
 4. **Frenos de emergencia** (salience 20): `batch-emergency-brake` cancela
    intenciones pendientes cuando aparece un error real de comando, y
    `cancel-intentions-on-abort` consume cualquier `batch-abort`.
@@ -510,6 +519,22 @@ Configuración vía `config.json` o variables de entorno (`LLM_PROVIDER`,
 El proveedor por defecto es
 `anthropic` con `claude-sonnet-4-20250514`; el proyecto se validó con OpenRouter
 + DeepSeek.
+
+#### Política de reintentos HTTP
+
+`dexador-post-with-retry` envuelve cada llamada al proveedor:
+
+- Reintenta sólo `429` y `5xx`, y los errores de transporte (conexión
+  reiniciada, timeout). Un `4xx` que no sea `429` sube de inmediato: reintentar
+  una petición mal formada sólo gasta cuota.
+- Espera `llm_http_backoff_seconds * 2^(intento-1)` más jitter, hasta
+  `llm_http_attempts` intentos en total (default 3).
+- Timeout de lectura por request: `llm_http_read_timeout` (default 120 s).
+- El reintento vive en `call-with-retry`, que recibe un `thunk`: así la
+  política se ejercita en los tests con condiciones sintéticas
+  (`dexador::http-request-failed`) sin abrir ningún socket.
+- Al agotar los intentos sube el último error, anotando cuántos intentos se
+  hicieron.
 
 ### 11. Métricas (medir antes de optimizar)
 
@@ -606,6 +631,11 @@ propia): el valor del `config.json` tiene prioridad sobre la variable.
 | `background_on_timeout`  | true      | Relanzar detached lo que excede el timeout           |
 | `conserve_errors`        | true      | Errores reales se conservan (TTL-exentos + prioridad) |
 | `max_tool_result_chars`  | 8000      | Recorte del tool-result inyectado (0/false = off)    |
+| `batch_max_iterations`  | 8         | Máx. rondas LLM por turno en modo batch (0 = sin tope) |
+| `batch_repeat_tolerance`| 1         | Cuántas veces se tolera pedir el MISMO lote antes de cortar |
+| `llm_http_attempts`     | 3         | Intentos HTTP totales (1 = sin reintento)            |
+| `llm_http_backoff_seconds` | 1.0    | Base del backoff exponencial con jitter entre reintentos |
+| `llm_http_read_timeout` | 120       | Timeout de lectura por request HTTP                  |
 | `sessions_dir`/`dumps_dir`/`metrics_dir` | subdirs del base dir | Dónde persistir |
 
 ## Comandos del REPL
@@ -748,11 +778,16 @@ dependencias.
 
 ## Validación realizada
 
-- *Offline (0 llamadas API)*: suite de verificación de los dos motores (23/23
-  PASS): aislamiento entre motores, reglas por engine (incl. `mem-dedup-durable`
-  en el motor de memoria), detección de loops, sin falsos positivos, promoción
-  durable (se conservan errores/escrituras, no la conversación), bloque
-  `long_term_memory` en el contexto, dump/restore/boot-memory.
+- *Offline (0 llamadas API)*: **suite automatizada de 52 casos, 52/52 PASS**
+  (`./run-tests.sh`, `RESULTADO: OK`). Cubre aislamiento entre motores, reglas
+  por engine (incl. `mem-dedup-durable` en el motor de memoria), detección de
+  loops, sin falsos positivos, promoción durable (se conservan
+  errores/escrituras, no la conversación), bloque `long_term_memory` en el
+  contexto, dump/restore/boot-memory, parser y normalización batch, dedup/TTL,
+  topes por tipo, guardas de escritura, métricas, topes del bucle batch y
+  política de reintentos HTTP. El suite es offline **por contrato**: durante la
+  corrida `dexador:post` se sustituye por una señal, de modo que una fuga de
+  red falle en vez de gastar una llamada real.
 - *En vivo (OpenRouter/DeepSeek)*:
   - arreglar un test que fallaba → `pytest` 32/32 PASS;
   - **levantar un servicio** uvicorn y **verificarlo** por HTTP (`/api/state`
@@ -771,8 +806,9 @@ dependencias.
     incluso dentro de un mismo turno.
   - Se ejercitaron `response_format: json_object`, reintento de respuesta
     inválida, normalización ToolUse canónica/flatten, lecturas, escrituras y
-    comandos. En una repetición hubo un `502` transitorio del endpoint y el
-    flujo batch se recuperó.
+    comandos. En una repetición hubo un `502` transitorio del endpoint y el turno
+    terminó igual; el log no registra qué lo recuperó, así que no es evidencia
+    de reintento automático (esa política se añadió después, con suite propia).
   - Resultado: **9/9 tests**, salida coherente de `main.py` y respuesta final sin
     `BATCH_JSON_INVALID`. El modelo efectivo se obtiene del campo `model` de la
     respuesta del proveedor; la captura de esta prueba lo registró por llamada.
@@ -826,6 +862,14 @@ Arranque directo con SBCL + Quicklisp (el proyecto se encuentra vía
 
   ```shell
   ./run.sh run "verifica que el servicio responda"
+  ```
+
+- **Suite de tests** (offline, sin llamadas al proveedor):
+
+  ```shell
+  ./run-tests.sh              # 52 casos; exit 0 = todo pasó
+  ./run-tests.sh metrics      # sólo los casos cuyo nombre coincide
+  ./run-tests.sh config/retry # sólo los de reintentos HTTP
   ```
 
 - **Config/dir base alternativos** vía entorno:

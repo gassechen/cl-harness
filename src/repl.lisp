@@ -211,6 +211,8 @@ working context via structured facts. Help them with their task."))
          (response (handler-case
                        (progn
                          (setf *last-llm-usage* nil)
+                         (setf *llm-call-log* nil)
+                         (setf *llm-response-model* nil)
                          (setf *last-llm-call-info* nil)
                          (when streamed
                            (format *standard-output* "~&assistant>~%")
@@ -222,17 +224,61 @@ working context via structured facts. Help them with their task."))
     (when (and (string-equal (llm-provider) "batch")
                response
                (not (search "[LLM ERROR]" response :test #'char=)))
-      (loop for i from 1 to 100
-            while (and response 
-                       (not (search "[LLM ERROR]" response :test #'char=))
-                       (not (batch-complete-p)))
-            do (progn
-                 (format t "~&[DEBUG process-turn] Disparando (run) - Ronda ~A...~%" i)
-                 (detect-blind-writes)
-                 (run)
-                 (let ((new-context (build-yaml-context user-message))) ;; <--- ACÁ SE GENERA EL DUMP ACTUALIZADO
-                   (setf response (call-llm system-prompt new-context user-message))
-                   (incf batch-iterations))))) 
+      (let ((max-rounds (or (batch-max-iterations) most-positive-fixnum))
+            (seen (make-hash-table :test 'equal))
+            (repeats 0)
+            (aborted nil))
+        (loop for i from 1
+              while (and response
+                         (< i max-rounds)
+                         (not (search "[LLM ERROR]" response :test #'char=))
+                         (not (batch-complete-p)))
+              do (let ((fingerprint (batch-fingerprint response)))
+                   ;; A model that re-requests the IDENTICAL batch is not
+                   ;; reacting to the tool result: it is stuck. Abort instead of
+                   ;; paying for the same failure again.
+                   (if (and (plusp (batch-repeat-tolerance))
+                            (gethash fingerprint seen))
+                       (progn
+                         (incf repeats)
+                         (when (> repeats (batch-repeat-tolerance))
+                           ;; Razon unica: *LAST-LLM-CALL-INFO* se escribe una
+                           ;; sola vez al final, con :PATH = ABORTED.
+                           (setf aborted :batch-repeated)))
+                       (progn
+                         (setf (gethash fingerprint seen) t)
+                         (format t "~&[DEBUG process-turn] Disparando (run) - Ronda ~A...~%" i)
+                         (detect-blind-writes)
+                         (run)
+                         (let ((new-context (build-yaml-context user-message))) ;; <--- ACÁ SE GENERA EL DUMP ACTUALIZADO
+                           (incf batch-iterations)
+                           (setf response
+                                 (handler-case
+                                     (call-llm system-prompt new-context user-message)
+                                   (error (e)
+                                     (setf aborted :llm-error)
+                                     (format nil "[LLM ERROR] ~A" e)))))))))
+        (when (and (not aborted)
+                   response
+                   (not (search "[LLM ERROR]" response :test #'char=))
+                   (not (batch-complete-p)))
+          ;; The loop only ends early on those three conditions, so reaching
+          ;; here with a pending batch means batch_max_iterations ran out.
+          (setf aborted :iterations))
+        (when aborted
+          ;; Sin directivas "~:" en ningun mensaje: en este Lisp "~:P"/"~:A" no
+          ;; consumen argumento, asi que el FORMAT se come el valor equivocado y
+          ;; el tope configurado nunca se imprimia (decia "maximo 2" con
+          ;; batch_max_iterations=8).
+          (format t "~&[HARNESS BATCH ABORT] ~A tras ~D ronda(s) (maximo ~D)~%"
+                  (case aborted
+                    (:batch-repeated "el modelo repitio el mismo lote")
+                    (:iterations "se agoto batch_max_iterations")
+                    (t "error del proveedor"))
+                  batch-iterations
+                  max-rounds)
+          (setf *last-llm-call-info*
+                (list :iterations batch-iterations :path aborted)))))
     ;; -------------------------------
     
     (record-context-metrics context user-message
@@ -256,6 +302,39 @@ working context via structured facts. Help them with their task."))
     response))
 
 
+
+
+(defun batch-content-hash (calls response)
+  "FNV-1a de 64 bits sobre la serialización canónica de CALLS y RESPONSE.
+   Nada de SXHASH aquí: en SBCL 2.4.1 `(sxhash '((:PATH \"a.lisp\")))` y
+   `(sxhash '((:PATH \"b.lisp\")))` devuelven el MISMO entero, así que el
+   detector de bucles veía una repetición fantasma entre lotes que sólo
+   difieren en el valor de un argumento."
+  (let ((hash 14695981039346656037))
+    (with-standard-io-syntax
+      (loop for char across (prin1-to-string (list calls response))
+            do (setf hash
+                    (logand #xFFFFFFFFFFFFFFFF
+                            (* (logxor hash (char-code char)) 1099511628211)))))
+    hash))
+
+
+(defun batch-fingerprint (response)
+  "A stable identity for the batch a response asks for: the tool_calls array
+   (normalised through the same parser the validator uses, so whitespace and
+   key ordering do not matter) plus the free-text response. Two responses with
+   the same fingerprint ask the harness to do exactly the same thing again,
+   which is the signature of a model stuck in a loop."
+  (let ((json (batch-json-text response)))
+    (handler-case
+        (let ((payload (com.inuoe.jzon:parse json)))
+          (if (hash-table-p payload)
+              (multiple-value-bind (calls error)
+                  (normalize-batch-tool-calls (gethash "tool_calls" payload))
+                (batch-content-hash (if error (gethash "tool_calls" payload) calls)
+                                    (gethash "response" payload)))
+              (batch-content-hash json json)))
+      (error () (batch-content-hash response response)))))
 
 
 (defun batch-complete-p (&optional (turn *turn-counter*))

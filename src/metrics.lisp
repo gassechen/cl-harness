@@ -12,6 +12,15 @@
 ;;; Token estimates are heuristic (1 token ~= 4 chars). The real
 ;;; provider usage (when the LLM answers) is ground truth.
 
+;;; These live in llm.lisp (loaded AFTER this file) and in repl.lisp, so they
+;;; are declared here too to keep the compiler quiet and to make it explicit
+;;; that metrics.lisp depends on them. DEFVAR does not reset an existing value;
+;;; the DEFVAR of the owning file still runs later and initialises it to NIL.
+(defvar *debug-mode* nil)
+(defvar *last-llm-usage* nil)
+(defvar *llm-call-log* nil)
+(defvar *llm-response-model* nil)
+
 (defparameter *metrics-events* nil
   "List of per-turn metric records (plists).")
 
@@ -19,9 +28,18 @@
   "Per-call tool execution records (:name :chars-raw :chars-sent), reset at
    the end of each turn (see record-context-metrics).")
 
+(defparameter *metrics-llm-calls* nil
+  "Per-API-call token records for the turn in progress, snapshotted by
+   record-context-metrics. Mirrors cl-harness::*llm-call-log*.")
+
 (defun token-estimate (text)
   "Heuristic token count: ~4 chars per token. Good enough for ratios."
   (ceiling (length text) 4))
+
+(defun record-llm-call (record)
+  "Record one provider API call for per-call token accounting. RECORD is a
+   plist (:prompt N :completion N :model \"m\" :endpoint \"url\")."
+  (push record *metrics-llm-calls*))
 
 (defun record-tool-call (name raw-text sent-text)
   "Record one tool execution for per-turn metrics. RAW-TEXT is the full
@@ -44,16 +62,21 @@
 
 (defun record-context-metrics (context-str user-str
                                &key (naive-str nil) real-prompt real-completion
-                                    llm-iterations llm-path)
+                                    llm-iterations llm-path (llm-calls nil)
+                                    (response-model nil))
   "Record one turn: curated context vs naive baseline vs real API usage.
    NAIVE-STR must be a snapshot captured BEFORE pruning rules ran, so the
    reduction reflects facts the rules actually removed (a naive captured
    after run() would be identical to the curated set). The turn's tool-call
-   stats are snapshotted and reset here.
+   and per-API-call stats are snapshotted and reset here.
    REAL-PROMPT/REAL-COMPLETION are CUMULATIVE usage across the whole tool
    loop (each iteration re-sends the message pile), and LLM-ITERATIONS counts
-   the API requests made this turn."
-  (let ((naive (or naive-str (naive-context-string))))
+   the API requests made this turn.
+   LLM-CALLS is the per-request breakdown (:prompt :completion :model), which
+   is what makes a runaway loop visible instead of a single opaque total.
+   RESPONSE-MODEL is the model the provider reported for this turn."
+  (let ((naive (or naive-str (naive-context-string)))
+        (calls (or llm-calls (reverse cl-harness::*llm-call-log*))))
     (push (list :turn (1+ (length *metrics-events*))
                 :user-chars (length user-str)
                 :context-chars (length context-str)
@@ -64,14 +87,20 @@
                 :completion-tokens real-completion
                 :llm-iterations llm-iterations
                 :llm-path llm-path
+                :response-model (or response-model cl-harness::*llm-response-model*)
+                :llm-calls calls
                 :tools (reverse *metrics-tool-calls*))
           *metrics-events*)
-    (setf *metrics-tool-calls* nil)))
+    (setf *metrics-tool-calls* nil)
+    (setf *metrics-llm-calls* nil)
+    (setf cl-harness::*llm-call-log* nil)))
 
 (defun metrics-reset ()
   "Clear recorded metrics."
   (setf *metrics-events* nil)
-  (setf *metrics-tool-calls* nil))
+  (setf *metrics-tool-calls* nil)
+  (setf *metrics-llm-calls* nil)
+  (setf cl-harness::*llm-call-log* nil))
 
 (defun metrics-tool-totals ()
   "Aggregate per-tool statistics over all recorded turns.
@@ -99,6 +128,14 @@
          (real (remove-if-not (lambda (e) (getf e :prompt-tokens)) evs))
          (real-ctx (reduce (lambda (a e) (+ a (getf e :prompt-tokens)))
                            real :initial-value 0))
+         (real-comp (reduce (lambda (a e) (+ a (or (getf e :completion-tokens) 0)))
+                            real :initial-value 0))
+         (api-calls (reduce (lambda (a e) (+ a (length (getf e :llm-calls))))
+                            evs :initial-value 0))
+         (models (remove-duplicates
+                  (loop for e in evs
+                        for m = (getf e :response-model)
+                        when m collect m)))
          (iters (reduce (lambda (a e) (+ a (or (getf e :llm-iterations) 0)))
                         evs :initial-value 0))
          (turns (length evs)))
@@ -109,7 +146,10 @@
                              0.0
                              (* 100.0 (/ (- nve ctx) nve)))
           :real-prompt-tokens (and (plusp (length real)) real-ctx)
+          :real-completion-tokens (and (plusp (length real)) real-comp)
           :real-turns (length real)
+          :api-calls api-calls
+          :models models
           :llm-iterations iters)))
 
 (defun metrics-summary ()
@@ -139,8 +179,11 @@
                                 (or (getf tot :real-prompt-tokens) "-")
                                 "" "" ""))
       (format t "~&Reduction (curated vs naive): ~,1F%~%" (getf tot :reduction-pct))
-      (format t "~&Turns (curated): ~A · Turns (real usage): ~A~%"
-              (getf tot :turns) (getf tot :real-turns)))
+      (format t "~&Turns (curated): ~A · Turns (real usage): ~A · API calls: ~A~%"
+              (getf tot :turns) (getf tot :real-turns) (getf tot :api-calls))
+      (when (getf tot :models)
+        (format t "~&Models: ~{~A~^, ~}~%" (getf tot :models)))
+      (format t "~&Real completion tokens: ~A~%" (getf tot :real-completion-tokens)))
     (let ((tools (metrics-tool-totals)))
       (when tools
         (format t "~&~%Tools:~%")
