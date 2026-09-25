@@ -389,6 +389,11 @@ memoria de hechos y alimenta el pruning de turnos futuros.
 
 Con `llm_provider: "batch"` no hay tool-use nativo HTTP: `call-batch-llm` pide al modelo
 un lote de acciones compatible con ToolUse y lo convierte en intenciones Rete.
+El objetivo del modo es doble: permitir modelos que no exponen ToolUse nativo
+y medir, en una comparación pareada, si el total de tokens del lote es menor
+que el del tool-loop nativo. La compatibilidad ya está validada; el ahorro de
+tokens es una hipótesis hasta contar con una corrida nativa equivalente.
+
 La respuesta canónica tiene esta forma:
 
 ```json
@@ -767,6 +772,8 @@ dependencias.
   - Resultado: **9/9 tests**, salida coherente de `main.py` y respuesta final sin
     `BATCH_JSON_INVALID`. El modelo efectivo se obtiene del campo `model` de la
     respuesta del proveedor; la captura de esta prueba lo registró por llamada.
+  - Esta corrida valida compatibilidad y deja la línea base de tokens; no incluye
+    una rama nativa comparable, por lo que todavía no afirma ahorro.
 
 ## Cómo ejecutar
 

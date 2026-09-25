@@ -1,4 +1,4 @@
-# Batch ToolUse con `auto` y rotación de modelos
+# Batch JSON sin ToolUse nativo con `auto` y rotación de modelos
 
 > **Fecha:** 2026-09-25  
 > **Origen de la corrida:** `/home/mtk/TEST-PRUEBAS/cl-harness-yaml-debug`  
@@ -11,7 +11,16 @@ Validar el modo batch después de migrar el parser a JSON compatible con ToolUse
 La prueba de estrés no dependía de la calidad de un modelo concreto: usó `auto`,
 por lo que el proveedor pudo cambiar de modelo entre llamadas del mismo turno.
 
-Se comprobaron además:
+El experimento tiene dos objetivos independientes:
+
+1. **Compatibilidad:** permitir que un modelo sin ToolUse nativo exprese un plan
+   JSON y que las reglas de Rete lo ejecuten sin depender de una API de tools.
+2. **Eficiencia:** medir si el lote reduce el total de tokens de entrada frente
+   al tool-loop nativo. Esto es una hipótesis y requiere una corrida pareada; no
+   se debe inferir solo del tamaño del contexto local.
+
+La corrida actual cubre el primer objetivo y deja una línea base para el
+segundo. Se comprobaron además:
 
 - `response_format: {"type":"json_object"}`;
 - normalización de ToolUse canónico y flatten (`gpt-oss`);
@@ -90,6 +99,25 @@ The 10th Fibonacci number is 55
 En una repetición del stress test se produjo un `502` transitorio del endpoint;
 el flujo batch lo recuperó y volvió a cerrar el turno correctamente.
 
+### 4.1. Medición de tokens
+
+La corrida batch de `session-3999334880` registró:
+
+| Métrica | Batch observado | ToolUse nativo comparable |
+|---|---:|---:|
+| `real-prompt-tokens` | 2572 | Pendiente |
+| `completion-tokens` | 404 | Pendiente |
+| Llamadas al proveedor | 5 | Pendiente |
+
+Estos valores no demuestran ahorro por sí solos. Para cerrar el segundo
+objetivo hay que ejecutar el mismo prompt, con los mismos límites y un modelo
+equivalente, en dos directorios limpios: `llm_provider: "batch"` y
+`openai-compat` con ToolUse nativo. Se deben comparar `prompt_tokens` y
+`completion-tokens` acumulados del proveedor, además de llamadas, resultado y
+latencia; no comparar `context-tokens` con `prompt-tokens`, porque son métricas
+distintas. Si `auto` rota modelos, hay que fijar el modelo o registrar el
+`response.model` de cada llamada.
+
 ## 5. Routing de modelos
 
 El resumen de routing está en [`model-routing.json`](./model-routing.json). El
@@ -127,6 +155,7 @@ prompt desde un directorio de trabajo limpio.
 ## 8. Conclusión
 
 El harness mantuvo la separación entre planificación y ejecución cuando `auto`
-cambió de modelo dentro del mismo turno. El test valida la robustez del
-protocolo y de las reglas del harness, no la calidad absoluta de los modelos
-usados.
+cambió de modelo dentro del mismo turno. La corrida demuestra compatibilidad
+con la ruta JSON sin ToolUse nativo y la robustez del protocolo; todavía no
+permite afirmar un ahorro de tokens frente al tool-loop nativo. Ese veredicto
+requiere la comparación pareada descrita en la sección 4.1.
