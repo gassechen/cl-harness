@@ -83,7 +83,21 @@
                                 :action (data-get data :action)
                                 :target target
                                 :verdict (if applied :applied :failed)
-                                :turn-id (current-turn-id))
+                                ;; El turno del VERDICTO es el turno de la
+                                ;; INTENCION, no el que corre ahora. current-turn-id
+                                ;; mentia: las reglas de ejecucion disparan en
+                                ;; cuanto el intention entra, asi que un intention
+                                ;; del turno 1 que se ejecuta en el turno 2
+                                ;; (reintento, cola, cancelacion tardia) quedaba
+                                ;; sellado con el turno equivocado. Como el
+                                ;; numero de paso se reinicia cada turno, un
+                                ;; veredicto mal sellado se emparejaba con el
+                                ;; paso equivocado de otro turno, y la tarjeta
+                                ;; de COBOL ensenaba un FAILED donde hubo un
+                                ;; APPLIED. El JOIN es por (turn-id, step): si
+                                ;; uno de los dos lados miente, cruza.
+                                :turn-id (or (data-get data :turn-id)
+                                             (current-turn-id)))
                            (when why (list :reason why))))))))
 
 ;;; ============================================

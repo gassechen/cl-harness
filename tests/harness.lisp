@@ -1289,7 +1289,92 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
             (ok (search "PENDING" card2)
                 "un plan sin ejecutar se declara PENDING, no desaparece")
             (ok (search "01." card2)
-                "y conserva su numero de paso aunque no se haya ejecutado")))))))
+                 "y conserva su numero de paso aunque no se haya ejecutado")))))))
+
+(deftest protocol/dos-turnos-no-comparten-paso
+  "Los pasos se numeran por turno, y la tarjeta tiene que respetar esa division.
+
+   El numero de paso NO es un identificador global: 02. del turno 1 y 02. del
+   turno 2 son el mismo numero y turnos distintos. Un JOIN que empareja
+   plan-y-veredicto solo por :step cruza los dos turnos, y el modelo recibe el
+   veredicto de una operacion que no pidio en la tarjeta que esta leyendo.
+
+   El caso que se rompe no es exotico: es cualquier sesion de dos turnos donde
+   ambos planes tienen el mismo numero de pasos, que es lo normal. Y es
+   silencioso -- la tarjeta se ve perfecta, con STATE rellenado, solo que con el
+   dato equivocado.
+
+   Por eso el paso 2 del turno 1 se RECHAZA y el paso 2 del turno 2 se APLICA. Si
+   el JOIN cruza turnos, el primero aparecera como APPLIED y este test falla en
+   una linea, leyendo lo que el modelo leeria."
+  (with-temp-dir (dir)
+    (let ((cl-harness::*base-dir* dir))
+      (with-turn-engine
+        (h::reset-turn-engine)
+        ;; --- turno 1: dos pasos, el segundo se rechaza ---
+        (incf cl-harness::*turn-counter*)
+        (h::parse-llm-batch-to-intentions
+         "{\"tool_calls\":[{\"name\":\"write_file\",\"arguments\":{\"path\":\"t1a.txt\",\"content\":\"a\"}},{\"name\":\"edit_file\",\"arguments\":{\"path\":\"inexistente.txt\",\"old_string\":\"nada\",\"new_string\":\"b\"}}]}")
+        (h::run)
+        ;; --- turno 2: otros dos pasos, el segundo SI se aplica ---
+        ;; El incf va AQUI, explicito. El turno lo incrementa process-turn, no
+        ;; run ni parse-llm-batch-to-intentions: un test que encadena dos
+        ;; parse+run sin avanzar el contador esta probando DOS VECES EL MISMO
+        ;; turno, y todo lo que este test afirma -- que los pasos se numeran
+        ;; por turno -- seria verdad por casualidad, no por el codigo.
+        (incf cl-harness::*turn-counter*)
+        (h::parse-llm-batch-to-intentions
+         "{\"tool_calls\":[{\"name\":\"write_file\",\"arguments\":{\"path\":\"t2a.txt\",\"content\":\"a\"}},{\"name\":\"write_file\",\"arguments\":{\"path\":\"t2b.txt\",\"content\":\"b\"}}]}")
+        (h::run)
+        (let* ((facts (h::collect-active-facts))
+               (card (h::render-plan-card facts))
+               ;; Los dos veredictos del paso 2, uno por turno.
+               (step2-verdicts
+                 (remove nil
+                         (mapcar (lambda (d)
+                                   (when (and (equal (h::data-get d :step) 2)
+                                              (h::data-get d :verdict))
+                                     (list :turn (h::data-get d :turn-id)
+                                           :verdict (h::data-get d :verdict))))
+                                 (h::collect-facts-of-type facts "verdict")))))
+          (ok (>= (length step2-verdicts) 2)
+              (format nil "hay dos veredictos distintos para el paso 2, uno por turno; hay ~D"
+                      (length step2-verdicts)))
+          ;; El fallo que importa: el turno 1 escribio t1a.txt y su paso 2
+          ;; fallo; el turno 2 escribio t2a.txt y t2b.txt. Cada tarjeta debe
+          ;; seguir a su turno.
+          (ok (and (search "t1a.txt" card) (search "t2a.txt" card))
+              "la tarjeta menciona los pasos de ambos turnos")
+          ;; Si el JOIN cruza, el paso 2 del turno 1 aparecera APPLIED con el
+          ;; motivo del turno 2 (o al reves). Se comprueba que el motivo del
+          ;; turno 1 -- el fichero inexistente -- no se atribuya a t2b.txt.
+          ;; El fallo que importa, afirmado sobre el DATO y no sobre el texto
+          ;; entero: el motivo del turno 1 tiene que seguir al paso del turno 1.
+          ;; Antes de arreglarlo, el paso 2 del turno 2 aparecia FAILED con el
+          ;; motivo del turno 1. No se puede afirmar "la tarjeta no menciona
+          ;; File not found" -- tiene que, para el paso que fallo de verdad.
+          (let* ((t3 (or (search "02.  T3" card) 0))
+                 (t4 (search "02.  T4" card))
+                 (t3-block (subseq card t3 (or t4 (length card))))
+                 (t4-block (if t4 (subseq card t4) "")))
+            (ok (search "STATE = FAILED" t3-block)
+                "el paso 2 del turno 1 conserva su FAILED")
+            (ok (search "File not found" t3-block)
+                "y su motivo sigue pegado a el")
+            (ok (not (search "File not found" t4-block))
+                (format nil "y no se ha filtrado al paso 2 del turno 2; t4=~S" t4-block)))
+          ;; Y el caso limpio: el paso 2 del turno 1 debe verse FAILED, con SU
+          ;; motivo, y el del turno 2 APPLIED. Antes del fix, los dos salian
+          ;; FAILED con el motivo del turno 1 -- es decir, una escritura que
+          ;; habia funcionado aparecia como rota.
+          (ok (and (search "02.  T3 EDIT-FILE  inexistente.txt" card)
+                   (search "STATE = FAILED" card)
+                   (search "02.  T4 WRITE-FILE  t2b.txt" card))
+              "cada paso lleva el turno al que pertenece")
+          (ok (not (search "02.  T4 WRITE-FILE  t2b.txt~%        STATE = FAILED" card))
+              (format nil "el paso 2 del turno 2 se empareja con su propio turno; tarjeta=~S"
+                      card)))))))
+
 
 (defun fact-signature (facts)
   "Una firma comparable de FACTS: tipo + datos relevantes, en orden estable.

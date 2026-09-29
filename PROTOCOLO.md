@@ -70,14 +70,66 @@ esto porque Y", "esto es una precondición", "voy a comprobar X".
 Lo escribe **solo** el harness, proyectado de los hechos de resultado. Se lleva la
 identidad del paso (`:step`) y un motivo acotado.
 
+`VERDICT` no viaja suelto: se renderiza **dentro de la tarjeta `PLAN`**, en la
+división que el modelo no controla. Es decir, el mismo formato sirve para las dos
+direcciones, y la separación entre "lo que el LLM pidió" y "lo que la máquina
+respondió" es literal.
+
+**Formato: medio-CBOL.** No es decoración. Salida real de
+`render-plan-card` para un turno con un paso aplicado y uno rechazado:
+
 ```
-step=2/3 target=math_utils.py state=EDITED verdict=applied reason=-
-step=3/4 target=test_math_u.py state=EDIT verdict=failed reason=anchor not found at line 12
+IDENTIFICATION DIVISION.
+PROGRAM-ID. session-3999687439.
+
+    PROCEDURE DIVISION.
+        01.  T3  WRITE-FILE  math_utils.py
+            STATE = APPLIED
+        02.  T3  EDIT-FILE  nope.py
+            STATE = FAILED
+            REASON = File not found: /tmp/proyecto/nope.py
+
+DATA DIVISION.
+
+GOAL ABIERTO. 2
+    Write math_utils.py
+    Edit nope.py
+
+GOBACK.
 ```
 
-`reason` es el único campo de texto arbitrario (viene del stderr del SO). Los otros
-cuatro son tokens. Formato: **logfmt**, un registro por línea, con el vocabulario
-cerrado de §2.1. Un registro malformado se descarta sin arrastrar a los demás.
+Por qué COBOL y no el logfmt que este documento describía antes. Tres razones, en
+orden de peso:
+
+1. **El formato es el mecanismo.** En `PROCEDURE DIVISION` están los pasos que el
+   modelo escribió; en `DATA DIVISION` los veredictos, que rellena la máquina. Un
+   modelo que quisiera declarar su propio éxito tendría que escribir en la división
+   de la máquina. En YAML plano — y en logfmt — los campos vivían en la misma línea
+   y el modelo podía escribir `verdict=applied` por su cuenta: el harness lo
+   validaba, pero el contrato no lo impedía, y lo que se documenta como "el
+   harness lo ignora" termina leyéndose como "el harness lo acepta".
+
+2. **Números de paso en columna fija, con el turno al lado.** `01.`, `02.`, ...
+   El orden es legible y ordenable sin parsear, que es de lo que se trata. El
+   `T3` delante **no es adorno**: la numeración de COBOL se reinicia por turno, así que
+   `02.` del turno 1 y `02.` del turno 2 son el mismo número y turnos distintos. Sin
+   marcarlo, la tarjeta de una sesión de dos turnos tiene dos `01.` y dos `02.` y no hay
+   forma de saber a qué turno pertenece cada uno — que es justo lo que el formato tiene
+   que evitar.
+
+3. **El vocabulario cerrado ya no necesita apologise en prosa.** `STATE` es
+   `APPLIED | FAILED | PENDING`. `REASON` es el único texto libre, y viene del
+   stderr del SO o del rechazo de la acción.
+
+`GOAL ABIERTO. N` no es decoración: pone las bananas pendientes del LLM en el mismo
+sitio donde ve su plan, que es donde tiene sentido que las mire. Cierra cuando `N`
+llega a 0, y solo entonces.
+
+`PROGRAM-ID` es el id de sesión, no del turno: la tarjeta sobrevive a los turnos, que
+es justo lo que exige I4.
+
+Fijado por `protocol/el-plan-se-lee-como-un-programa-cobol`, que comprueba las tres
+divisiones y que el veredicto de la máquina sobrevive al viaje de ida y vuelta.
 
 ### 2.4 `GOAL`
 
@@ -181,10 +233,12 @@ No es deuda de formato, es deuda de mensaje:
    Renombrar sin borrar el nombre viejo deja dos vocabularios conviviendo, que es el
    problema original con más pasos. El test afirma que `batch-complete` ya no lo emite
    nadie, no solo que `plan-done` existe. Fijado por `protocol/plan-done-y-nada-mas`.
-4. **El aviso de truncación miente para `command-exec`.** Dice *"Use read_file or
-   grep to inspect specifics"* (`src/context.lisp:177`), pero no se puede hacer
-   `read_file` del stderr de un comando: no vive en un fichero localizable. El único
-   recupero es re-ejecutar más estrecho.
+4. ~~**El aviso de truncación miente para `command-exec`.**~~ Resuelto. Decía
+   *"Use read_file or grep to inspect specifics"*, pero el stderr de un comando no vive
+   en ningún fichero localizable: `read_file` no tiene a qué aplicarse. Ahora el aviso
+   dice lo único que es verdad — repetir el comando más estrecho, o pasarlo por
+   `head`/`tail`/`grep`. Un aviso que sugiere una herramienta que no puede funcionar es
+   peor que no dar ninguno, porque gasta un turno del modelo en intentarlo.
 5. **Un rechazo sin nombre acaba colándose en el campo de al lado.** Esto no se
    vio hasta arreglar I6. `read-file` metía *"ERROR: File not found"* dentro de
    `:contents`, así que un hecho `file-read` fallido era indistinguible de una
@@ -205,6 +259,65 @@ No es deuda de formato, es deuda de mensaje:
    por otro. Ahora `todo-satisfied-p` exige `:applied t` para **todo** verbo, y
    hay tests que fijan las tres legs (el rechazo no cierra, el rechazo no
    desaparece, el acierto sí cierra).
+
+6. **Restaurar una sesión nunca funcionó, y se rompía en silencio.** Tres capas, y
+   ninguna daba un error visible:
+   - `persist.lisp` tenía **dos** `defun restore-facts`. El que usa `restore-session`
+     lo emite el propio serializador *dentro* del dump; el segundo, al final del
+     fichero, lo sobreescribía y leía `(getf f :type)` / `(getf f :ts)`, un formato
+     que **ningún serializador escribe**. El resultado: `Session ... restored.` en
+     pantalla y cero hechos. Solo quedaba un `WARNING: redefining ...` que nadie leía.
+   - `collect-facts-of-type` usaba `mapcar` con `when` en vez de `filter`, así que
+     devolvía una lista de la longitud de la entrada con `nil` en los huecos.
+     `length` contaba los huecos: 2 hechos de los que 1 era `file-read` daban
+     longitud 2. Nadie se quejaba porque casi siempre se filtraba después.
+   - Las claves de los datos restaurados llegan en **MAYÚSCULAS** (`:CONTENTS`), no
+     en minúsculas como las escribe el código. Con eso, cada `data-get` del programa
+     ve `nil` sobre un hecho viejo. Un hecho que parece *vacío* es peor que uno que
+     parece *roto*, porque no se queja nada.
+
+   Y el más caro de todos, invisible por construcción: el saneado usaba `eql` para
+   comparar strings. `eql` sobre dos strings compara **identidad del objeto**, no
+   contenido, así que la comparación nunca era cierta y el arreglo no hacía nada —
+   sin error, sin aviso, sin forma de saber que había fallado.
+
+   Resuelto: `data-get-ci` acepta las dos formas de clave, `collect-facts-of-type`
+   filtra de verdad, el `defun` duplicado está borrado, y `restore-session` **avisa**
+   de la deriva en vez de cargarla callado. Rechazar el dump entero no era opción
+   (perdería sesiones válidas); lo que no puede ser es cargar en silencio. Fijado por
+   `persistence/un-viaje-de-ida-y-vuelta-no-cambia-los-hechos` y
+   `persistence/un-dump-viejo-no-resucita-el-bug-de-i2`.
+
+7. **Un test que ata la variable equivocada pasa verde y ensucia el proyecto.**
+   `protocol/el-plan-se-lee-como-un-programa-cobol` hacía `(let ((*base-dir* dir)) ...)`.
+   Ese símbolo **no está importado** en el paquete de pruebas, así que ligaba
+   `cl-harness/tests::*base-dir*`, que no lee nadie: el test escribía sus ficheros en
+   la raíz del repo y pasaba. Ahora los directorios se atan por los tres caminos que
+   existen — `dumps_dir`, `sessions_dir` y `metrics_dir` en la config, y el base dir
+   con el símbolo del paquete bueno — porque `harness-base-dir` da prioridad al env
+   `CL_HARNESS_DIR` sobre `*base-dir*`, y atar solo uno de los dos deja que el
+   entorno de quien lanza decida dónde acaba la sesión.
+
+8. **El número de paso no es un identificador, y la tarjeta lo trataba como si lo fuera.**
+   `render-plan-card` emparejaba plan y veredicto solo por `:step`. Pero la numeración se
+   reinicia en cada turno, así que `02.` del turno 1 y `02.` del turno 2 son el mismo
+   número y turnos distintos. Como los dos planes suelen tener el mismo número de pasos —
+   que es lo normal, no una casualidad — el emparejamiento cruzado no era un caso raro:
+   era **cualquier sesión de dos turnos**. Una escritura que había funcionado aparecía como
+   `FAILED`, con el motivo de un fallo que no era suyo, y el modelo leía que su operación
+   se había roto.
+
+   Y el bug de verdad estaba un nivel más abajo, en `assert-step-verdict`, que sellaba el
+   veredicto con `(current-turn-id)`: **el turno en curso, no el de la intención**. Las
+   reglas de ejecución disparan en cuanto la intención entra, así que cualquier intention
+   ejecutada en un turno distinto del suyo — reintento, cola, cancelación tardía — quedaba
+   mal sellada. Arreglado solo el JOIN, el cruce seguía ahí, solo que repartido distinto.
+   Por eso el turno va en el propio hecho: `:turn-id (data-get data :turn-id)`.
+
+   Fijado por `protocol/dos-turnos-no-comparten-paso`, que avanza `*turn-counter*` a mano
+   porque el turno lo incrementa `process-turn` y no `run` — un test que encadena dos
+   `parse` + `run` sin avanzar el contador está probando dos veces el mismo turno, y todo
+   lo que afirma sería verdad por casualidad, no por el código.
 
 ## 5. Tests que fijan el protocolo
 
@@ -230,6 +343,20 @@ Sin red, sin LLM, sobre el harness. Los cinco primeros están escritos y verdes:
   se renderiza con el veredicto de cada paso al lado, incluido `pending`. (I1/I4)
 - `protocol/un-paso-malformado-no-arrastra-a-los-demas` — un `batch-plan` roto se salta
   sin tumbar el render ni perder los pasos buenos.
+- `protocol/el-plan-se-lee-como-un-programa-cobol` — la tarjeta tiene las tres divisiones,
+  el `veredicto` de la máquina sobrevive al viaje, y los ficheros del test no salen del
+  directorio temporal. (§2.3)
+- `persistence/un-viaje-de-ida-y-vuelta-no-cambia-los-hechos` — siete tipos de hechos y
+  sus datos sobreviven a `save` → motor nuevo → `restore`, y el motivo de un rechazo sigue
+  a su hecho.
+- `persistence/un-dump-viejo-no-resucita-el-bug-de-i2` — un dump con la forma de antes de
+  I2 carga entero (perder la sesión sería peor), avisa de lo que trae de otra versión, y
+  no devuelve `"ERROR: File not found"` disfrazado de `:contents`.
+- `protocol/dos-turnos-no-comparten-paso` — el paso 2 del turno 1 y el del turno 2 se
+  emparejan con su propio veredicto. Aquí falló, y no por poco: una escritura que había
+  funcionado aparecía como `FAILED` con el motivo de un fallo ajeno. (§2.3)
+- `protocol/plan-done-y-nada-mas` — `DONE` sin goals abiertos se acepta, y nadie emite
+  ya el nombre viejo.
 
 ## 5b. Una nota sobre cómo se cazan estos fallos
 
@@ -248,7 +375,9 @@ Las dos mutaciones que se hicieron:
 
 ## 6. Decisiones pendientes
 
-- **Codificación del alambre:** logfmt (§2.3) frente a TSV posicional con cabecera.
-  El YAML actual se queda como **vista humana**, no como transporte.
-- **Orden de trabajo:** ¿tests primero (el documento emerge de ellos) o documento
-  primero (los tests lo implementan)?
+- **Resto del alambre:** `PLAN` ya es medio-CBOL (§2.3). Queda decidir si los demás
+  bloques del contexto viajan en el mismo dialecto o se quedan como YAML. El YAML
+  sigue siendo **vista humana**, no transporte.
+- **Orden de trabajo:** resuelto por los hechos, no por decreto. Los tests se
+  escribieron primero y el documento salió de ellos; el orden contrario ya había
+  produzido antes un §2.3 entero que describía un formato que nadie implementó.

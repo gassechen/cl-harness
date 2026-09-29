@@ -170,13 +170,22 @@
 
 (defun truncate-payload (text &optional (max-chars (max-fact-payload-chars)))
   "If TEXT exceeds MAX-CHARS, retain head and tail with an explicit omission notice.
-   This prevents a single massive file from starving the rest of the context budget."
+   This prevents a single massive file from starving the rest of the context budget.
+
+   El aviso NO sugiere read_file. Antes decia \"Use read_file or grep to inspect
+   specifics\", y para el caso que mas lo necesitaba -- el stderr de un comando
+   truncado -- read_file no tiene a que aplicarse: ese texto no vive en ningun
+   fichero localizable, solo en la salida del proceso que ya termino. Un aviso
+   que manda al modelo a una herramienta que no puede funcionar le cuesta un
+   turno entero y no le devuelve nada. Ahora solo dice lo que es verdad: repetir
+   el comando mas estrecho, o pasarlo por head/tail/grep, que si se puede
+   ejecutar."
   (if (or (null text) (<= (length text) max-chars))
       text
       (let* ((head-len (floor (* max-chars 0.6)))
              (tail-len (floor (* max-chars 0.3)))
              (omitted (- (length text) head-len tail-len)))
-        (format nil "~A~%... [~A characters omitted. Use read_file or grep to inspect specifics] ...~%~A"
+        (format nil "~A~%... [~A characters omitted. Re-run narrower, or pipe the same command through head/tail/grep] ...~%~A"
                 (subseq text 0 head-len)
                 omitted
                 (subseq text (- (length text) tail-len))))))
@@ -449,7 +458,27 @@
           (format s "~%PROCEDURE DIVISION.~%")
           (dolist (d order)
             (let* ((n (data-get d :step))
-                   (v (find-if (lambda (vd) (eql (data-get vd :step) n)) verdicts))
+                   (turn (data-get d :turn-id))
+                   ;; EMPAREJAR POR (turn-id, step), NO POR step SOLO.
+                   ;;
+                   ;; El numero de paso se reinicia cada turno: 02. del turno 1
+                   ;; y 02. del turno 2 son el mismo numero y turnos
+                   ;; distintos. Emparejando solo por :step, el paso 2 del
+                   ;; turno 2 se llevaba el veredicto del turno 1 -- y como el
+                   ;; plan de ambos turnos suele tener el MISMO numero de
+                   ;; pasos, eso no es un caso raro: es cualquier sesion de
+                   ;; dos turnos. La tarjeta se ve perfecta, con STATE
+                   ;; rellenado, solo que con el dato de otro turno. Un paso
+                   ;; que se escribio bien aparecia como FAILED, con el motivo
+                   ;; de un fallo que no era suyo.
+                   ;;
+                   ;; :turn-id a NIL (un plan sin turno) solo empareja con
+                   ;; veredictos sin turno, para no cruzarlos con los que si lo
+                   ;; tienen.
+                   (v (find-if (lambda (vd)
+                                (and (eql (data-get vd :step) n)
+                                     (eql (data-get vd :turn-id) turn)))
+                              verdicts))
                    (verdict (data-get v :verdict))
                    ;; OJO: :APPLIED y :FAILED son keywords y los dos son
                    ;; truthy. Hay que COMPARAR para decidir cual es cual; con un
@@ -458,8 +487,14 @@
                               (string-downcase
                                 (symbol-name (if (keywordp verdict) verdict :failed)))
                               "pending")))
-              (format s "    ~A  ~A  ~A~%"
+              ;; El turno va en la etiqueta, porque la numeracion de COBOL se
+              ;; REINICIA por turno y sola no distingue 02. del turno 1 de 02.
+              ;; del turno 2. Sin esto la tarjeta tiene dos 01. y dos 02. y no
+              ;; hay forma de saber cuales pertenecen a cual, que es justo lo
+              ;; que el formato tiene que evitar.
+              (format s "    ~A  T~A ~A  ~A~%"
                       (cobol-step-label n)
+                      (or turn "-")
                       (cobol-verb (or (data-get d :action) "?"))
                       (or (data-get d :target) "-"))
               (format s "        STATE = ~A~%"
