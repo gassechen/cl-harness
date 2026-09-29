@@ -33,7 +33,7 @@ estado, el `PLAN` es una propuesta. El LLM nunca queda bloqueado esperando.
 | `PLAN` | LLM → harness | LLM | JSON ToolUse, `tool_calls[]` | Ordenado, 1..N |
 | `NOTE` | LLM → harness | LLM | — **no existe** | Intención/salto del modelo |
 | `VERDICT` | harness → LLM | harness | — **no existe** | Único emisor de applied/failed |
-| `GOAL` | harness → LLM | harness | `agent-todo` en YAML | Estado derivado de `VERDICT` |
+| `GOAL` | harness → LLM | harness | hecho `agent-todo` | Estado derivado de `VERDICT` |
 | `DONE` | LLM → harness | LLM | `"tool_calls":[]` | **Propuesta**, no hecho |
 
 ### 2.1 `PLAN`
@@ -57,7 +57,7 @@ E  (guardar) implícito en la escritura
 **Estados terminales:** `CREATED`, `EDITED`, `FAILED`, `SKIPPED`.
 No existe estado "no podemos modelarlo": si el harness se niega a intentar un
 paso (p. ej. `old_string` vacío), el veredicto es `FAILED(motivo)`. La capa
-operacional no tiene Recognize限.
+operacional no tiene salida "no puedo modelarlo".
 
 ### 2.2 `NOTE`
 
@@ -75,39 +75,67 @@ división que el modelo no controla. Es decir, el mismo formato sirve para las d
 direcciones, y la separación entre "lo que el LLM pidió" y "lo que la máquina
 respondió" es literal.
 
-**Formato: medio-CBOL.** No es decoración. Salida real de
-`render-plan-card` para un turno con un paso aplicado y uno rechazado:
+**Formato: medio-CBOL, en el contexto ENTERO.** No es decoración, y no es solo la
+tarjeta del plan: todo lo que el modelo lee cada turno es un único programa. Salida
+real de `build-context` para un turno con un paso aplicado, uno rechazado, un comando
+ejecutado y un fichero leído:
 
 ```
 IDENTIFICATION DIVISION.
-PROGRAM-ID. session-3999687439.
-
-    PROCEDURE DIVISION.
-        01.  T3  WRITE-FILE  math_utils.py
-            STATE = APPLIED
-        02.  T3  EDIT-FILE  nope.py
-            STATE = FAILED
-            REASON = File not found: /tmp/proyecto/nope.py
-
+PROGRAM-ID. session-demo.
+PROCEDURE DIVISION.
+    01.  T3 WRITE-FILE  math_utils.py
+        STATE = APPLIED
+    02.  T3 EDIT-FILE  nope.py
+        STATE = FAILED
+        REASON = old_string not found
 DATA DIVISION.
-
-GOAL ABIERTO. 2
-    Write math_utils.py
-    Edit nope.py
-
+GOAL ABIERTO. 1
+    todo-2  Edit nope.py
+        STATUS = pending
+        PRIORITY = normal
+TURN 3.
+    USER.
+        TEXT = hazlo
+    WRITE-FILE  math_utils.py
+        STATE = APPLIED
+        BYTES = 2048
+    EXEC-COMMAND.
+        COMMAND = pytest -q
+        EXIT-CODE = 0
+        OUTPUT =
+            1 passed
+    READ-FILE  app.py
+        STATE = APPLIED
+        CONTENTS =
+            import os
+            print(os.getcwd())
 GOBACK.
 ```
+
+`IDENTIFICATION DIVISION` y `PROCEDURE DIVISION` los emitía antes solo la tarjeta; el
+YAML era el que los envolvía. Ahora las cuatro divisiones (`IDENTIFICATION`,
+`PROCEDURE`, `DATA`, `GOBACK`) son el contexto, y la tarjeta del plan es su
+`PROCEDURE DIVISION`. No hay dos formatos anidados.
 
 Por qué COBOL y no el logfmt que este documento describía antes. Tres razones, en
 orden de peso:
 
-1. **El formato es el mecanismo.** En `PROCEDURE DIVISION` están los pasos que el
-   modelo escribió; en `DATA DIVISION` los veredictos, que rellena la máquina. Un
-   modelo que quisiera declarar su propio éxito tendría que escribir en la división
-   de la máquina. En YAML plano — y en logfmt — los campos vivían en la misma línea
-   y el modelo podía escribir `verdict=applied` por su cuenta: el harness lo
-   validaba, pero el contrato no lo impedía, y lo que se documenta como "el
-   harness lo ignora" termina leyéndose como "el harness lo acepta".
+1. **El formato es el mecanismo, pero el mecanismo no es una frontera contra el
+   modelo.** Hay que decirlo claro porque una versión anterior de este documento
+   afirmaba lo contrario: el modelo **no escribe** en el contexto. El contexto lo
+   construye el harness entero, a partir de hechos; lo único que el modelo emite
+   son `tool_calls` en JSON, y eso lo valida `parse-llm-batch-to-intentions`. Así
+   que "el modelo podría declarar su propio éxito en `DATA DIVISION`" es falso: no
+   tiene por dónde. La separación por divisiones es **disciplina de lectura**, no
+   un cortafuegos — y la defensa real está en el parser, no en el formato.
+
+   Lo que el formato sí compra, y es lo que sostiene el cambio: un solo dialecto en
+   vez de dos anidados, `STATE` como vocabulario cerrado
+   (`APPLIED | FAILED | PENDING`), y el veredicto **pegado al paso** que juzga. En
+   YAML plano y en logfmt el estado y la acción caían en la misma clave y el paso
+   no se distinguía de un turno a otro; en la tarjeta, `01.` con su `STATE` al lado
+   se lee como lo que es, un paso y su resultado.
 
 2. **Números de paso en columna fija, con el turno al lado.** `01.`, `02.`, ...
    El orden es legible y ordenable sin parsear, que es de lo que se trata. El
@@ -117,7 +145,7 @@ orden de peso:
    forma de saber a qué turno pertenece cada uno — que es justo lo que el formato tiene
    que evitar.
 
-3. **El vocabulario cerrado ya no necesita apologise en prosa.** `STATE` es
+3. **El vocabulario cerrado ya no necesita justificarse en prosa.** `STATE` es
    `APPLIED | FAILED | PENDING`. `REASON` es el único texto libre, y viene del
    stderr del SO o del rechazo de la acción.
 
@@ -176,12 +204,11 @@ No es deuda de formato, es deuda de mensaje:
    Y ya existe también `batch-plan`, que es el otro lado del JOIN. Un hecho `batch-plan`
    por paso —`:step`, `:action`, `:target`— que **no se retracta** al ejecutarse, a
    diferencia de `intention`, que sí lo hace para que la regla no dispare en bucle. El
-   contexto lleva ahora un bloque `plan:` donde cada paso aparece con su veredicto al
-   lado, y `pending` para lo que aún no se ha ejecutado.
+   contexto lo renderiza como la `PROCEDURE DIVISION` del programa (§2.3): cada paso
+   con su veredicto al lado, y `PENDING` para lo que aún no se ha ejecutado.
 
-   El `plan:` que aparece en el contexto **ya no es YAML**: es la tarjeta COBOL de §2.3.
-   Este bloque de abajo se conserva porque explica el problema que la tarjeta resolvió, no
-   porque sea la forma actual de nada.
+   El `plan:` de abajo se conserva porque explica el problema que la tarjeta resolvió,
+   no porque sea la forma actual de nada. Ya no hay `plan:`: hay `PROCEDURE DIVISION`.
 
    ```yaml
    # ANTES (YAML plano, eliminado en d2e45f0)
@@ -385,9 +412,14 @@ Las dos mutaciones que se hicieron:
 
 ## 6. Decisiones pendientes
 
-- **Resto del alambre:** `PLAN` ya es medio-CBOL (§2.3). Queda decidir si los demás
-  bloques del contexto viajan en el mismo dialecto o se quedan como YAML. El YAML
-  sigue siendo **vista humana**, no transporte.
+- **Lado de escritura del modelo:** el contexto ya es medio-CBOL entero (§2.3),
+  pero la salida del modelo sigue siendo JSON `tool_calls`. No se le pide escribir
+  COBOL: no se le puede exigir un dialecto para el que no fue entrenado, y el parser
+  ya valida JSON. Decidir si algún día se acepta COBOL de entrada —y con qué parser—
+  queda abierto; hoy no hace falta.
+- **`fact-to-yaml` en las métricas:** `src/metrics.lisp` sigue serializando en YAML.
+  No es transporte al modelo, es un volcado de telemetría, así que se queda como está
+  hasta que haya una razón para tocarlo.
 - **Orden de trabajo:** resuelto por los hechos, no por decreto. Los tests se
   escribieron primero y el documento salió de ellos; el orden contrario ya había
   produzido antes un §2.3 entero que describía un formato que nadie implementó.

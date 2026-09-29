@@ -193,7 +193,7 @@
        t)
 
       ((string= cmd ":context")
-       (format t "~A" (build-yaml-context ""))
+       (format t "~A" (build-context ""))
        t)
 
       ((string= cmd ":metrics")
@@ -296,7 +296,7 @@
                             (data (list :text user-message
                                         :turn-id turn))))
                   (naive-context-string)))
-         (context (build-yaml-context user-message))
+         (context (build-context user-message))
          (streamed (llm-stream-p))
          (response (handler-case
                        (progn
@@ -341,7 +341,7 @@
                          (format t "~&[DEBUG process-turn] Disparando (run) - Ronda ~A...~%" i)
                          (detect-blind-writes)
                          (run)
-                         (let ((new-context (build-yaml-context user-message)))
+                         (let ((new-context (build-context user-message)))
                            (incf batch-iterations)
                            (setf response
                                  (handler-case

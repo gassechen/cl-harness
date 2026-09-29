@@ -20,7 +20,7 @@
      #:*debug-mode*
      #:toggle-debug
      ;; context
-     #:build-yaml-context
+     #:build-context
      #:collect-active-facts
      #:retract-oldest-of-type
      #:fact-slot

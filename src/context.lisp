@@ -1,7 +1,7 @@
 (in-package :cl-harness)
 
 ;;; ============================================
-;;; Context builder — YAML output
+;;; Context builder — salida medio-COBOL
 ;;; ============================================
 
 ;;; Defined with DEFVAR in repl.lisp (loaded later); declared here so the debug
@@ -76,7 +76,7 @@
   "(timestamp . insertion-order), a total order over the facts of ONE engine.
 
    Sorting on timestamp alone handed CL:SORT no tiebreaker, so two actions
-   inside the same second came out in arbitrary order and the rendered YAML
+   inside the same second came out in arbitrary order and the rendered context
    could show a command running BEFORE the file write it consumed. Every
    context query reads a single engine, so the ids are comparable; facts
    without one fall back to 0 rather than dropping out of the timeline."
@@ -191,12 +191,39 @@
                 (subseq text (- (length text) tail-len))))))
 
 
-(defun yaml-block (text &optional (indent "          "))
-  "Formatea un texto multi-línea como un block scalar de YAML (usando |)."
+(defun cobol-block (text &optional (indent "            "))
+  "Texto multi-linea como bloque COBOL: la clave, dos puntos, y el texto debajo.
+
+   El bloque va DEBAJO de la clave y no dentro de comillas, porque un
+   contenido de fichero puede traer comillas, barras invertidas y saltos de
+   linea. Escaparlo a un escalar de una linea exigiria inventar una sintaxis
+   de escape, y cualquier escape que no se deshaga exacto es una forma de
+   corromper el dato. Ahi se lee igual que en la terminal: lo que se metio
+   esta.
+
+   Acepta cualquier cosa y la vuelve texto: los hechos sucios no deben poder
+   tirar el render (ver PLAN-STEPS-OF y el resto del renderer)."
   (with-output-to-string (s)
-    (format s "|~%")
-    (dolist (line (cl-ppcre:split "\\n" (or text "")))
+    (format s "~%")
+    (dolist (line (cl-ppcre:split "\\n" (if (stringp text) text
+                                            (princ-to-string (or text "")))))
       (format s "~A~A~%" indent line))))
+
+
+(defun cobol-value (s)
+  "Un valor de una linea, o NIL si no hay nada que poner.
+
+   El dato va de seguido. No se envuelve entre comillas porque un valor con
+   comillas dentro -- que es la norma en contenido de codigo -- tendria que
+   escaparse, y un escape se deshace peor que la comilla. La ambiguedad
+   real (un valor que empieza por 'REASON = ') es teoria: estos valores los
+   escribe la maquina, no el modelo.
+
+   Acepta cualquier cosa y la vuelve texto, por la misma razon que COBOL-BLOCK."
+  (when s
+    (let ((text (if (stringp s) s (princ-to-string s))))
+      (when (plusp (length (string-trim '(#\Space #\Tab #\Return #\Newline) text)))
+        text))))
 
 
 (defun count-repetitions (facts)
@@ -307,7 +334,7 @@
 ;;; model saw a full todo list on the last turn of a finished task.
 ;;;
 ;;; Closing is a plain pass over the facts instead, run from
-;;; build-yaml-context next to the per-type caps, which is the mechanism this
+;;; build-context next to the per-type caps, which is the mechanism this
 ;;; file already uses for every other bound.
 
 (defun todo-verb (task)
@@ -416,92 +443,60 @@
    ancho de columna fijo, que es lo que hace el formato legible de un vistazo."
   (format nil "~2,'0D." n))
 
+(defun plan-steps-of (facts)
+  "Los batch-plan con :step entero y positivo.
+
+   Tolera hechos basura: un batch-plan sin :step, o con un :step que no es
+   entero, se SALTA. Perder el estado de los pasos buenos por un dato sucio en
+   uno seria la peor forma de perderlo, porque ademas seria silenciosa."
+  (remove nil
+          (mapcar (lambda (d)
+                    (let ((n (data-get d :step)))
+                      (when (and (integerp n) (> n 0)) d)))
+                  (collect-facts-of-type facts "batch-plan"))))
+
+
 (defun render-plan-card (facts)
-  "El PLAN como tarjeta COBOL: lo que el LLM pidio y lo que la maquina respondio.
+  "El PLAN como programa COBOL suelto: pasos y veredictos.
 
-   NO es decoracion. El formato ES el mecanismo de seguridad del protocolo:
+   La tarjeta suelta se usa en los tests y para inspeccionarla sola. El contexto
+   completo NO la incrusta: reutiliza RENDER-PLAN-PROCEDURE y pone su propia
+   cabecera, para no anidar un programa dentro de otro.
 
-     - La seccion que el modelo controla (sus pasos) y la que la maquina
-       controla (los veredictos) estan SEPARADAS por division. Un modelo que
-       quisiera declarar su propio exito tendria que escribir en la division
-       de la maquina, que es la que el harness rellena. En el YAML plano el
-       veredicto viajaba en la misma clave que la accion, al lado: nada
-       impedia que el modelo se lo escribiera solo.
+   Lo que el formato compra -- y conviene no exagerarlo:
 
-     - IDENTITY DIVISION lleva de quien es la tarjeta. Sin eso, un veredicto
-       de un turno viejo es indistinguible de uno recien emitido, y el modelo
-       reintenta cosas que ya se完之后.
+     - Un solo dialecto. Antes el plan era COBOL y el resto YAML: dos formatos
+       anidados donde el que mandaba era el viejo. Aqui todo es el mismo idioma.
 
-     - DATA DIVISION lleva GOAL ABIERTO, la cuenta que I5 ya hacia calcular y
-       que hasta ahora vivia escondida dentro de open-goal-tasks. Aqui el
-       modelo ve sus bananas en el mismo sitio donde ve su plan, que es donde
-       tiene sentido que mire antes de decidir el proximo turno.
+     - El veredicto va PEGADO al paso que juzga (`01.` con su `STATE` debajo), y
+       `STATE` es un vocabulario cerrado: APPLIED | FAILED | PENDING. En el YAML
+       plano el estado y la accion caian en la misma clave.
 
-   PENDING es lo que la hace estado de maquina y no parte de prensa: lo que
-   no se ha ejecutado se ve.
+     - `IDENTIFICATION DIVISION` lleva de quien es la tarjeta. Sin eso, un
+       veredicto de un turno viejo es indistinguible de uno recien emitido, y el
+       modelo reintenta cosas que ya se ejecutaron.
+
+     - `DATA DIVISION` lleva GOAL ABIERTO, la cuenta que I5 ya hacia calcular y
+       que vivia escondida dentro de open-goal-tasks.
+
+   OJO: esto NO es una frontera de seguridad. El modelo no escribe en el
+   contexto -- lo construye el harness entero --, asi que la separacion de
+   divisiones es disciplina de lectura, no un cortafuegos. La validacion de lo
+   que el modelo emite vive en parse-llm-batch-to-intentions.
+
+   PENDING es lo que la hace estado de maquina y no parte de prensa: lo que no
+   se ha ejecutado se ve.
 
    Tolera hechos basura, como el renderer anterior: un batch-plan sin :step, o
-   con un :step que no es entero, se SALTA. Perder el estado de los pasos
-   buenos por un dato sucio en uno seria la peor forma de perderlo, porque
-   ademas seria silenciosa."
-  (let* ((steps (remove nil
-                        (mapcar (lambda (d)
-                                  (let ((n (data-get d :step)))
-                                    (when (and (integerp n) (> n 0)) d)))
-                                (collect-facts-of-type facts "batch-plan"))))
+   con un :step que no es entero, se SALTA (ver PLAN-STEPS-OF)."
+  (let* ((steps (plan-steps-of facts))
          (verdicts (collect-facts-of-type facts "verdict")))
     (when steps
       (let ((order (sort steps #'< :key (lambda (d) (data-get d :step)))))
         (with-output-to-string (s)
           (format s "~&IDENTIFICATION DIVISION.~%")
           (format s "PROGRAM-ID. ~A.~%" (or *session-id* "SESSION"))
-          (format s "~%PROCEDURE DIVISION.~%")
-          (dolist (d order)
-            (let* ((n (data-get d :step))
-                   (turn (data-get d :turn-id))
-                   ;; EMPAREJAR POR (turn-id, step), NO POR step SOLO.
-                   ;;
-                   ;; El numero de paso se reinicia cada turno: 02. del turno 1
-                   ;; y 02. del turno 2 son el mismo numero y turnos
-                   ;; distintos. Emparejando solo por :step, el paso 2 del
-                   ;; turno 2 se llevaba el veredicto del turno 1 -- y como el
-                   ;; plan de ambos turnos suele tener el MISMO numero de
-                   ;; pasos, eso no es un caso raro: es cualquier sesion de
-                   ;; dos turnos. La tarjeta se ve perfecta, con STATE
-                   ;; rellenado, solo que con el dato de otro turno. Un paso
-                   ;; que se escribio bien aparecia como FAILED, con el motivo
-                   ;; de un fallo que no era suyo.
-                   ;;
-                   ;; :turn-id a NIL (un plan sin turno) solo empareja con
-                   ;; veredictos sin turno, para no cruzarlos con los que si lo
-                   ;; tienen.
-                   (v (find-if (lambda (vd)
-                                (and (eql (data-get vd :step) n)
-                                     (eql (data-get vd :turn-id) turn)))
-                              verdicts))
-                   (verdict (data-get v :verdict))
-                   ;; OJO: :APPLIED y :FAILED son keywords y los dos son
-                   ;; truthy. Hay que COMPARAR para decidir cual es cual; con un
-                   ;; test de verdad, todo saldria 'applied'.
-                   (state (if v
-                              (string-downcase
-                                (symbol-name (if (keywordp verdict) verdict :failed)))
-                              "pending")))
-              ;; El turno va en la etiqueta, porque la numeracion de COBOL se
-              ;; REINICIA por turno y sola no distingue 02. del turno 1 de 02.
-              ;; del turno 2. Sin esto la tarjeta tiene dos 01. y dos 02. y no
-              ;; hay forma de saber cuales pertenecen a cual, que es justo lo
-              ;; que el formato tiene que evitar.
-              (format s "    ~A  T~A ~A  ~A~%"
-                      (cobol-step-label n)
-                      (or turn "-")
-                      (cobol-verb (or (data-get d :action) "?"))
-                      (or (data-get d :target) "-"))
-              (format s "        STATE = ~A~%"
-                      (string-upcase state))
-              (let ((why (data-get v :reason)))
-                (when why
-                  (format s "        REASON = ~A~%" why)))))
+          (render-plan-procedure s order verdicts)
           (format s "~%DATA DIVISION.~%")
           (let ((open (open-goal-tasks)))
             (format s "~%GOAL ABIERTO. ~D~%"
@@ -509,6 +504,71 @@
             (dolist (g open)
               (format s "    ~A~%" g)))
           (format s "~%GOBACK.~%"))))))
+
+
+(defun render-plan-procedure (s order verdicts)
+  "La PROCEDURE DIVISION de la tarjeta: los pasos y su veredicto.
+
+   Vive suelto para que el programa COMPLETO del contexto la reutilice. La
+   tarjeta sola es un programa entero (IDENTIFICATION...GOBACK), pero cuando
+   va incrustada seria un programa dentro de otro: dos cabeceras y dos
+   GOBACK, y no se sabria de quien es cada parte.
+
+   Por eso no lleva PROGRAM-ID ni GOBACK: los pone quien envuelve.
+
+   Los VERDICTS se pasan como argumento, no se vuelven a leer de la base de
+   hechos. Recolectarlos aqui otra vez haria que la tarjeta leyera el estado
+   global por su cuenta, y si el contexto se esta construyendo con una lista
+   filtrada, la tarjeta se saltaria el filtro."
+  (format s "~%PROCEDURE DIVISION.~%")
+  (dolist (d order)
+    (let* ((n (data-get d :step))
+           (turn (data-get d :turn-id))
+           ;; EMPAREJAR POR (turn-id, step), NO POR step SOLO.
+           ;;
+           ;; El numero de paso se reinicia cada turno: 02. del turno 1 y 02.
+           ;; del turno 2 son el mismo numero y turnos distintos. Emparejando
+           ;; solo por :step, el paso 2 del turno 2 se llevaba el veredicto del
+           ;; turno 1 -- y como el plan de ambos turnos suele tener el MISMO
+           ;; numero de pasos, eso no es un caso raro: es cualquier sesion de
+           ;; dos turnos. La tarjeta se ve perfecta, con STATE rellenado, solo
+           ;; que con el dato de otro turno. Un paso que se escribio bien
+           ;; aparecia como FAILED, con el motivo de un fallo que no era suyo.
+           ;;
+           ;; :turn-id a NIL (un plan sin turno) solo empareja con veredictos
+           ;; sin turno, para no cruzarlos con los que si lo tienen.
+           (v (find-if (lambda (vd)
+                         (and (eql (data-get vd :step) n)
+                              (eql (data-get vd :turn-id) turn)))
+                       verdicts))
+           (verdict (data-get v :verdict))
+           ;; OJO: :APPLIED y :FAILED son keywords y los dos son truthy. Hay
+           ;; que COMPARAR para decidir cual es cual; con un test de verdad,
+           ;; todo saldria 'applied'.
+           (state (if v
+                      (string-downcase
+                        (symbol-name (if (keywordp verdict) verdict :failed)))
+                      "pending")))
+      ;; El turno va en la etiqueta, porque la numeracion de COBOL se REINICIA
+      ;; por turno y sola no distingue 02. del turno 1 de 02. del turno 2. Sin
+      ;; esto la tarjeta tiene dos 01. y dos 02. y no hay forma de saber cuales
+      ;; pertenecen a cual, que es justo lo que el formato tiene que evitar.
+      (format s "    ~A  T~A ~A  ~A~%"
+              (cobol-step-label n)
+              (or turn "-")
+              (cobol-verb (or (data-get d :action) "?"))
+              (or (data-get d :target) "-"))
+      ;; PENDING cuando no hay veredicto: lo que el modelo pidio y todavia no
+      ;; ha ocurrido. NO se omite la linea. Omitirla hacia que 'no ejecutado'
+      ;; fuera indistinguible de 'no me lo dijeron', y el modelo no puede
+      ;; reintentar lo que cree que no existe.
+      (format s "        STATE = ~A~%"
+              (string-upcase state))
+      (let ((why (data-get v :reason)))
+        (when why
+          (format s "        REASON = ~A~%" why))))))
+
+
 
 
 (defun cobol-verb (action)
@@ -522,203 +582,242 @@
 
 
 
-(defun grouped-context-string (facts now-turn)
-  "Render facts grouped by causal :turn-id, separating past from current turn."
+(defun render-fact (s type data)
+  "Un hecho como su bloque COBOL. Los internos no se renderizan: no son
+   contexto, son andamiaje.
+
+   El verbo va en la etiqueta, no en una clave. 'read:', 'wrote:',
+   'read_failed:' eran tres claves distintas para un solo tipo de hecho
+   (file-read), y el que decidia cual era el que decidia el resultado: un
+   file-read con :applied nil se imprimia como read_failed:, o sea que el
+   ESTADO viajaba dentro del NOMBRE. Ahora el nombre es siempre el mismo
+   (READ-FILE) y el estado va en STATE, que es lo unico que se lee."
+  (cond ((string= type "user-input")
+         (format s "    USER.~%")
+         (format s "        TEXT = ~A~%" (cobol-value (or (data-get data :text) ""))))
+        ((string= type "llm-response")
+         (format s "    ASSISTANT.~%")
+         (format s "        TEXT = ~A~%" (cobol-value (or (data-get data :text) ""))))
+        ((string= type "command-exec")
+         (format s "    EXEC-COMMAND.~%")
+         (format s "        COMMAND = ~A~%" (cobol-value (or (data-get data :command) "")))
+         (format s "        EXIT-CODE = ~A~%" (or (data-get data :exit-code) ""))
+         (format s "        OUTPUT = ~A~%"
+                 (cobol-block (truncate-payload (or (data-get data :output) "")))))
+        ((string= type "file-read")
+         (format s "    READ-FILE  ~A~%" (cobol-value (or (data-get data :path) "")))
+         ;; I6: el estado viaja en STATE, no en el nombre del bloque. Con el
+         ;; motivo dentro de :contents se imprimia el texto del error
+         ;; como si fuera el contenido del fichero, y el modelo creia
+         ;; haber leido algo.
+         (format s "        STATE = ~A~%" (if (data-get data :applied) "APPLIED" "FAILED"))
+         (if (data-get data :applied)
+             (format s "        CONTENTS = ~A~%"
+                     (cobol-block (truncate-payload (or (data-get data :contents) ""))))
+             (when (data-get data :reason)
+               (format s "        REASON = ~A~%" (data-get data :reason)))))
+        ((string= type "file-write")
+         (format s "    WRITE-FILE  ~A~%" (cobol-value (or (data-get data :path) "")))
+         (format s "        STATE = ~A~%" (if (data-get data :applied) "APPLIED" "FAILED"))
+         (when (data-get data :bytes)
+           (format s "        BYTES = ~A~%" (data-get data :bytes)))
+         (when (data-get data :reason)
+           (format s "        REASON = ~A~%" (data-get data :reason)))
+         (when (data-get data :refused)
+           (format s "        REFUSED = TRUE~%")))
+        ((string= type "file-edit")
+         (format s "    EDIT-FILE  ~A~%" (cobol-value (or (data-get data :path) "")))
+         (format s "        STATE = ~A~%" (if (data-get data :applied) "APPLIED" "FAILED"))
+         ;; I6: una sola clave, :reason. Leer :reason y :error a la vez era
+         ;; el sintoma de que el rechazo no tenia nombre unico.
+         (let ((why (data-get data :reason)))
+           (when why
+             (format s "        REASON = ~A~%" why)))
+         (when (data-get data :matches)
+           (format s "        MATCHES = ~A~%" (data-get data :matches))))
+        ;; batch-plan NO se renderiza aqui: vive en PROCEDURE DIVISION, con su
+        ;; veredicto al lado (ver RENDER-PLAN-CARD). Los hechos de control
+        ;; tampoco: son andamiaje, no contexto.
+        ((or (string= type "tool-loop")
+             (string= type "plan-done")
+             (string= type "batch-abort")
+             (string= type "intention")
+             (string= type "batch-plan"))
+         nil)
+        ;; Un veredicto HUERFANO -- sin batch-plan que lo muestre en la
+        ;; tarjeta -- si se renderiza. Si el paso existe, la tarjeta ya lleva
+        ;; el STATE al lado del paso, y repetirlo aqui seria la misma verdad
+        ;; dos veces en el mismo turno. Si el paso se fue (el cap de
+        ;; batch-plan retrae los viejos y deja los verdicts), este es el unico
+        ;; sitio donde el modelo se entera de que fallo.
+        ((string= type "verdict")
+         (format s "    STEP ~A  ~A  ~A~%"
+                 (cobol-step-label (or (data-get data :step) 0))
+                 (cobol-verb (or (data-get data :action) "?"))
+                 (or (data-get data :target) "-"))
+         (format s "        STATE = ~A~%"
+                 (string-upcase (symbol-name (or (data-get data :verdict) :failed))))
+         (let ((why (data-get data :reason)))
+           (when why
+             (format s "        REASON = ~A~%" why))))
+        (t nil)))
+
+
+(defun grouped-context-string (facts now-turn &optional memory)
+  "Los hechos del turno, agrupados por :turn-id, como PROGRAMA COBOL.
+
+   Antes esto era un bloque YAML con claves 'context:', 'prior_turns:',
+   'current_turn:', y la tarjeta COBOL incrustada dentro -- dos formatos
+   anidados, con la tarjeta de Boundaries en medio. El que mandaba era el
+   viejo, y el modelo leia un 'read:' junto a un '01. WRITE-FILE' sin saber
+   que eran el mismo idioma.
+
+   Ahora es un unico programa. La jerarquia la ponen las divisiones y la
+   sangria, no los dos puntos; y el dato va de seguido, sin comillas ni
+   escapes, porque un escape que no se deshace exacto es una forma de
+   corromper el contenido de un fichero."
   (let ((groups (make-hash-table :test #'eql))
         (epoch (current-epoch))
-        (todos (collect-active-todos)))
+        ;; GOAL ABIERTO son los que siguen SIN completar. collect-active-todos
+        ;; devuelve tambien los completados que aun no se han retraido (el cap
+        ;; los poda por cantidad, no por estado), y contarlos como abiertos
+        ;; pintaba un goal cerrado bajo el rotulo 'ABIERTO'. La cuenta tiene
+        ;; que salir de la misma definicion que usa el protocolo para decidir
+        ;; si cierra la sesion.
+        (todos (remove-if (lambda (td)
+                            (string-equal (or (get-slot-value td 'status) "") "completed"))
+                          (collect-active-todos)))
+        (plan-keys (make-hash-table :test #'equal)))
+    (dolist (d (plan-steps-of facts))
+      (setf (gethash (cons (data-get d :step) (data-get d :turn-id)) plan-keys) t))
     (dolist (f facts)
       (let* ((type (fact-type-of f))
              (data (fact-data-of f))
              (turn (or (data-get data :turn-id) 0)))
-        ;; Carry the full ORDER KEY, not the bare timestamp: two events in the
-        ;; same second used to be re-sorted here with no tiebreaker, which is how
-        ;; a command still came out above the write it read.
-        ;; NOTE: built with CONS, not LIST -- in this package LIST is LISA's, and
-        ;; calling it here silently produced a pattern instead of a list.
-        (push (cons (fact-order-key f) (cons type data)) (gethash turn groups))))
+        ;; Un veredicto cuyo paso YA esta en la tarjeta no se repite en el
+        ;; flujo: la tarjeta lo lleva al lado del paso, y repetirlo seria la
+        ;; misma verdad dos veces. El que no tiene paso -- porque el cap de
+        ;; batch-plan lo retiro -- se cae al flujo para no perderse.
+        (when (or (not (string= type "verdict"))
+                  (not (gethash (cons (data-get data :step) (data-get data :turn-id))
+                                plan-keys)))
+          ;; Carry the full ORDER KEY, not the bare timestamp: two events in the
+          ;; same second used to be re-sorted here with no tiebreaker, which is how
+          ;; a command still came out above the write it read.
+          ;; NOTE: built with CONS, not LIST -- in this package LIST is LISA's, and
+          ;; calling it here silently produced a pattern instead of a list.
+          (push (cons (fact-order-key f) (cons type data)) (gethash turn groups)))))
     (maphash (lambda (turn cells)
                (setf (gethash turn groups)
                      (sort cells #'fact-order-before-p :key #'car)))
              groups)
 
+    (with-output-to-string (s)
+      (format s "IDENTIFICATION DIVISION.~%")
+      (format s "PROGRAM-ID. ~A.~%" (or *session-id* "SESSION"))
 
-        (flet ((render-fact (s type data)
-             "Helper local para renderizar un hecho en YAML."
-             (cond ((string= type "user-input")
-                    (format s "      user: ~A~%" (escape-yaml (or (data-get data :text) ""))))
-                   ((string= type "llm-response")
-                    (format s "      assistant: ~A~%" (escape-yaml (or (data-get data :text) ""))))
-                   ((string= type "command-exec")
-                    (format s "      exec:~%")
-                    (format s "        command: ~A~%" (escape-yaml (or (data-get data :command) "")))
-                    (format s "        exit_code: ~A~%" (or (data-get data :exit-code) ""))
-                    (format s "        output: ~A~%" (yaml-block (truncate-payload (or (data-get data :output) "")) "          ")))
-                   ((string= type "file-read")
-                    ;; I6: una lectura fallida se renderiza COMO FALLIDA. Con
-                    ;; el motivo dentro de :contents se imprimia un bloque de
-                    ;; texto que parecia el contenido del fichero.
-                    (if (data-get data :applied)
-                        (format s "      read:~%")
-                        (format s "      read_failed:~%"))
-                    (format s "        path: ~A~%" (escape-yaml (or (data-get data :path) "")))
-                    (if (data-get data :applied)
-                        (format s "        contents: ~A~%" (yaml-block (truncate-payload (or (data-get data :contents) "")) "          "))
-                        (when (data-get data :reason)
-                          (format s "        reason: ~A~%" (escape-yaml (data-get data :reason))))))
-                   ((string= type "file-write")
-                    (if (data-get data :applied)
-                        (format s "      wrote:~%")
-                        (format s "      write_refused:~%"))
-                    (format s "        path: ~A~%" (escape-yaml (or (data-get data :path) "")))
-                    (when (data-get data :bytes)
-                      (format s "        bytes: ~A~%" (data-get data :bytes)))
-                    ;; I6: :error ya no existe en los hechos; el motivo es
-                    ;; :reason, como en file-edit y en verdict.
-                    (when (data-get data :reason)
-                      (format s "        reason: ~A~%" (escape-yaml (data-get data :reason))))
-                    (when (data-get data :refused)
-                      (format s "        refused: true~%")))
+      ;; El epoch, si lo hay, va aqui y no en su propio bloque: es parte de
+      ;; la identidad del programa, no una seccion mas.
+      (when epoch
+        (format s "EPOCH. ~A~%" (get-slot-value epoch 'id))
+        (format s "BASELINE-TURN. ~A~%" (get-slot-value epoch 'baseline-seq))
+        (when (get-slot-value epoch 'summary)
+          (format s "SUMMARY. ~A~%" (get-slot-value epoch 'summary))))
 
-		   ((string= type "file-edit")
-                    (format s "      edit:~%")
-                    (format s "        path: ~A~%" (escape-yaml (or (data-get data :path) "")))
-                    (format s "        applied: ~A~%" (if (data-get data :applied) "true" "false"))
-                    ;; I6: una sola clave, :reason. Leer :reason y :error a la
-                    ;; vez era el sintoma de que el rechazo no tenia nombre unico.
-                    (let ((why (data-get data :reason)))
-                      (when why
-                        (format s "        reason: ~A~%" (escape-yaml why))))
-                    (when (data-get data :matches)
-                      (format s "        matches: ~A~%" (data-get data :matches))))
-;; PROTOCOLO §2.3: el VERDICT es lo unico que el LLM puede leer como verdad
-;; sobre lo que paso. :step es lo que lo enlaza con el plan que el propio
-;; modelo probo -- sin el, el modelo ve "edit fallo" y no sabe cual de sus N
-;; pasos fue, que es justo lo que necesita para decidir el siguiente.
-		   ((string= type "verdict")
-                     (format s "      verdict:~%")
-                     (format s "        step: ~A~%" (or (data-get data :step) "?"))
-                     (format s "        action: ~A~%" (or (data-get data :action) "?"))
-                     (format s "        target: ~A~%" (escape-yaml (or (data-get data :target) "")))
-                     ;; OJO: :verdict es el keyword :applied o :failed, y en
-                     ;; Lisp los DOS son truthy. Un (if (data-get ...)) dira
-                     ;; "applied" siempre; hay que COMPARAR el simbolo.
-                     (format s "        result: ~A~%"
-                             (let ((v (data-get data :verdict)))
-                               (string-downcase (symbol-name (if (keywordp v) v :failed)))))
-                     (let ((why (data-get data :reason)))
-                       (when why
-                         (format s "        reason: ~A~%" (escape-yaml why)))))
-		   
-                    ;; Suprimimos hechos de control interno que no son contexto.
-                    ;; batch-plan NO va aqui: se renderiza en su propio bloque
-                    ;; (ver PLAN-BLOCK), que lo junta con los veredictos.
-                    ((or (string= type "tool-loop")
-                         (string= type "plan-done")
-                         (string= type "batch-abort")
-                         (string= type "intention")
-                         (string= type "batch-plan")
-                         (string= type "verdict"))
-                     nil)
-                    (t nil))))
+      ;; PROCEDURE DIVISION va SIEMPRE, aunque no haya plan. Un programa sin
+      ;; division de procedimiento no es un programa vacio: es un programa
+      ;; MAL FORMADO, y el modelo que lee 'no hay PROCEDURE' aprende que el
+      ;; formato cambia de forma. Una seccion vacia se lee: no me pidio nada.
+      (let* ((ordered (sort (plan-steps-of facts) #'< :key (lambda (d) (data-get d :step))))
+             (verdicts (collect-facts-of-type facts "verdict")))
+        (render-plan-procedure s ordered verdicts))
 
-	  
-      (with-output-to-string (s)
-        (format s "context:~%")
-        (format s "  session: ~A~%" (escape-yaml *session-id*))
-        
-        ;; Render epoch baseline snapshot if present
-        (when epoch
-          (format s "  epoch:~%")
-          (format s "    id: ~A~%" (escape-yaml (get-slot-value epoch 'id)))
-          (format s "    baseline_turn: ~A~%" (get-slot-value epoch 'baseline-seq))
-          (format s "    summary: ~A~%" (escape-yaml (get-slot-value epoch 'summary))))
+      ;; DATA DIVISION con los goals abiertos. La tarjeta suelta lleva
+      ;; 'GOAL ABIERTO. N' con las tareas peladas; el programa completo lleva
+      ;; ademas STATUS, PRIORITY y PARENT, que es lo que la tarjeta no cabe.
+      (format s "~%DATA DIVISION.~%")
+      (format s "~%GOAL ABIERTO. ~D~%" (length todos))
+      (dolist (td todos)
+        (let ((id (get-slot-value td 'id))
+              (task (get-slot-value td 'task))
+              (status (get-slot-value td 'status))
+              (priority (get-slot-value td 'priority))
+              (parent (get-slot-value td 'parent-id)))
+          (format s "    ~A  ~A~%" (or id "-") (cobol-value task))
+          (when status
+            (format s "        STATUS = ~A~%" (cobol-value status)))
+          (when priority
+            (format s "        PRIORITY = ~A~%" priority))
+          (unless (or (null parent) (string= parent "root"))
+            (format s "        PARENT = ~A~%" parent))))
 
-        ;; PROTOCOLO: el plan del turno como TARJETA COBOL, antes de los goals.
-        ;; Primero porque es lo que acaba de hacer el modelo y lo que decide su
-        ;; siguiente turno; los goals son el marco de fondo.
-        ;;
-        ;; Va dentro del bloque context: y en indented, y no suelto arriba. La
-        ;; tarjeta es texto plano con su propio formato, y la clave del sistema
-        ;; es que cada bloque tenga un renderizador con el suyo. Mezclarla aqui
-        ;; seria el camino corto a un formato que no se puede parsear de vuelta.
-        (let ((plan (render-plan-card facts)))
-          (when plan
-            (format s "~A" plan)))
-        
-        ;; Render goals / todos
-        (when todos
-          (format s "  goals:~%")
-          (dolist (td todos)
-            (let ((id (get-slot-value td 'id))
-                  (task (get-slot-value td 'task))
-                  (status (get-slot-value td 'status))
-                  (priority (get-slot-value td 'priority))
-                  (parent (get-slot-value td 'parent-id)))
-              (format s "    - id: ~A~%" (escape-yaml id))
-              (format s "      task: ~A~%" (escape-yaml task))
-              (format s "      status: ~A~%" (escape-yaml status))
-              (format s "      priority: ~A~%" (escape-yaml priority))
-              (unless (or (null parent) (string= parent "root"))
-                (format s "      parent_goal: ~A~%" (escape-yaml parent))))))
-        
-        ;; Render loop warnings
-        (let ((loops (collect-tool-loops)))
-          (when loops
-            (format s "  warnings:~%")
-            (dolist (l loops)
-              (let* ((d (fact-data-of l))
-                     (family (or (data-get d :family) ""))
-                     (count (or (data-get d :count) 3)))
-                (format s "    - loop: ~A failing commands are the same retried attempt (family ~S). STOP re-running variants — change approach.~%"
-                        count family)))))
-        
-        ;; Render PAST TURNS (Historia cerrada)
-        (format s "  prior_turns:~%")
-        (dolist (turn (sort (loop for k being the hash-keys of groups collect k) #'<))
-          (when (< turn now-turn)
-            (format s "    ~A:~%" turn)
-            (dolist (cell (gethash turn groups))
-              (render-fact s (cadr cell) (cddr cell)))))
-        
-        ;; Render CURRENT TURN (Lo que está pasando ahora)
-        (when (> now-turn 0)
-          (format s "  current_turn:~%")
-          (format s "    number: ~A~%" now-turn)
-          (format s "    events:~%")
-          (dolist (cell (gethash now-turn groups))
-            (render-fact s (cadr cell) (cddr cell))))))))
+      ;; Los avisos. En YAML era 'warnings:' con una lista de '- loop: ...'.
+      (let ((loops (collect-tool-loops)))
+        (when loops
+          (format s "~%WARNING DIVISION.~%")
+          (dolist (l loops)
+            (let* ((d (fact-data-of l))
+                   (family (or (data-get d :family) ""))
+                   (count (or (data-get d :count) 3)))
+              (format s "    LOOP. ~A failing commands are the same retried attempt (family ~S).~%"
+                      count family)
+              (format s "        STOP re-running variants; change approach.~%")))))
+
+      ;; Los turnos, del mas viejo al actual. La agrupacion por :turn-id se
+      ;; mantiene porque es informacion, no formato: saber que dos hechos son
+      ;; del mismo turno es parte del estado.
+      (dolist (turn (sort (loop for k being the hash-keys of groups collect k) #'<))
+        (format s "~%TURN ~A.~%" turn)
+        (dolist (cell (gethash turn groups))
+          (render-fact s (cadr cell) (cddr cell))))
+
+      ;; La memoria va DENTRO del programa, antes del cierre. Fuera del
+      ;; GOBACK no seria parte de este turno, seria un anexo.
+      (when (and memory (plusp (length memory)))
+        (format s "~A" memory))
+
+      (format s "~%GOBACK.~%"))))
 
 
 (defun mem-context-block ()
-  "Render long-term memory (durable facts in the *mem-engine*) as a YAML
-   section appended to every turn's context. Independent of the turn working
-   memory and its TTL/dedup/cap pruning."
+  "La MEMORY DIVISION: lo durable de la *mem-engine*, dentro del programa.
+
+   Antes se CONCATENABA fuera del programa, con su propia clave
+   'long_term_memory:'. Eso tenia dos problemas: el programa cerraba con
+   GOBACK y la memoria aparecia DESPUES del cierre, o sea fuera del programa;
+   y un bloque YAML colgando de un programa COBOL, que es exactamente el
+   mezcladito que este cambio viene a quitar.
+
+   Es independiente de la memoria de turno y de su TTL/dedup/cap: eso lo hace
+   la mem-engine antes de llegar aqui."
   (let ((facts (mem-engine-facts)))
     (when facts
       (with-output-to-string (s)
-        (format s "long_term_memory:~%")
+        (format s "~%MEMORY DIVISION.~%")
         (dolist (f (nreverse
                      (sort facts #'fact-order-before-p :key #'fact-order-key)))
           (let* ((type (fact-type-of f))
                  (data (fact-data-of f)))
             (cond ((string= type "command-exec")
-                   (format s "  - error: ~A -> exit ~A~%"
-                           (escape-yaml (or (data-get data :command) ""))
+                   ;; Un comando que salio mal es lo que hay que recordar: un
+                   ;; comando que fue bien no merece linea. La asimetria es
+                   ;; deliberada, y por eso esto no es ni 'command:' ni 'exec:'.
+                   (format s "    ERROR. ~A~%"
+                           (cobol-value (or (data-get data :command) "")))
+                   (format s "        EXIT-CODE = ~A~%"
                            (or (data-get data :exit-code) ""))
-                   (format s "    evidence: ~A~%"
-                           (escape-yaml (truncate-payload
+                   (format s "        EVIDENCE = ~A~%"
+                           (cobol-block (truncate-payload
                                          (or (data-get data :output) "")))))
                   ((string= type "file-write")
-                   (format s "  - action: wrote ~A (~A bytes)~%"
-                           (escape-yaml (or (data-get data :path) ""))
-                           (or (data-get data :bytes) "")))
+                   (format s "    WROTE. ~A~%" (cobol-value (or (data-get data :path) "")))
+                   (format s "        BYTES = ~A~%" (or (data-get data :bytes) "")))
                   (t nil))))))))
 
 
-(defun build-yaml-context (user-message)
-  "Build the full YAML context block: run pruning rules, then select the
-   most structurally and semantically relevant facts."
+(defun build-context (user-message)
+  "El contexto completo como programa COBOL: poda, selecciona y renderiza
+   los hechos mas relevantes estructural y semanticamente."
   (run)
   (retract-oldest-of-type "user-input" (max-facts-per-type))
   (retract-oldest-of-type "llm-response" (max-facts-per-type))
@@ -745,20 +844,22 @@
                            0)
                        0)))
     (when *debug-mode*
-      (format t "~&[DEBUG build-yaml-context] active-facts=~A now-turn=~A~%" (length all-facts) now-turn))
+      (format t "~&[DEBUG build-context] active-facts=~A now-turn=~A~%" (length all-facts) now-turn))
     (let ((selected (select-relevant-facts all-facts now-turn :query user-message)))
-      (let ((yaml (grouped-context-string selected now-turn)))
+      ;; La memoria se calcula ANTES de renderizar, porque ahora es una
+      ;; division del programa y no una cola que se le pega por detras.
+      (let* ((mem (mem-context-block))
+             (cobol (grouped-context-string selected now-turn mem)))
         ;; DUMP AUTOMÁTICO AQUÍ:
         (when *debug-mode*
           (let* ((ts (get-universal-time))
-                 ;; Armamos la ruta completa: /harness-base/debug/debug-123.yaml
-                 (full-path (merge-pathnames 
-                             (format nil "debug/debug-~A.yaml" ts) 
+                 ;; Armamos la ruta completa: /harness-base/debug/debug-123.cob
+                 (full-path (merge-pathnames
+                             (format nil "debug/debug-~A.cob" ts)
                              (harness-base-dir))))
             ;; Le pasamos el archivo: SBCL crea la carpeta 'debug' si no existe
             (ensure-directories-exist full-path)
             (with-open-file (s full-path
                                :direction :output :if-exists :supersede)
-              (write-string yaml s))))
-        (let ((mem (mem-context-block)))
-          (if mem (format nil "~A~%~A" yaml mem) yaml))))))
+              (write-string cobol s))))
+        cobol))))

@@ -20,7 +20,7 @@
                 #:durable-type-p #:promote-durable-facts #:mem-engine-facts
                 #:collect-active-facts #:retract-oldest-of-type #:fact-slot
                 ;; metrics
-                #:metrics-reset #:build-yaml-context
+                #:metrics-reset #:build-context
                 ;; config
                 #:llm-provider #:llm-endpoint))
 
@@ -481,7 +481,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                                                  :turn-id 1 :parent-id 1)))))
     (ok (= 6 (fact-count "file-read")))
     (with-test-config (("max_facts_per_type" 2))
-      (build-yaml-context "hola"))
+      (build-context "hola"))
     (ok (= 2 (fact-count "file-read")) "el tope por tipo debe retirar los viejos")
     (let ((paths (mapcar (lambda (f) (h::data-get (h::fact-data-of f) :path))
                          (with-turn-engine (h::collect-harness-facts)))))
@@ -506,7 +506,46 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
   (ok (= 2 (h::token-estimate "abcde")) "redondea hacia arriba")
   (ok (= 0 (h::token-estimate ""))))
 
-(deftest context/build-yaml-context-renders-session
+(deftest context/el-contexto-no-es-yaml
+  "El contexto completo es un programa COBOL. No hay YAML en ninguna parte.
+
+   El YAML se justificaba como \"vista humana\". No lo era: nadie lo leia, y
+   las dos cosas que se le pedian -- jerarquia explicita y campos en columna
+   fija -- las hace mejor la tarjeta. Un formato que existe \"por si alguien
+   lo mira\" y que nadie mira es una segunda fuente de verdad: cuando el YAML
+   y el COBOL discrepan, no hay forma de saber cual mintio.
+
+   Se afirma sobre el CONTEXTO ENTERO, no sobre la tarjeta. La tarjeta ya
+   era COBOL y aun asi el contexto lo envolvia en 'context:' con claves
+   YAML alrededor, o sea que el formato estaba a medias y el que mandaba era
+   el viejo. Este test falla si vuelve a colarse un solo ':' de clave."
+  (with-temp-dir (dir)
+    (let ((cl-harness::*base-dir* dir)
+          (h:*session-id* "session-cobol"))
+      (with-turn-engine
+        (reset-turn-engine)
+        (h::assert (h::harness-fact (h::fact-type "user-input")
+                                    (h::timestamp (get-universal-time))
+                                    (h::data (list :text "hola" :turn-id 1))))
+        (let ((ctx (build-context "hola")))
+          ;; Las cuatro divisiones del programa.
+          (ok (search "IDENTIFICATION DIVISION." ctx) "abre con IDENTIFICATION")
+          (ok (search "PROCEDURE DIVISION." ctx) "y tiene PROCEDURE")
+          (ok (search "DATA DIVISION." ctx) "y DATA")
+          (ok (search "GOBACK." ctx) "y cierra con GOBACK")
+          (ok (search "session-cobol" ctx) "el PROGRAM-ID es la sesion")
+          (ok (search "hola" ctx) "la entrada del usuario sigue estando")
+          ;; Y NINGUNA clave YAML. Estas son las que existian antes; si vuelve
+          ;; cualquiera, el formato ha vuelto a ser dos formatos.
+          (ok (not (search "context:" ctx)) "no la clave 'context:'")
+          (ok (not (search "prior_turns" ctx)) "ni 'prior_turns'")
+          (ok (not (search "current_turn" ctx)) "ni 'current_turn'")
+          (ok (not (search "goals:" ctx)) "ni 'goals:'")
+          (ok (not (search "long_term_memory" ctx)) "ni 'long_term_memory'")
+          (ok (not (search "warnings:" ctx)) "ni 'warnings:'"))))))
+
+
+(deftest context/build-context-renders-session
   (with-temp-dir (dir)
     (let ((h::*base-dir* dir)
           (h:*session-id* "session-test-123"))
@@ -515,10 +554,10 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
         (h::assert (h::harness-fact (h::fact-type "user-input")
                                     (h::timestamp (get-universal-time))
                                     (h::data (list :text "hola" :turn-id 1))))
-        (let ((yaml (build-yaml-context "hola")))
-          (ok (search "context:" yaml))
-          (ok (search "session-test-123" yaml))
-          (ok (search "hola" yaml)))))))
+        (let ((cobol (build-context "hola")))
+          (ok (search "PROGRAM-ID." cobol))
+          (ok (search "session-test-123" cobol))
+          (ok (search "hola" cobol)))))))
 
 ;;;; ---------------------------------------------------------------
 ;;;; Goals: cierre, deduplicacion, orden y poda
@@ -556,6 +595,37 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
     (h::add-todo "Read src/app.lisp" :status "pending")
     (h::add-todo "Read src/util.lisp" :status "pending")
     (ok (= 2 (length (active-todos))))))
+
+(deftest context/goal-abierto-no-cuenta-los-completados
+  "El contador de GOAL ABIERTO son los goals SIN completar.
+
+   collect-active-todos devuelve tambien los completados que aun no se han
+   retraido: el cap los poda por CANTIDAD, no por estado. Al pintarlos bajo el
+   rotulo 'GOAL ABIERTO', un goal ya cerrado se contaba como pendiente y el
+   modelo seguia trabajando en algo que ya estaba hecho. La cuenta tiene que
+   salir de la misma definicion con la que el protocolo decide cerrar la
+   sesion."
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::add-todo "Write app.py" :status "in-progress")
+    (h::add-todo "Edit otro.py" :status "pending")
+    (h::assert (h::harness-fact (h::fact-type "file-write")
+                                (h::timestamp (get-universal-time))
+                                (h::data (list :path "/tmp/proyecto/app.py"
+                                               :applied t
+                                               :bytes 42
+                                               :turn-id (h::current-turn-id)))))
+    ;; El primer goal queda completado por evidencia; el segundo sigue abierto
+    ;; y el cap no poda nada (hay 2, el tope es 5).
+    (let* ((ctx (build-context "sigue"))
+           (idx (search "GOAL ABIERTO." ctx)))
+      (ok idx "hay seccion de goals")
+      (ok (search "GOAL ABIERTO. 1" ctx)
+          "solo el que sigue pendiente cuenta como abierto")
+      (ok (not (search "Write app.py" ctx))
+          "el goal ya completado no aparece como abierto")
+      (ok (search "Edit otro.py" ctx)
+          "el que sigue abierto si aparece"))))
 
 (deftest goals/ordering-is-numeric-not-lexicographic
   "Ordenar por texto daria todo-10 antes que todo-9: el modelo leeria sus goals
@@ -682,13 +752,14 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                                                      :output "5"
                                                      :exit-code 0
                                                      :turn-id 1)))))
-        (let ((yaml (build-yaml-context "cuentalas")))
-          ;; Search the RENDERED KEYS, not the path: the goal task also mentions
-          ;; datos.txt, so searching the bare path would match the goals block.
-          (let ((wrote-at (search "wrote:" yaml))
-                (exec-at (search "exec:" yaml)))
+        (let ((cobol (build-context "cuentalas")))
+          ;; Search the RENDERED LABELS, not the path: the goal task also
+          ;; mentions datos.txt, so searching the bare path would match the
+          ;; goals block.
+          (let ((wrote-at (search "WRITE-FILE" cobol))
+                (exec-at (search "EXEC-COMMAND" cobol)))
             (ok (and wrote-at exec-at (< wrote-at exec-at))
-                (format nil "wrote en ~S y exec en ~S" wrote-at exec-at))))))))
+                (format nil "WRITE-FILE en ~S y EXEC-COMMAND en ~S" wrote-at exec-at))))))))
 
 ;;;; ---------------------------------------------------------------
 ;;;; Registro de la respuesta del modelo
@@ -1412,7 +1483,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
    un cambio de vocabulario lo rompe en silencio: nadie ve un error, el dump
    carga bien y aparecen hechos con la forma de la version vieja.
 
-   Ya paso. Los batch-plan，随后 el batch-complete se renombro a plan-done y el
+   Ya paso. Los batch-plan, y despues el batch-complete se renombro a plan-done y el
    :parent-id desaparecio de los hechos resultado, sin tocar el serializador. Un
    dump de la epoca anterior, restaurado hoy, resucita :PARENT-ID (un campo que
    ya no existe) y hechos tipados con nombres que nadie emite. Carga sin quejarse
@@ -1740,10 +1811,10 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
           ;; Y que el rechazo LLEGU al modelo. Si el renderer no distingue un
           ;; hecho fallido de uno bueno, el modelo ve 'wrote:' sobre un fichero
           ;; que no se toco.
-          (let ((yaml (build-yaml-context "sigue")))
-            (ok (search "write_refused" yaml)
-                "una escritura rechazada no se renderiza como 'wrote'")
-            (ok (search "already exists" yaml)
+          (let ((cobol (build-context "sigue")))
+            (ok (search "REFUSED = TRUE" cobol)
+                "una escritura rechazada se marca REFUSED, no se calla")
+            (ok (search "already exists" cobol)
                 "y el motivo viaja al modelo"))))))
 
 
@@ -1856,15 +1927,14 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
         (h::assert-step-verdict (list :step 2 :action :edit-file :path "uno.txt")
                                 (list :applied nil
                                       :reason "old_string not found"))
-        (let ((yaml (build-yaml-context "sigue")))
-          (ok (search "verdict:" yaml) "el veredicto se renderiza en el contexto")
-          (ok (search "step: 1" yaml) "el veredicto conserva su numero de paso")
-          (ok (search "step: 2" yaml)
+        (let ((cobol (build-context "sigue")))
+          (ok (search "STEP 01" cobol) "el veredicto se renderiza en el contexto")
+          (ok (search "STEP 02" cobol)
               "cada veredicto apunta a SU paso, no a un 'fallo' generico")
-          (ok (search "result: applied" yaml) "un paso ok se distingue de uno roto")
-          (ok (search "result: failed" yaml)
+          (ok (search "STATE = APPLIED" cobol) "un paso ok se distingue de uno roto")
+          (ok (search "STATE = FAILED" cobol)
               "un fallo NO se presenta como applied aunque el keyword sea truthy")
-          (ok (search "old_string not found" yaml)
+          (ok (search "old_string not found" cobol)
               "el motivo del rechazo viaja al modelo, no solo al debugger"))))))
 
 
@@ -1917,7 +1987,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                                     (h::timestamp (get-universal-time))
                                     (h::data (list :reason "Blind write attempt" :turn-id 1))))
         (let* ((plans (batch-plan-facts))
-               (ctx (build-yaml-context "sigue"))
+               (ctx (build-context "sigue"))
                (plan (card-section ctx)))
           (ok (= 3 (length plans))
               (format nil "los 3 pasos del plan quedan registrados; hay ~D" (length plans)))
@@ -1960,7 +2030,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                                     (h::data (list :step "no-so-numero" :action :read-file
                                                    :turn-id 1))))
         ;; Esto NO debe lanzar: es el fallo que se vigila.
-        (let ((ctx (build-yaml-context "sigue")))
+        (let ((ctx (build-context "sigue")))
           (ok (search "PROCEDURE DIVISION." ctx)
               "los pasos validos se siguen mostrando")
           (ok (search "01." ctx))

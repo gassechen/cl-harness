@@ -6,7 +6,7 @@
 ;;; NOTE: Rules must NOT perform internal retrieve() queries
 ;;; (that triggers reentrant run-query and macro-expansion issues
 ;;; in the RHS). Per-type and global caps are enforced by plain
-;;; functions called from build-yaml-context.
+;;; functions called from build-context.
 ;;;
 ;;; Two engines: these defrule forms compile into whichever engine is
 ;;; active at load — the *turn-engine* (working memory). Rules specific to
@@ -143,7 +143,7 @@
   (retract ?f))
 
 ;;; ============================================================
-;;; Imperative pruning helpers (called from build-yaml-context,
+;;; Imperative pruning helpers (called from build-context,
 ;;; NOT from rules, to avoid reentrant run-query)
 ;;; ============================================================
 
