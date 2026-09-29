@@ -109,7 +109,9 @@
 ;;; - closeness to the current turn (small |turn-id - now| = higher)
 ;;; - repetition (a dedup-key seen more times = more relevant; re-reading
 ;;;   or re-running the same thing signals it matters)
-;;; - causality (facts with a parent-id = part of a chain worth keeping)
+;;; - causality (facts with a parent-id = a sub-goal of another, so it sits in
+;;;   a chain worth keeping). Solo goals lo llevan: ver la nota de parent-id en
+;;;   facts.lisp para por que los resultados dejaron de llevarlo.
 ;;;
 ;;; This keeps Rete deciding structure (time, repetition, dependency) and
 ;;; leaves meaning to the LLM. Nothing here is a rule — it is a scoring
@@ -211,7 +213,7 @@
 (defconstant +score-keyword-path+ 450 "Bonus si el path del archivo matchea la query.")
 (defconstant +score-keyword-cmd+ 400 "Bonus si el comando matchea la query.")
 (defconstant +score-keyword-content+ 80 "Bonus por keyword en el contenido (max 4).")
-(defconstant +score-causal+ 50 "Bonus por tener parent-id (cadena causal).")
+(defconstant +score-causal+ 50 "Bonus por un parent-id real (un goal dentro de otro).")
 
 (defun relevance-score (f now-turn rep-counts &optional (query-keywords nil))
   "Structural and semantic relevance of fact F, higher = more important."
@@ -534,7 +536,7 @@
                     ;; batch-plan NO va aqui: se renderiza en su propio bloque
                     ;; (ver PLAN-BLOCK), que lo junta con los veredictos.
                     ((or (string= type "tool-loop")
-                         (string= type "batch-complete")
+                         (string= type "plan-done")
                          (string= type "batch-abort")
                          (string= type "intention")
                          (string= type "batch-plan")

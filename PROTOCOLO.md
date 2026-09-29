@@ -154,11 +154,33 @@ No es deuda de formato, es deuda de mensaje:
    un `:step` que no es entero, se salta. Perder el estado de los pasos buenos por un
    dato sucio en uno sería la peor forma de perderlo, porque además es silenciosa. Una
    mutación que quita ese filtro tumba el turno entero, y el test lo detecta.
-2. **`:parent-id` es un nombre que miente.** En los hechos resultado vale
-   `(current-turn-id)` — lo mismo que `:turn-id` (`src/actions.lisp:159`). Debería
-   apuntar a la intención, o eliminarse.
-3. **`batch-complete` es un nombre que miente.** Significa "el modelo mandó
-   `tool_calls` vacío", no "el trabajo está hecho". Debería ser `plan-done`.
+2. ~~**`:parent-id` es un nombre que miente.**~~ Resuelto: eliminado de los hechos
+   resultado, donde duplicaba `:turn-id` bajo otro nombre.
+
+   Y no era solo cosmético. `select-relevant-facts` paga `+score-causal+` (50 puntos)
+   a cualquier hecho que tenga `:parent-id`, para premiar la cadena causal. Como
+   *todos* los resultados lo llevaban, la bonificación era para todos: 50 puntos de
+   relleno que no separaban un caso de otro. Una señal que no discrimina no es una
+   señal, es ruido con nombre de heurística.
+
+   La tentación era apuntar `:parent-id` a la intención que originó el resultado. Se
+   descartó: el enlace paso↔resultado ya existe y es el `:step` del `verdict`, que es
+   donde debe estar. Añadir un segundo enlace al mismo hecho habría creado justo el
+   problema que se quería cerrar.
+
+   `:parent-id` queda en `agent-todo`, donde significa algo de verdad: la jerarquía de
+   goals (`"root"` por defecto). Fijado por `protocol/un-nombre-no-puede-decir-dos-cosas`.
+
+3. ~~**`batch-complete` es un nombre que miente.**~~ Resuelto: renombrado a `plan-done`,
+   y `batch-complete-p` a `plan-done-p`.
+
+   Con I5 ya no era tan falso — solo se aserta si no queda ningún goal abierto — pero el
+   nombre seguía mintiendo, y un nombre que miente se lleva por delante a quien lo lea
+   después, que es el siguiente que toque esto.
+
+   Renombrar sin borrar el nombre viejo deja dos vocabularios conviviendo, que es el
+   problema original con más pasos. El test afirma que `batch-complete` ya no lo emite
+   nadie, no solo que `plan-done` existe. Fijado por `protocol/plan-done-y-nada-mas`.
 4. **El aviso de truncación miente para `command-exec`.** Dice *"Use read_file or
    grep to inspect specifics"* (`src/context.lisp:177`), pero no se puede hacer
    `read_file` del stderr de un comando: no vive en un fichero localizable. El único

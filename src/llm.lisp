@@ -1162,7 +1162,6 @@ batch_execution_mode:
            (timestamp (get-universal-time))
            (data (append data
                          (list :turn-id (current-turn-id)
-                               :parent-id (current-turn-id)
                                :step step-id
                                :status :pending)))))
   t)
@@ -1231,7 +1230,7 @@ batch_execution_mode:
                                              (length open)
                                              (subseq open 0 (min 5 (length open))))))))
                        (assert (harness-fact
-                                (fact-type "batch-complete")
+                                (fact-type "plan-done")
                                 (timestamp (get-universal-time))
                                 (data (list :turn-id (current-turn-id)))))
                        (values nil response nil))))))))))

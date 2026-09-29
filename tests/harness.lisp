@@ -216,7 +216,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
       (ok error)
       (ok (= 0 (fact-count "intention"))))))
 
-(deftest batch-parsing/response-only-batch-completes
+(deftest batch-parsing/response-only-plan-dones
   (with-turn-engine
     (reset-turn-engine)
     (multiple-value-bind (ok-p response error)
@@ -224,7 +224,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
       (ng error)
       (ng ok-p)
       (ok (string= "listo" response))
-      (ok (= 1 (fact-count "batch-complete"))))))
+      (ok (= 1 (fact-count "plan-done"))))))
 
 (deftest batch-parsing/malformed-json-reported
   (with-turn-engine
@@ -941,7 +941,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
 
 (defun stuck-batch-json ()
   "Un lote que el modelo puede pedir indefinidamente: una tool_call y nada de
-   respuesta de texto, así que el bucle nunca encuentra batch-complete."
+   respuesta de texto, así que el bucle nunca encuentra plan-done."
   "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.lisp\"}}}]}")
 
 
@@ -1102,6 +1102,82 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                               (h::fact-data-of f)))
                           (h::collect-harness-facts)))
           #'< :key (lambda (d) (or (h::data-get d :step) 0)))))
+
+
+(deftest protocol/un-nombre-no-puede-decir-dos-cosas
+  "I6, segunda vuelta: :parent-id.
+
+   El mismo campo significa dos cosas. En AGENT-TODO es la jerarquia de goals
+   (por defecto \"root\"), y eso es real y se usa. En los hechos resultado vale
+   (current-turn-id), o sea :turn-id DUPLICADO con otro nombre. Y no era
+   inofensivo: SELECT-RELEVANT-FACTS da +score-causal+ (50 puntos) a cualquier
+   hecho que tenga :parent-id, para premiar la cadena causal. Como todos los
+   hechos resultado lo tenian, la bonificacion era para todos: 50 puntos de
+   relleno, sin discriminar nada. Una senal que no separa casos no es una senal.
+
+   Aqui no se inventa un nombre nuevo. El enlace paso-resultado YA existe y es
+   el :step del VERDICT, que es donde debe estar. Asi que :parent-id se queda en
+   goals, donde significa algo, y la senal causal vuelve a significar algo."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir))
+      (with-turn-engine
+        (reset-turn-engine)
+        (h::write-file "uno.txt" "a")
+        (h::read-file "uno.txt")
+        (h::edit-file "uno.txt" "a" "b")
+        (h::exec-command "true")
+        (let ((liars (remove nil
+                             (mapcar (lambda (f)
+                                       (let ((d (h::fact-data-of f)))
+                                         (and (h::data-get d :parent-id)
+                                              (eql (h::data-get d :parent-id)
+                                                   (h::data-get d :turn-id))
+                                              (h::fact-type-of f))))
+                                     (h::collect-harness-facts)))))
+          (ok (null liars)
+              (format nil "ningun hecho resultado lleva :parent-id copiando :turn-id; hay ~D"
+                      (length liars))))
+        ;; Y la jerarquia de goals sigue intacta: ese uso es real. AGENT-TODO
+        ;; guarda sus campos en SLOTS del DSL, no en un plist :data, asi que
+        ;; fact-data-of devuelve NIL ahi y hay que leerlos por slot.
+        ;;
+        ;; Y el slot se lee con el simbolo CUANTIFICADO: desde este paquete,
+        ;; 'parent-id es un simbolo distinto del que el template de Lisa/Rete
+        ;; declaro en CL-HARNESS, y get-slot-value devuelve NIL sin avisar. No
+        ;; era un fallo de arranque ni una rareza del harness: era un simbolo
+        ;; distinto, y eso no se debuggea solo.
+        (h::add-todo "Write uno.txt" :status "in-progress")
+        (let ((goal (first (h::collect-active-todos))))
+          (ok (and goal
+                   (string= (h::get-slot-value goal 'h::parent-id) "root"))
+              "el :parent-id de un goal sigue siendo su jerarquia, no el turno")
+          (ok (not (eql (h::get-slot-value goal 'h::parent-id)
+                        (h::get-slot-value goal 'h::turn-id)))
+              "y no es su turno: los dos campos ya no dicen lo mismo"))))))
+
+
+(deftest protocol/plan-done-y-nada-mas
+  "El nombre del hecho de fin de turno decia una cosa y hacia otra.
+
+   BATCH-COMPLETE significaba 'el modelo mando tool_calls vacio', no 'el trabajo
+   esta hecho'. Con I5 ya no es tan falso -- solo se aserta si no queda ningun
+   goal abierto -- pero el nombre seguia mintiendo, y un nombre que miente se
+   lleva por delante a quien lo lea, que es el siguiente que toque esto.
+
+   Se renombra a plan-done, que es lo que afirma, y el test fija que el nombre
+   viejo desaparece: renombrar sin quitar el viejo deja dos vocabularios
+   conviviendo, que es el problema original."
+  (with-turn-engine
+    (reset-turn-engine)
+    (multiple-value-bind (parsed response error)
+        (h::parse-llm-batch-to-intentions
+         "{\"tool_calls\":[],\"response\":\"Listo\"}")
+      (ok (null error) "un DONE sin goals abiertos se acepta")
+      (ok (= 0 (fact-count "batch-complete"))
+          "el nombre viejo 'batch-complete' ya no lo emite nadie")
+      (ok (= 1 (fact-count "plan-done"))
+          "se llama plan-done, que es lo que significa")
+      (ok (h::plan-done-p) "y el predicado se llama igual"))))
 
 
 (deftest protocol/el-plan-sobrevive-a-la-ejecucion
@@ -1296,7 +1372,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
   "I5: tool_calls vacio es una PROPUESTA de fin de turno, no un hecho.
 
    HOY FALLA. PARSE-LLM-BATCH-TO-INTENTIONS, cuando no hay intenciones,
-   aserta batch-complete y devuelve la respuesta tal cual, sin mirar si queda
+   aserta plan-done y devuelve la respuesta tal cual, sin mirar si queda
    trabajo por hacer. El modelo puede mandar {\"tool_calls\":[],
    \"response\":\"Listo\"} con tres goals abiertos y el harness lo acepta como
    turno completado. Es la fuga de ejecutor en su forma mas desnuda: la
@@ -1306,7 +1382,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
     (h::add-todo "Write pendiente.txt" :status "in-progress")
     (h::parse-llm-batch-to-intentions
      "{\"tool_calls\":[],\"response\":\"Listo, todo hecho\"}")
-    (ok (not (h::batch-complete-p))
+    (ok (not (h::plan-done-p))
         "con un goal abierto, DONE no puede aceptarse como completado")
     (ok (= 1 (length (active-todos)))
         "y el goal sigue abierto, no se cerro por decreto del modelo")))

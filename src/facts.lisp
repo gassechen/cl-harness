@@ -16,9 +16,16 @@
 ;;; ============================================
 ;;; Causal metadata (Phase 2)
 ;;; ============================================
-;;; Every fact carries :turn-id / :parent-id INSIDE its data plist (not a
-;;; template slot) so persistence, dedup and YAML rendering need no change.
-;;; Linkage is captured at ingestion, never derived by rules.
+;;; Every fact carries :turn-id INSIDE its data plist (not a template slot) so
+;;; persistence, dedup and YAML rendering need no change. Linkage is captured at
+;;; ingestion, never derived by rules.
+;;;
+;;; :parent-id NO se pone en los hechos resultado. Antes valia lo mismo que
+;;; :turn-id, y un campo que repite otro bajo otro nombre no es un campo: es una
+;;; segunda puerta por la que colarse. Peor: select-relevant-facts paga +50 por
+;;; tenerlo, asi que la bonificacion causal era para todos los resultados y no
+;;; discriminaba nada. Ahora :parent-id queda solo en AGENT-TODO, donde significa
+;;; de verdad la jerarquia de goals, y la senal causal vuelve a senal.
 
 (defparameter *turn-counter* 0
   "Monotonic turn number; incremented at the start of each process-turn.")

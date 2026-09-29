@@ -111,8 +111,7 @@
                                             :output output
                                             :exit-code code
                                             :timed-out timed-out
-                                            :turn-id (current-turn-id)
-                                            :parent-id (current-turn-id)))))
+                                            :turn-id (current-turn-id)))))
           (when *debug-mode*
             (format t "~&[DEBUG exec-command] cmd=~A exit=~A output-len=~A~%"
                     command code (length output))
@@ -136,8 +135,7 @@
                                             :output output
                                             :exit-code -1
                                             :launch-failed t
-                                            :turn-id (current-turn-id)
-                                            :parent-id (current-turn-id)))))
+                                            :turn-id (current-turn-id)))))
           (when *debug-mode*
             (format t "~&[DEBUG exec-command] cmd=~A exit=-1 error=~A~%" command e))
           (list :command command :output output :exit-code -1 :launch-failed t))))))
@@ -155,8 +153,7 @@
                                 (data (list :path (namestring full)
                                             :applied t
                                             :contents contents
-                                            :turn-id (current-turn-id)
-                                            :parent-id (current-turn-id)))))
+                                            :turn-id (current-turn-id)))))
           (list :path (namestring full) :applied t :contents contents))
         ;; I6: el fallo tiene NOMBRE. Antes se colaba dentro de :contents con
         ;; el string "ERROR: File not found: ...", con lo que el hecho parecia
@@ -168,8 +165,7 @@
                                 (data (list :path (namestring full)
                                             :applied nil
                                             :reason missing
-                                            :turn-id (current-turn-id)
-                                            :parent-id (current-turn-id)))))
+                                            :turn-id (current-turn-id)))))
           (list :path (namestring full) :applied nil :reason missing)))))
 
 (defun count-occurrences (text needle)
@@ -206,8 +202,7 @@
                               (data (list :path (namestring full)
                                           :applied nil
                                           :reason why
-                                          :turn-id (current-turn-id)
-                                          :parent-id (current-turn-id)))))
+                                          :turn-id (current-turn-id)))))
         (return-from edit-file
           (list :path (namestring full)
                 :applied nil
@@ -224,8 +219,7 @@
                                          (data (list :path (namestring full)
                                                      :applied nil
                                                      :reason why
-                                                     :turn-id (current-turn-id)
-                                                     :parent-id (current-turn-id)))))
+                                                     :turn-id (current-turn-id)))))
                    (return-from edit-file
                      (list :path (namestring full) :applied nil :reason why)))))
            (pos (search old-string contents)))
@@ -237,8 +231,7 @@
                                     (data (list :path (namestring full)
                                                 :applied nil
                                                 :reason why
-                                                :turn-id (current-turn-id)
-                                                :parent-id (current-turn-id)))))
+                                                :turn-id (current-turn-id)))))
               (list :path (namestring full) :applied nil :reason why)))
           (let* ((new-contents
                    (concatenate 'string
@@ -256,8 +249,7 @@
                                               :replaced-chars (length old-string)
                                               :new-chars (length new-string)
                                               :matches hits
-                                              :turn-id (current-turn-id)
-                                              :parent-id (current-turn-id)))))
+                                              :turn-id (current-turn-id)))))
             (list :path (namestring full)
                   :applied t
                   :matches hits
@@ -294,8 +286,7 @@
                                               :applied nil
                                               :refused t
                                               :reason why
-                                              :turn-id (current-turn-id)
-                                              :parent-id (current-turn-id)))))
+                                              :turn-id (current-turn-id)))))
             (return-from write-file
               (list :path (namestring full)
                     :applied nil
@@ -312,7 +303,6 @@
                             (data (list :path (namestring full)
                                         :applied t
                                         :bytes bytes
-                                        :turn-id (current-turn-id)
-                                        :parent-id (current-turn-id)))))
+                                        :turn-id (current-turn-id)))))
       (list :path (namestring full) :applied t :bytes bytes))))
 

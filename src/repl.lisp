@@ -295,7 +295,7 @@ working context via structured facts. Help them with their task."))
               while (and response
                          (< i max-rounds)
                          (not (search "[LLM ERROR]" response :test #'char=))
-                         (not (batch-complete-p)))
+                         (not (plan-done-p)))
               do (let ((fingerprint (batch-fingerprint response)))
                 (if (and (plusp (batch-repeat-tolerance))
                          (gethash fingerprint seen))
@@ -325,7 +325,7 @@ working context via structured facts. Help them with their task."))
         (when (and (not aborted)
                    response
                    (not (search "[LLM ERROR]" response :test #'char=))
-                   (not (batch-complete-p)))
+                   (not (plan-done-p)))
         ;; The loop only ends early on those three conditions, so reaching
         ;; here with a pending batch means batch_max_iterations ran out.
         (setf aborted :iterations))
@@ -415,13 +415,13 @@ working context via structured facts. Help them with their task."))
       (error () (batch-content-hash response response)))))
 
 
-(defun batch-complete-p (&optional (turn *turn-counter*))
+(defun plan-done-p (&optional (turn *turn-counter*))
   "Retorna T si Rete dice que el batch del turno actual terminó."
   (some (lambda (f)
           (eql (data-get (fact-slot f 'data) :turn-id) turn))
         (mapcar #'first
                 (retrieve (?f) (?f (harness-fact
-                                    (fact-type "batch-complete")))))))
+                                    (fact-type "plan-done")))))))
 
 
 

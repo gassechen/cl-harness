@@ -306,8 +306,7 @@
                                        (data-get ?db :command)
                                        (data-get ?dc :command))
                        :count 3
-                       :turn-id (data-get ?da :turn-id)
-                       :parent-id (data-get ?da :turn-id))))))
+                       :turn-id (data-get ?da :turn-id))))))
 
 (defun read-triple-p (da db dc)
   "Rete TEST for detect-read-triple: three file-read facts from the SAME turn
@@ -337,8 +336,7 @@
            (data (list :kind "read-loop"
                        :path (or (data-get ?da :path) "")
                        :count 3
-                       :turn-id (data-get ?da :turn-id)
-                       :parent-id (data-get ?da :turn-id))))))
+                       :turn-id (data-get ?da :turn-id))))))
 
 
 (defrule prevent-duplicate-read (:salience 15)
