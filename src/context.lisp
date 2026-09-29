@@ -399,21 +399,42 @@
         (dotimes (i (- (length oldest) max-todos))
           (retract (nth i oldest)))))))
 
-(defun plan-block (facts)
-  "El PLAN del turno actual con el veredicto del harness al lado de cada paso.
+(defun cobol-step-label (n)
+  "El paso N con la numeracion de COBOL: 01, 02, ... 12.
 
-   PROTOCOLO: esto es el JOIN entre lo que el modelo pidio y lo que la maquina
-   hizo. Sin el, el modelo recibe una lista de veredictos sin dueño ('el paso 2
-   fallo') y no puede reintentar bien, porque no sabe que era el paso 2.
+   Un entero a secas ('3') no dice nada. El numero de dos digitos con punto es
+   lo que hace que esto se lea como un programa y no como un log, y de paso da
+   ancho de columna fijo, que es lo que hace el formato legible de un vistazo."
+  (format nil "~2,'0D." n))
 
-   Un paso sin veredicto se imprime como PENDING. Eso es lo que convierte el
-   contexto en un estado de la maquina en vez de un parte de prensa: el modelo
-   ve que le queda trabajo, no solo lo que ya se rompio.
+(defun render-plan-card (facts)
+  "El PLAN como tarjeta COBOL: lo que el LLM pidio y lo que la maquina respondio.
 
-   Tolera hechos basura a proposito. Si un batch-plan llega sin :step, o con un
-   :step que no es un entero, se SALTA. Perder el estado de los pasos buenos
-   por un dato sucio en uno seria la peor forma de perderlo, porque ademas
-   seria silenciosa. Un renderer que casca aqui tumba el turno entero."
+   NO es decoracion. El formato ES el mecanismo de seguridad del protocolo:
+
+     - La seccion que el modelo controla (sus pasos) y la que la maquina
+       controla (los veredictos) estan SEPARADAS por division. Un modelo que
+       quisiera declarar su propio exito tendria que escribir en la division
+       de la maquina, que es la que el harness rellena. En el YAML plano el
+       veredicto viajaba en la misma clave que la accion, al lado: nada
+       impedia que el modelo se lo escribiera solo.
+
+     - IDENTITY DIVISION lleva de quien es la tarjeta. Sin eso, un veredicto
+       de un turno viejo es indistinguible de uno recien emitido, y el modelo
+       reintenta cosas que ya se完之后.
+
+     - DATA DIVISION lleva GOAL ABIERTO, la cuenta que I5 ya hacia calcular y
+       que hasta ahora vivia escondida dentro de open-goal-tasks. Aqui el
+       modelo ve sus bananas en el mismo sitio donde ve su plan, que es donde
+       tiene sentido que mire antes de decidir el proximo turno.
+
+   PENDING es lo que la hace estado de maquina y no parte de prensa: lo que
+   no se ha ejecutado se ve.
+
+   Tolera hechos basura, como el renderer anterior: un batch-plan sin :step, o
+   con un :step que no es entero, se SALTA. Perder el estado de los pasos
+   buenos por un dato sucio en uno seria la peor forma de perderlo, porque
+   ademas seria silenciosa."
   (let* ((steps (remove nil
                         (mapcar (lambda (d)
                                   (let ((n (data-get d :step)))
@@ -423,25 +444,47 @@
     (when steps
       (let ((order (sort steps #'< :key (lambda (d) (data-get d :step)))))
         (with-output-to-string (s)
-          (format s "  plan:~%")
+          (format s "~&IDENTIFICATION DIVISION.~%")
+          (format s "PROGRAM-ID. ~A.~%" (or *session-id* "SESSION"))
+          (format s "~%PROCEDURE DIVISION.~%")
           (dolist (d order)
             (let* ((n (data-get d :step))
                    (v (find-if (lambda (vd) (eql (data-get vd :step) n)) verdicts))
                    (verdict (data-get v :verdict))
                    ;; OJO: :APPLIED y :FAILED son keywords y los dos son
                    ;; truthy. Hay que COMPARAR para decidir cual es cual; con un
-                   ;; test de verdad, todo saldría 'applied'.
+                   ;; test de verdad, todo saldria 'applied'.
                    (state (if v
                               (string-downcase
                                 (symbol-name (if (keywordp verdict) verdict :failed)))
                               "pending")))
-              (format s "    - step: ~A~%" n)
-              (format s "      action: ~A~%" (or (data-get d :action) "?"))
-              (format s "      target: ~A~%" (escape-yaml (or (data-get d :target) "")))
-              (format s "      verdict: ~A~%" state)
+              (format s "    ~A  ~A  ~A~%"
+                      (cobol-step-label n)
+                      (cobol-verb (or (data-get d :action) "?"))
+                      (or (data-get d :target) "-"))
+              (format s "        STATE = ~A~%"
+                      (string-upcase state))
               (let ((why (data-get v :reason)))
                 (when why
-                  (format s "      reason: ~A~%" (escape-yaml why)))))))))))
+                  (format s "        REASON = ~A~%" why)))))
+          (format s "~%DATA DIVISION.~%")
+          (let ((open (open-goal-tasks)))
+            (format s "~%GOAL ABIERTO. ~D~%"
+                    (length open))
+            (dolist (g open)
+              (format s "    ~A~%" g)))
+          (format s "~%GOBACK.~%"))))))
+
+
+(defun cobol-verb (action)
+  "La accion tal cual la escribio el modelo, enmayusculada.
+
+   Sin traducir. READ-FILE se queda READ-FILE: el mismo token que el modelo
+   escribio, para que pueda comparar lo que pidio con lo que se ejecuto. Una
+   tabla de sinonimos aqui seria otra fuente de verdad mas que puede
+   contradecir al modelo, y su memoria no tiene por que pasar por ella."
+  (string-upcase (princ-to-string action)))
+
 
 
 (defun grouped-context-string (facts now-turn)
@@ -556,10 +599,15 @@
           (format s "    baseline_turn: ~A~%" (get-slot-value epoch 'baseline-seq))
           (format s "    summary: ~A~%" (escape-yaml (get-slot-value epoch 'summary))))
 
-        ;; PROTOCOLO: el plan del turno con sus veredictos, antes de los goals.
+        ;; PROTOCOLO: el plan del turno como TARJETA COBOL, antes de los goals.
         ;; Primero porque es lo que acaba de hacer el modelo y lo que decide su
         ;; siguiente turno; los goals son el marco de fondo.
-        (let ((plan (plan-block facts)))
+        ;;
+        ;; Va dentro del bloque context: y en indented, y no suelto arriba. La
+        ;; tarjeta es texto plano con su propio formato, y la clave del sistema
+        ;; es que cada bloque tenga un renderizador con el suyo. Mezclarla aqui
+        ;; seria el camino corto a un formato que no se puede parsear de vuelta.
+        (let ((plan (render-plan-card facts)))
           (when plan
             (format s "~A" plan)))
         

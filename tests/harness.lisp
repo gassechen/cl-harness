@@ -1060,37 +1060,28 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
               (h::collect-harness-facts))))
 
 
-(defun sibling-key-line-p (line)
-  "Verdadero si LINE es una clave del mismo nivel que 'plan:'.
 
-   O sea: exactamente dos espacios de sangria y texto detras. Los hijos del
-   bloque van a cuatro espacios, asi que un indice 2 que sea espacio significa
-   que estamos dentro, no en el hermano siguiente."
-  (and line
-       (> (length line) 2)
-       (char= (char line 0) #\Space)
-       (char= (char line 1) #\Space)
-       (not (char= (char line 2) #\Space))))
+(defun card-section (ctx)
+  "El TRAMO de la tarjeta COBOL: desde 'PROCEDURE DIVISION.' hasta 'DATA DIVISION.'.
 
+   Se recorta por los DOS extremos de la seccion, no por sangria. Con el YAML
+   plano habia que inferir el final por 'la siguiente clave de nivel 2', una
+   regla sobre ESPACIOS que se rompe en cuanto un valor contiene un salto de
+   linea. Con la tarjeta los limites los pone el propio formato, y por eso una
+   de las Dividendas del cambio es que el recorte ya no tiene que adivinar.
 
-(defun plan-section (yaml)
-  "El TRAMO del bloque plan: de la linea '  plan:' hasta la siguiente clave de
-   nivel 2.
-
-   Hace falta por dos razones. SEARCH devuelve un INDICE, no un substring: usarlo
-   directo como texto hacia que 'step: 1' pasara por culpa del bloque de
-   verdictos, que tambien lleva step. Y un corte ingenuo con el patron de
-   newline+dos espacios se trunca al instante, porque el propio '  plan:' ya
-   empieza por dos espacios y los hijos del bloque van a cuatro."
-  (let ((lines (uiop:split-string yaml :separator '(#\Newline))))
-    (let ((start (position "  plan:" lines :test #'string=)))
-      (if (null start)
+   El motivo de recortarla en vez de buscar en el contexto entero es el mismo
+   de antes: SEARCH devuelve un indice, no un texto. Buscar 'APPLIED' en todo
+   el contexto podria dar el acierto por el bloque equivocado, y el test
+   pasaria sin que la tarjeta tuviera nada que ver."
+  (let ((lines (uiop:split-string ctx :separator '(#\Newline))))
+    (let ((start (position "PROCEDURE DIVISION." lines :test #'string=))
+          (end (position "DATA DIVISION." lines :test #'string=)))
+      (if (or (null start) (null end) (<= end start))
           ""
           (with-output-to-string (s)
-            (loop for i from start
-                  for line = (nth i lines)
-                  while (and line (or (= i start) (not (sibling-key-line-p line))))
-                  do (format s "~A~%" line)))))))
+            (loop for i from start below end
+                  do (format s "~A~%" (nth i lines))))))))
 
 
 (defun batch-plan-facts ()
@@ -1207,6 +1198,93 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
         (ok (not (search "coding assistant" (or got "")))
             "y no se le anade doctrina de opencode por debajo")))))
 
+
+(deftest protocol/el-plan-se-lee-como-un-programa-cobol
+  "El PLAN no es YAML: es un programa de COBOL por tarjetas, y se lee asi.
+
+   Este es el test PRIMERO, como toca: fija la forma antes de que exista el
+   codigo que la produce. Al reves, el codigo dicta la forma y despues se
+   escribe el test que lo consagra -- que es como el formato real acabo siendo
+   logfmt en PROTOCOLO.md, un formato que nunca implemento nadie.
+
+   Por que COBOL y no YAML. YAML es lo que consume un LLM moderno sin
+   esfuerzo. COBOL es lo que declara el CONTRATO: campos en columna fija,
+   jerarquia explicita, y sobre todo una division entre lo que el LLM escribe y
+   lo que la maquina responde. En PLAN eso es literal: el modelo perfora la
+   tarjeta, y el veredicto lo rellena la maquina. El formato ES el mecanismo.
+   En YAML el modelo podia escribir su propio veredicto sin que nada se lo
+   impidiera; aqui el veredicto viaja en una seccion que el modelo no controla.
+
+   Y una division mas, que es la que I5 ya necesitaba y no tenia donde
+   esconderse: PROCEDURE DIVISION lleva GOAL ABIERTO. El LLM ve sus bananas
+   pendientes en el mismo lugar donde ve su plan, que es donde tiene sentido
+   que las mire.
+
+   El test comprueba las tres divisiones y que el veredicto de la maquina
+   sobrevive al viaje de ida y vuelta."
+  (with-temp-dir (dir)
+    (let ((*base-dir* dir))
+      (with-turn-engine
+        (reset-turn-engine)
+        (h::write-file "uno.txt" "contenido real\n")
+        (h::parse-llm-batch-to-intentions
+         "{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"uno.txt\"}},{\"name\":\"edit_file\",\"arguments\":{\"path\":\"uno.txt\",\"old_string\":\"no esta\",\"new_string\":\"x\"}},{\"name\":\"write_file\",\"arguments\":{\"path\":\"dos.txt\",\"content\":\"hola\"}}]}")
+        (h::run)
+        ;; Se pasa la lista CRUDA a proposito: la tarjeta se dibuja desde los
+        ;; hechos, no desde el texto ya renderizado, para que el test mida el
+        ;; dato y no el formato viejo. Se llama directo en vez de por un helper
+        ;; porque un defun suelto aqui no lo ve el cuerpo del deftest, y un
+        ;; "unbound" ahi habria hecho depurar el sitio equivocado.
+        (let ((card (h::render-plan-card (h::collect-harness-facts))))
+          ;; 1. Las tres divisiones, con su nombre exacto. Un formato con las
+          ;; divisiones equivocadas no es "casi COBOL", es otro formato.
+          (ok (search "IDENTIFICATION DIVISION." card)
+              "IDENTIFICATION DIVISION: quien produjo la tarjeta")
+          (ok (search "PROCEDURE DIVISION." card)
+              "PROCEDURE DIVISION: los pasos y sus veredictos")
+          (ok (search "DATA DIVISION." card)
+              "DATA DIVISION: el estado de la maquina")
+
+          ;; 2. El paso conserva su identidad a traves del viaje. Sin esto el
+          ;; modelo recibe 'algo fallo' y no sabe reintentar.
+          (ok (search "01." card) "el paso se numera a la COBOL, con punto")
+          (ok (search "READ-FILE" card) "cada paso conserva su ACCION")
+          (ok (search "uno.txt" card) "y su OBJETIVO")
+
+          ;; 3. Veredicto por paso, con el que puso la maquina.
+          (ok (search "APPLIED" card) "un paso que funciono dice APPLIED")
+          (ok (search "FAILED" card) "y uno que fallo dice FAILED")
+          ;; 4. PENDING se comprueba mas abajo, en su propio turno: aqui los tres
+          ;; pasos se ejecutaron, y buscar PENDING en esta tarjeta solo pasaria
+          ;; por el motivo equivocado. Ver la tarjeta final.
+          ;; 5. El motivo viaja. Sin el, FAILED no dice nada accionable.
+          (ok (search "REASON" card) "y el motivo del rechazo es parte del registro")
+
+          ;; PENDING va en su propia tarjeta, y en un turno propio. Meterlo aqui
+          ;; exigia fabricarse un batch-abort a mano, y lo que se ended verificando
+          ;; era que yo habia asertado un batch-abort, no que el harness produce
+          ;; un PENDING. Este caso sale solo: un plan de un paso que se cancela
+          ;; ANTES de ejecutarse, que es exactamente como se queda trabajo
+          ;; colgando en la vida real.
+          (h::reset-turn-engine)
+          (h::assert-batch-intention (list :action :write-file :target "nunca.txt"
+                                           :content "x" :step 1) 1)
+          ;; Se cancela la intencion, no el plan. Se dispara la REGLA de verdad
+          ;; (cancel-intentions-on-abort) en vez de retractar a mano: retract es
+          ;; una primitiva de Rete con firma propia y lo que interesa comprobar
+          ;; es que el harness produce el PENDING solo, no que se lo sepamos
+          ;; fabricar. Si el plan se fuera con la intencion, PENDING seria
+          ;; imposible por construccion y la seccion entera no significaria nada.
+          (h::assert (h::harness-fact (h::fact-type "batch-abort")
+                                      (h::timestamp (get-universal-time))
+                                      (h::data (list :reason "Abort de prueba"
+                                                     :turn-id 1))))
+          (h::run)
+          (let ((card2 (h::render-plan-card (h::collect-harness-facts))))
+            (ok (search "PENDING" card2)
+                "un plan sin ejecutar se declara PENDING, no desaparece")
+            (ok (search "01." card2)
+                "y conserva su numero de paso aunque no se haya ejecutado")))))))
 
 (deftest protocol/plan-done-y-nada-mas
   "El nombre del hecho de fin de turno decia una cosa y hacia otra.
@@ -1544,17 +1622,18 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                                     (h::timestamp (get-universal-time))
                                     (h::data (list :reason "Blind write attempt" :turn-id 1))))
         (let* ((plans (batch-plan-facts))
-               (yaml (build-yaml-context "sigue"))
-               (plan (plan-section yaml)))
+               (ctx (build-yaml-context "sigue"))
+               (plan (card-section ctx)))
           (ok (= 3 (length plans))
               (format nil "los 3 pasos del plan quedan registrados; hay ~D" (length plans)))
           (ok (and (equal 1 (h::data-get (first plans) :step))
                    (eql :write-file (h::data-get (first plans) :action)))
               "y en orden, con su numero de paso y su accion")
-          (ok (search "plan:" yaml) "el plan se renderiza en el contexto")
-          (ok (search "step: 1" plan) "el bloque lista los pasos")
-          (ok (search "applied" plan) "con el veredicto del harness al lado")
-          (ok (search "pending" plan)
+          (ok (search "PROCEDURE DIVISION." ctx)
+              "el plan se renderiza como tarjeta COBOL en el contexto")
+          (ok (search "01." plan) "el bloque lista los pasos numerados a la COBOL")
+          (ok (search "APPLIED" plan) "con el veredicto del harness al lado")
+          (ok (search "PENDING" plan)
               "un paso sin ejecutar se ve PENDING: el estado de la maquina, no un parte")
           (ok (search "old_string not found" plan)
               "el motivo del fallo queda unido a SU paso"))))))
@@ -1586,11 +1665,12 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                                     (h::data (list :step "no-so-numero" :action :read-file
                                                    :turn-id 1))))
         ;; Esto NO debe lanzar: es el fallo que se vigila.
-        (let ((yaml (build-yaml-context "sigue")))
-          (ok (search "plan:" yaml) "los pasos validos se siguen mostrando")
-          (ok (search "step: 1" yaml))
-          (ok (search "step: 2" yaml))
-          (ok (search "step: 3" yaml)
+        (let ((ctx (build-yaml-context "sigue")))
+          (ok (search "PROCEDURE DIVISION." ctx)
+              "los pasos validos se siguen mostrando")
+          (ok (search "01." ctx))
+          (ok (search "02." ctx))
+          (ok (search "03." ctx)
               "un paso sin numero no borra a los demas"))))))
 
 
