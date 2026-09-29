@@ -36,27 +36,24 @@
        (emergency-flush)
        (sb-ext:exit :code 130)))))
 
+
 (defun one-shot-message ()
   "Resolve the one-shot prompt without exposing it in the process argv.
-   Prefers CL_HARNESS_PROMPT (so an agent's `pkill -f <prompt fragment>`
-   cannot match this process); falls back to joined argv for compatibility.
-   Returns NIL when no message was given (interactive REPL)."
+   Filtra el flag --debug para que no se meta en el mensaje."
   (let ((env (sb-ext:posix-getenv "CL_HARNESS_PROMPT"))
-        (args (rest sb-ext:*posix-argv*)))
+        (args (remove "--debug" (rest sb-ext:*posix-argv*) :test #'string=)))
     (cond
       ((and env (plusp (length env))) env)
       (args (format nil "~{~A~^ ~}" args))
       (t nil))))
 
 (defun standalone-toplevel ()
-  "Toplevel for a standalone executable built WITHOUT a baked session
-   (build.sh → bin/cl-harness). Fresh engine at boot: config.json/dumps/
-   sessions/metrics resolve against the runtime working directory, so the
-   binary can be copied anywhere. One-shot message via CL_HARNESS_PROMPT (or
-   argv fallback); otherwise the interactive REPL."
+  "Toplevel for a standalone executable."
   (install-signal-handlers)
   (with-simple-restart (abort "Exit cl-harness (aborted)")
-    (let ((message (one-shot-message)))
+    (let* ((debug-p (member "--debug" sb-ext:*posix-argv* :test #'string=))
+           (message (one-shot-message)))
       (if message
-          (run-one-shot message t)
+          (run-one-shot message :reset-engine t :debug debug-p)
           (start-harness t)))))
+

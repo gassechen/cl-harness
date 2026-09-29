@@ -286,8 +286,11 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
         (reset-turn-engine)
         (let ((result (h::edit-file "code.lisp" "" "(defun b () 2)")))
           (ng (getf result :applied) "un old_string vacío no debe aplicarse")
-          (ok (getf result :error))
-          (ok (search "old_string" (getf result :error)))
+          ;; I6: el motivo del rechazo se llama :reason en TODO el sistema.
+          ;; Antes estos tests afirmaban sobre :error, que era la mitad del
+          ;; mismo concepto con dos nombres.
+          (ok (getf result :reason))
+          (ok (search "old_string" (getf result :reason)))
           (ng (getf result :matches))))
       (ok (string= "(defun a () 1)" (read-temp path))
           "el archivo no debe tocarse"))))
@@ -302,7 +305,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
         (reset-turn-engine)
         (let ((result (h::edit-file "code.lisp" "(defun zzz () 9)" "x")))
           (ng (getf result :applied))
-          (ok (search "not found" (getf result :error)))))
+          (ok (search "not found" (getf result :reason)))))
       (ok (string= "(defun a () 1)" (read-temp path))))))
 
 (deftest actions/edit-file-replaces-first-occurrence
@@ -326,7 +329,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
         (reset-turn-engine)
         (let ((result (h::edit-file "no-existe.lisp" "a" "b")))
           (ng (getf result :applied))
-          (ok (search "not found" (getf result :error))))))))
+          (ok (search "not found" (getf result :reason))))))))
 
 (deftest actions/write-file-refuses-large-existing
   (with-temp-dir (dir)
@@ -338,7 +341,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
         (reset-turn-engine)
         (let ((result (write-file "big.lisp" "nuevo")))
           (ok (getf result :refused) "un archivo existente grande no se sobrescribe")
-          (ok (search "edit_file" (getf result :error)))))
+          (ok (search "edit_file" (getf result :reason)))))
       (ok (> (with-open-file (s path) (file-length s)) 2000)
           "el archivo original no debe truncarse"))))
 
@@ -356,8 +359,13 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
     (let ((h::*base-dir* dir))
       (with-turn-engine
         (reset-turn-engine)
-        (let ((contents (getf (read-file "no-existe.lisp") :contents)))
-          (ok (search "File not found" contents)))))))
+        ;; I6: el motivo ya no se disfraza de contenido. Este test afirmaba
+        ;; que :contents contendria "File not found", o sea, que un hecho
+        ;; file-read fallido era indistinguible de una lectura buena.
+        (let* ((result (read-file "no-existe.lisp"))
+               (contents (getf result :contents)))
+          (ok (search "File not found" (getf result :reason)))
+          (ok (not contents) "y :contents NO lleva el error dentro"))))))
 
 (deftest actions/count-occurrences
   (ok (= 0 (h::count-occurrences "abc" "z")))
@@ -512,9 +520,248 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
           (ok (search "session-test-123" yaml))
           (ok (search "hola" yaml)))))))
 
-;;; ---------------------------------------------------------------
-;;; Configuración: límites de batch y política de reintentos
-;;; ---------------------------------------------------------------
+;;;; ---------------------------------------------------------------
+;;;; Goals: cierre, deduplicacion, orden y poda
+;;;; ---------------------------------------------------------------
+
+(defun todo-slot (todo name)
+  "Slot NAME of a goal fact, read with the symbol interned in CL-HARNESS.
+
+   The deftemplates live in CL-HARNESS, so their slot keys are CL-HARNESS
+   symbols; a bare 'status here would be CL-HARNESS/TESTS::STATUS and quietly
+   read NIL."
+  (h::get-slot-value todo (find-symbol (string-upcase name) :cl-harness)))
+
+(defun active-todos ()
+  (sort (mapcar #'first (h::retrieve (?t) (?t (h::agent-todo))))
+        #'<
+        :key (lambda (todo)
+               (h::todo-id-number (todo-slot todo "id")))))
+
+(deftest goals/same-turn-duplicate-is-one-goal
+  "El mismo objetivo pedido dos veces en un turno es UN goal, no dos: el modelo
+   recibe el mismo texto con dos numeros distintos y lo toma por dos tareas."
+  (with-turn-engine
+    (reset-turn-engine)
+    (let ((first-id (h::add-todo "Read src/app.lisp" :status "pending"))
+          (second-id (h::add-todo "Read src/app.lisp" :status "in-progress")))
+      (ok (= 1 (length (active-todos)))
+          (format nil "un solo goal, hay ~D" (length (active-todos))))
+      (ok (string= first-id second-id)
+          "el segundo pedido devuelve el mismo id, no uno nuevo"))))
+
+(deftest goals/distinct-tasks-are-distinct
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::add-todo "Read src/app.lisp" :status "pending")
+    (h::add-todo "Read src/util.lisp" :status "pending")
+    (ok (= 2 (length (active-todos))))))
+
+(deftest goals/ordering-is-numeric-not-lexicographic
+  "Ordenar por texto daria todo-10 antes que todo-9: el modelo leeria sus goals
+   desordenados justo cuando ya hay muchos."
+  (ok (= 9 (h::todo-id-number "todo-9")))
+  (ok (= 10 (h::todo-id-number "todo-10")))
+  (ok (< (h::todo-id-number "todo-9") (h::todo-id-number "todo-10"))))
+
+(deftest goals/evidence-completes-a-matching-goal
+  "Escribir el archivo que el goal nombra es la evidencia de que se hizo.
+
+   OJO: el hecho va a mano, asi que tiene que llevar SIEMPRE los mismos campos
+   que pone WRITE-FILE de verdad. Al exigir :applied para todo verbo (no solo
+   para :edit), este fixture sin :applied dejo de contar como evidencia y el
+   test se rompio. Los hechos a mano se desincronizan del codigo en silencio:
+   por eso el campo va explicito aqui."
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::add-todo "Write app.py" :status "in-progress")
+    (h::assert (h::harness-fact (h::fact-type "file-write")
+                                (h::timestamp (get-universal-time))
+                                (h::data (list :path "/tmp/proyecto/app.py"
+                                               :applied t
+                                               :bytes 42
+                                               :turn-id (h::current-turn-id)))))
+    (h::reconcile-todos (h::collect-active-facts))
+    (ok (string= "completed" (todo-slot (first (active-todos)) "status"))
+        (format nil "quedo ~A" (todo-slot (first (active-todos)) "status")))))
+
+(deftest goals/unrelated-evidence-leaves-goal-open
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::add-todo "Write app.py" :status "in-progress")
+    (h::assert (h::harness-fact (h::fact-type "file-write")
+                                (h::timestamp (get-universal-time))
+                                (h::data (list :path "/tmp/otro-cosa.txt"
+                                               :bytes 7
+                                               :turn-id (h::current-turn-id)))))
+    (h::reconcile-todos (h::collect-active-facts))
+    (ok (string= "in-progress" (todo-slot (first (active-todos)) "status"))
+        "escribir otro archivo no cierra un goal que habla de otro")))
+
+(deftest goals/failed-edit-is-not-evidence
+  "Un edit con :applied nil NO cuenta: el archivo nunca cambio. Cerrar el goal
+   aqui era como el harness reportaba successes que no ocurrieron."
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::add-todo "Edit test.py" :status "in-progress")
+    (h::assert (h::harness-fact (h::fact-type "file-edit")
+                                (h::timestamp (get-universal-time))
+                                (h::data (list :path "/tmp/test.py"
+                                               :applied nil
+                                               :reason "old_string not found"
+                                               :turn-id (h::current-turn-id)))))
+    (h::reconcile-todos (h::collect-active-facts))
+    (ok (string= "in-progress" (todo-slot (first (active-todos)) "status"))
+        "un edit fallido no completa el goal")))
+
+(deftest goals/prune-keeps-open-goals
+  "Podar es solo para lo terminado. Un goal abierto que rebase el tope debe
+   seguir visible, o el modelo pierde el trabajo que le falta por hacer."
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::add-todo "sigue pendiente" :status "in-progress")
+    (h::add-todo "ya estaba hecho" :status "completed")
+    (h::add-todo "tambien hecho" :status "completed")
+    (with-test-config (("max_facts_per_type" 1))
+      (h::prune-finished-todos))
+    (let ((tasks (mapcar (lambda (todo) (todo-slot todo "task"))
+                         (active-todos))))
+      (ok (member "sigue pendiente" tasks :test #'string=)
+          "el goal abierto sobrevive a la poda")
+      (ok (not (member "ya estaba hecho" tasks :test #'string=))
+          "los completed son los que se podan")
+      (ok (member "tambien hecho" tasks :test #'string=)
+          "se conserva el completed mas reciente")
+      (ok (= 2 (length (active-todos)))
+          (format nil "quedan 2 goals, no ~D" (length (active-todos)))))))
+
+;;;; ---------------------------------------------------------------
+;;;; Orden causal de eventos
+;;;; ---------------------------------------------------------------
+
+(deftest context/same-second-events-keep-insertion-order
+  "get-universal-time tiene 1 segundo de resolucion: un file-write y un
+   command-exec del mismo turno comparten timestamp. Sin desempate, CL:SORT los
+   deja en orden arbitrario y el YAML puede ensenar que el comando corrio antes
+   de escribir el archivo que consumio."
+  (with-turn-engine
+    (reset-turn-engine)
+    (let ((t0 (get-universal-time)))
+      (h::assert (h::harness-fact (h::fact-type "file-write")
+                                  (h::timestamp (identity t0))
+                                  (h::data (list :path "/tmp/a.txt" :bytes 1 :turn-id 1))))
+      (h::assert (h::harness-fact (h::fact-type "command-exec")
+                                  (h::timestamp (identity t0))
+                                  (h::data (list :command "wc -l a.txt"
+                                                 :output "1"
+                                                 :exit-code 0
+                                                 :turn-id 1)))))
+    (let* ((types (mapcar #'h::fact-type-of (h::collect-active-facts))))
+      (ok (equal types '("file-write" "command-exec"))
+          (format nil "insertion order preservado, salio ~S" types)))))
+
+(deftest context/render-shows-file-write-before-its-command
+  "La version observable: el archivo que el comando leyo aparece antes que el
+   comando en el contexto que ve el modelo."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir)
+          (h:*session-id* "session-order-1"))
+      (with-turn-engine
+        (reset-turn-engine)
+        (h::add-todo "contar lineas" :status "in-progress")
+        (let ((t0 (get-universal-time)))
+          (h::assert (h::harness-fact (h::fact-type "file-write")
+                                      (h::timestamp (identity t0))
+                                      (h::data (list :path (format nil "~A/datos.txt" dir)
+                                                     :applied t
+                                                     :bytes 5
+                                                     :turn-id 1))))
+          (h::assert (h::harness-fact (h::fact-type "command-exec")
+                                      (h::timestamp (identity t0))
+                                      (h::data (list :command "wc -l datos.txt"
+                                                     :output "5"
+                                                     :exit-code 0
+                                                     :turn-id 1)))))
+        (let ((yaml (build-yaml-context "cuentalas")))
+          ;; Search the RENDERED KEYS, not the path: the goal task also mentions
+          ;; datos.txt, so searching the bare path would match the goals block.
+          (let ((wrote-at (search "wrote:" yaml))
+                (exec-at (search "exec:" yaml)))
+            (ok (and wrote-at exec-at (< wrote-at exec-at))
+                (format nil "wrote en ~S y exec en ~S" wrote-at exec-at))))))))
+
+;;;; ---------------------------------------------------------------
+;;;; Registro de la respuesta del modelo
+;;;; ---------------------------------------------------------------
+
+(deftest response/raw-batch-is-not-stored-as-speech
+  "Guardar el lote crudo hacia que el modelo, al turno siguiente, leyera sus
+   propias tool_calls como si fueran una declaracion previa. Se reemplaza por
+   lo que el lote REALMENTE hizo."
+  (with-turn-engine
+    (reset-turn-engine)
+    (let* ((turn (h::current-turn-id))
+           (blob "{\"tool_calls\":[{\"name\":\"write_file\"}],\"response\":\"\"}"))
+      (ok (h::raw-batch-blob-p blob) "el lote crudo se reconoce como lote")
+      (let ((out (h::conversational-response-p blob turn)))
+        (ok (null (search "tool_calls" out :test #'char=))
+            "el lote crudo no queda como texto de conversacion")
+        (ok (plusp (length out))
+            "se registra algo, no se pierde el turno")))))
+
+(deftest response/empty-becomes-factual-summary
+  "El modelo puede ejecutar el lote entero y dejar 'response' vacio. Antes eso
+   se guardaba como \"\": el turno quedaba registrado como un silencio aunque
+   hubiera trabajo real hecho."
+  (with-turn-engine
+    (reset-turn-engine)
+    (let* ((turn (h::current-turn-id)))
+      (h::assert (h::harness-fact (h::fact-type "file-write")
+                                  (h::timestamp (get-universal-time))
+                                  (h::data (list :path "/tmp/datos.txt"
+                                                 :bytes 12
+                                                 :turn-id turn))))
+      (let ((out (h::conversational-response-p "" turn)))
+        (ok (plusp (length out)) "no se guarda un turno vacio")
+        (ok (search "datos.txt" out :test #'char=)
+            (format nil "el resumen dice que se escribio, obtuve ~S" out))
+        (let ((out2 (h::conversational-response-p "   " turn)))
+          (ok (search "datos.txt" out2 :test #'char=)
+              "solo espacios tambien cuenta como respuesta vacia"))))))
+
+(deftest response/prose-mentioning-a-tool-is-kept
+  "La blacklist anterior buscaba \"read_file\"/\"write_file\" como subcadena, asi
+   que una respuesta normal que mencionara una herramienta se destruia. La
+   prueba ahora es estructural: solo se descarta lo que PARSEA como lote."
+  (with-turn-engine
+    (reset-turn-engine)
+    (let* ((turn (h::current-turn-id))
+           (prose "Voy a usar write_file para crear el modulo, y luego read_file para revisarlo.")
+           (out (h::conversational-response-p prose turn)))
+      (ok (string= prose out)
+          (format nil "la prosa se conserva intacta, obtuve ~S" out)))))
+
+(deftest response/failed-action-is-reported-as-failure
+  "El resumen tiene que poder decir que algo FALLO. Un goal que se cierra solo
+   porque se intento es peor que no cerrarlo."
+  (with-turn-engine
+    (reset-turn-engine)
+    (let* ((turn (h::current-turn-id)))
+      (h::assert (h::harness-fact (h::fact-type "file-edit")
+                                  (h::timestamp (get-universal-time))
+                                  (h::data (list :path "/tmp/leeme.md"
+                                                 :applied nil
+                                                 :reason "old_string not found"
+                                                 :turn-id turn))))
+      (let ((out (h::conversational-response-p "" turn)))
+        (ok (search "FAILED" out :test #'char=)
+            (format nil "el intento fallido se declara, obtuve ~S" out))
+        (ok (search "old_string not found" out :test #'char=)
+            (format nil "y dice por que fallo, obtuve ~S" out))))))
+
+;;;; ---------------------------------------------------------------
+;;;; Configuración: límites de batch y política de reintentos
+;;;; ---------------------------------------------------------------
 
 (deftest config/batch-limits-defaults
   (with-test-config ()
@@ -766,6 +1013,457 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                       (if (< calls 3) (error (http-failure 503)) "ok")))))
       (ok (string= "ok" result) "reintenta hasta que la llamada funciona")
       (ok (= 3 calls) (format nil "hizo 3 intentos, hizo ~D" calls)))))
+
+;;;; ---------------------------------------------------------------
+;;;; PROTOCOLO: invariantes I1, I2, I3 e I5 de PROTOCOLO.md
+;;;;
+;;;; Lo que puede fallar y como debe, escrito como assert. Nada aqui toca la
+;;;; red. El test 5 de PROTOCOLO.md (un registro malformado no tumba el resto)
+;;;; NO se puede escribir todavia: depende del renderizador de la baraja, que
+;;;; aun no existe. Los cuatro de aqui si se pueden.
+;;; ---------------------------------------------------------------
+
+(defun step-linked-facts ()
+  "Cuantos hechos llevan la identidad del paso en su data.
+
+   Si esto es 0 tras ejecutar, el plan se perdio: el harness ejecuto, aserto el
+   resultado correcto, y borro que paso fue. El YAML no puede entonces decir
+   cual de los N fallo, que es justo lo que el modelo necesita para elegir el
+   siguiente paso. Implementacion-agnostico a proposito: vale igual que el fix
+   conserve las intenciones marcadas o que propague :step a los resultados.
+
+  OJO: aquí se usa FACT-DATA-OF y no H::FACT-SLOT. Desde este paquete,
+  (H::FACT-SLOT f 'data) devuelve NIL, mientras que FACT-DATA-OF (que el
+  fuente define como su equivalente exacto) sí devuelve la plist. Dentro de
+  CL-HARNESS el codigo de produccion no sufre esto: BATCH-COMPLETE-P, que usa
+  FACT-SLOT sin cualificar, funciona. Es una rareza de este paquete.
+
+   Y se cuentan PASOS DISTINTOS, no hechos. El invariante es 'un veredicto por
+   paso', no 'un hecho por paso': con batch-plan en escena hay dos familias de
+   hechos que llevan :step (el plan y el veredicto) y contar hechos diria que un
+   plan de 3 pasos tiene 6 pasos. El test tiene que medir la invariante, no una
+   implementacion."
+  (with-turn-engine
+    (length (remove nil
+                    (remove-duplicates
+                     (mapcar (lambda (f) (h::data-get (h::fact-data-of f) :step))
+                             (h::collect-harness-facts))
+                     :test #'eql)))))
+
+
+(defun applied-nil-edits ()
+  "Cuantos file-edit quedaron registrados como NO aplicados."
+  (with-turn-engine
+    (count-if (lambda (f)
+                (and (string= (h::fact-type-of f) "file-edit")
+                     (not (h::data-get (h::fact-slot f 'data) :applied))))
+              (h::collect-harness-facts))))
+
+
+(defun sibling-key-line-p (line)
+  "Verdadero si LINE es una clave del mismo nivel que 'plan:'.
+
+   O sea: exactamente dos espacios de sangria y texto detras. Los hijos del
+   bloque van a cuatro espacios, asi que un indice 2 que sea espacio significa
+   que estamos dentro, no en el hermano siguiente."
+  (and line
+       (> (length line) 2)
+       (char= (char line 0) #\Space)
+       (char= (char line 1) #\Space)
+       (not (char= (char line 2) #\Space))))
+
+
+(defun plan-section (yaml)
+  "El TRAMO del bloque plan: de la linea '  plan:' hasta la siguiente clave de
+   nivel 2.
+
+   Hace falta por dos razones. SEARCH devuelve un INDICE, no un substring: usarlo
+   directo como texto hacia que 'step: 1' pasara por culpa del bloque de
+   verdictos, que tambien lleva step. Y un corte ingenuo con el patron de
+   newline+dos espacios se trunca al instante, porque el propio '  plan:' ya
+   empieza por dos espacios y los hijos del bloque van a cuatro."
+  (let ((lines (uiop:split-string yaml :separator '(#\Newline))))
+    (let ((start (position "  plan:" lines :test #'string=)))
+      (if (null start)
+          ""
+          (with-output-to-string (s)
+            (loop for i from start
+                  for line = (nth i lines)
+                  while (and line (or (= i start) (not (sibling-key-line-p line))))
+                  do (format s "~A~%" line)))))))
+
+
+(defun batch-plan-facts ()
+  "Los hechos batch-plan, en orden de paso."
+  (with-turn-engine
+    (sort (remove nil
+                  (mapcar (lambda (f)
+                            (when (string= "batch-plan" (h::fact-type-of f))
+                              (h::fact-data-of f)))
+                          (h::collect-harness-facts)))
+          #'< :key (lambda (d) (or (h::data-get d :step) 0)))))
+
+
+(deftest protocol/el-plan-sobrevive-a-la-ejecucion
+  "I1: un PLAN de 3 pasos debe dejar 3 pasos recuperables.
+
+   HOY FALLA (0 de 3). La causa es una linea: EXECUTE-INTENTION-WRITE hace
+   (RETRACT ?f) sobre la intencion al ejecutarla, y el hecho file-write que
+   aserta WRITE-FILE no lleva :step. El resultado se guarda y el plan se
+   borra, asi que no queda forma de saber que paso fue el que fallo.
+
+   OJO al arreglarlo: si en vez de retractar se marca :status :done, la regla
+   tiene que guardar el (TEST (EQL :PENDING ...)) o se dispara en bucle."
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        (h::assert-batch-intention (list :action :write-file :path "uno.txt" :content "1") 1)
+        (h::assert-batch-intention (list :action :write-file :path "dos.txt" :content "2") 2)
+        (h::assert-batch-intention (list :action :write-file :path "tres.txt" :content "3") 3)
+        (h::run)
+        (ok (= 3 (step-linked-facts))
+            (format nil "los 3 pasos deben quedar registrados; quedan ~D"
+                    (step-linked-facts)))
+        (ok (= 3 (fact-count "file-write"))
+            (format nil "y los 3 deben haberse escrito; se escribieron ~D"
+                    (fact-count "file-write")))))))
+
+
+(deftest protocol/un-paso-rechazado-deja-veredicto
+  "I2: si el harness se niega a intentar un paso, tambien debe registrar POR QUE.
+
+   HOY FALLA (0 de 1). EXECUTE-INTENTION-EDIT comprueba que old_string no sea
+   vacio y, si lo es, escribe un [DEBUG rule] y hace (RETRACT ?f) sin asertar
+   nada. El paso desaparece del mundo: el modelo ve su PLAN con un hueco y no
+   sabe si se intento, se salto o se perdio. Edit-file SI sabe registrar el
+   fallo (:applied nil :reason); la regla se lo salta antes de llamarlo."
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        (h::write-file "vacio.txt" "contenido real")
+        (h::assert-batch-intention
+         (list :action :edit-file
+               :path "vacio.txt"
+               :old-string ""            ; invalido a proposito
+               :new-string "x")
+         1)
+        (h::run)
+        (ok (= 1 (applied-nil-edits))
+            (format nil "un edit rechazado debe quedar como edit no aplicado; hay ~D"
+                    (applied-nil-edits)))
+        (ok (= 1 (step-linked-facts))
+            (format nil "y debe quedar enlazado a su paso; hay ~D paso(s)"
+                    (step-linked-facts)))))))
+
+
+(defun fact-data-for (type)
+  "DATA del primer hecho de TYPE, o NIL."
+  (let ((f (find-if (lambda (f) (string= type (h::fact-type-of f)))
+                   (h::collect-harness-facts))))
+    (and f (h::fact-data-of f))))
+
+
+(deftest protocol/un-rechazo-tiene-un-solo-nombre
+  "I6: 'por que no lo hice' se llamaba :reason en el hecho y :error en el valor
+   devuelto, para el MISMO evento. Eso obliga a cada lector a probar los dos:
+   los dos renderers hacen (or :reason :error) y ASSERT-STEP-VERDICT idem. No es
+   cosmetico: hoy los dos textos ADEMAS son distintos, el hecho guarda
+   'old_string not found' y el retorno guarda la explicacion larga con la que
+   el modelo podria reintentar bien. Alguien lea solo el hecho y se queda con
+   la version inutil.
+
+   Aqui se fija una sola clave, :reason, y con el MISMO texto en hecho y
+   retorno. Un solo nombre, un solo texto, un solo sitio donde equivocarse."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir))
+      (with-turn-engine
+        (reset-turn-engine)
+        ;; Caso 1: old_string vacio.
+        (let ((ret (h::edit-file "no-existe-importa.txt" "" "x"))
+              (fact (progn (h::edit-file "no-existe-importa.txt" "" "x")
+                           (fact-data-for "file-edit"))))
+          (ok (and (getf ret :reason) (not (getf ret :error)))
+              "el valor devuelto usa :reason, no :error")
+          (ok (equal (getf ret :reason) (getf fact :reason))
+              (format nil "hecho y retorno cuentan lo MISMO~%     retorno: ~S~%     hecho:   ~S"
+                      (getf ret :reason) (getf fact :reason)))
+          (ok (and (getf fact :reason) (not (getf fact :error)))
+              "el hecho usa :reason, no :error"))
+        ;; Caso 2: fichero inexistente.
+        (reset-turn-engine)
+        (let ((ret (h::edit-file "fantasma.txt" "viejo" "nuevo"))
+              (fact (progn (h::edit-file "fantasma.txt" "viejo" "nuevo")
+                           (fact-data-for "file-edit"))))
+          (ok (and (getf ret :reason) (not (getf ret :error)))
+              "un fichero ausente tambien se explica con :reason")
+          (ok (and fact (getf fact :reason))
+              "y deja hecho: un rechazo sin hecho es un paso desaparecido"))))))
+
+
+(deftest protocol/ningun-rechazo-desaparece
+  "I2, segunda parte: un rechazo tiene que dejar RASTRO aunque no haya nada
+   que ejecutar.
+
+   Este test falla HOY y no por el nombre del campo, sino porque EDIT-FILE
+   sobre un fichero inexistente hace RETURN-FROM sin asertar hecho, y WRITE-FILE
+   sobre un fichero grande se niega sin asertar hecho. El paso se ejecuta, se
+   rechaza, y no consta en ninguna parte: el modelo ve su turno sin ningun
+   veredicto y no tiene ni idea de que intento algo. Los dos casos devuelven
+   :error y :refused, y ya de paso usan el nombre equivocado."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir))
+      ;; Un fichero grande de verdad, para que WRITE-FILE se niegue.
+      (with-open-file (s (merge-pathnames "grande.txt" dir) :direction :output
+                         :if-exists :supersede)
+        (dotimes (_ 400) (write-string "basura de relleno para pasar de 2000 bytes" s)))
+      (with-turn-engine
+        ;; Rechazo por fichero inexistente.
+        (reset-turn-engine)
+        (h::edit-file "fantasma.txt" "viejo" "nuevo")
+        (ok (fact-data-for "file-edit")
+            "editar un fichero ausente deja hecho")
+        (ok (and (fact-data-for "file-edit")
+                 (eql (getf (fact-data-for "file-edit") :applied) nil))
+            "y lo deja como NO aplicado")
+        ;; Rechazo por escritura a ciegas.
+        (reset-turn-engine)
+        (h::write-file "grande.txt" "contenido nuevo")
+        (let ((fact (fact-data-for "file-write")))
+          (ok fact "escribir sobre un fichero grande deja hecho")
+          (ok (and fact (eql (getf fact :applied) nil))
+              "y lo deja como NO aplicado")
+          (ok (and fact (getf fact :reason))
+              "y explica por que, con el mismo nombre de clave que el resto"))
+          ;; Y que el rechazo LLEGU al modelo. Si el renderer no distingue un
+          ;; hecho fallido de uno bueno, el modelo ve 'wrote:' sobre un fichero
+          ;; que no se toco.
+          (let ((yaml (build-yaml-context "sigue")))
+            (ok (search "write_refused" yaml)
+                "una escritura rechazada no se renderiza como 'wrote'")
+            (ok (search "already exists" yaml)
+                "y el motivo viaja al modelo"))))))
+
+
+(deftest protocol/un-hecho-rechazado-no-descarga-un-goal
+  "I3, y el.previa de I6.
+
+   TODO-SATISFIED-P mira :applied SOLO para :edit. Para :read y :write le da
+   igual: cualquier hecho del tipo que cuadre con la ruta descarga el goal. Dos
+   consecuencias, y la segunda la introduce este mismo trabajo:
+
+     1. HOY: leer un fichero que no existe aserta un file-read con
+        :contents \"ERROR: File not found\" y CIERRA el goal de lectura. El
+        modelo recibe 'Read app.py' completado sin haber leido nada.
+     2. AL ANADIR los hechos :applied nil de los rechazos (que es justo lo que
+        hace que I2 se cumpla), un rechazo pasaria a CERRAR el goal que
+        precisamente no cumplio. Arreglar I2 sin esto seria cambiar un fallo
+        por otro.
+
+   Asi que la evidencia exige :applied t SIEMPRE, no solo en :edit."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir))
+      (with-turn-engine
+        ;; 1) Lectura de un fichero inexistente NO cierra el goal.
+        (reset-turn-engine)
+        (h::add-todo "Read fantasma.txt" :status "in-progress")
+        (h::read-file "fantasma.txt")
+        (h::reconcile-todos (h::collect-active-facts))
+        (ok (string= "in-progress" (todo-slot (first (active-todos)) "status"))
+            "leer un fichero que no existe no cierra el goal de lectura")
+        ;; 2) Escritura rechazada por fichero grande NO cierra el goal.
+        (reset-turn-engine)
+        (with-open-file (s (merge-pathnames "grande.txt" dir) :direction :output
+                           :if-exists :supersede)
+          (dotimes (_ 400) (write-string "basura de relleno para pasar de 2000 bytes" s)))
+        (h::add-todo "Write grande.txt" :status "in-progress")
+        (h::write-file "grande.txt" "contenido nuevo")
+        (h::reconcile-todos (h::collect-active-facts))
+        (ok (string= "in-progress" (todo-slot (first (active-todos)) "status"))
+            "una escritura rechazada no cierra el goal de escritura")
+        ;; 3) Y el camino feliz sigue cerrando: esto no lo arregla rompiendolo.
+        (reset-turn-engine)
+        (h::add-todo "Write ok.txt" :status "in-progress")
+        (h::write-file "ok.txt" "contenido real")
+        (h::reconcile-todos (h::collect-active-facts))
+        (ok (string= "completed" (todo-slot (first (active-todos)) "status"))
+            (format nil "una escritura correcta SI cierra su goal; quedo ~A"
+                    (todo-slot (first (active-todos)) "status")))))))
+
+
+(deftest protocol/done-se-valida-contra-los-goals-abiertos
+  "I5: tool_calls vacio es una PROPUESTA de fin de turno, no un hecho.
+
+   HOY FALLA. PARSE-LLM-BATCH-TO-INTENTIONS, cuando no hay intenciones,
+   aserta batch-complete y devuelve la respuesta tal cual, sin mirar si queda
+   trabajo por hacer. El modelo puede mandar {\"tool_calls\":[],
+   \"response\":\"Listo\"} con tres goals abiertos y el harness lo acepta como
+   turno completado. Es la fuga de ejecutor en su forma mas desnuda: la
+   autoridad de cerrar la sesion es del LLM."
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::add-todo "Write pendiente.txt" :status "in-progress")
+    (h::parse-llm-batch-to-intentions
+     "{\"tool_calls\":[],\"response\":\"Listo, todo hecho\"}")
+    (ok (not (h::batch-complete-p))
+        "con un goal abierto, DONE no puede aceptarse como completado")
+    (ok (= 1 (length (active-todos)))
+        "y el goal sigue abierto, no se cerro por decreto del modelo")))
+
+
+(deftest protocol/un-comando-nunca-cierra-un-goal-de-fichero
+  "I3, fijado: un command-exec no es evidencia de escritura.
+
+   Pytest que pasa no significa que el archivo se escribiera. TODO-EVIDENCE-
+   TYPES ya es 1-1 estricto, asi que esto HOY PASA; el test existe para que no
+   se rompa al construir la maquina de estados, que es cuando va a ser tentador
+   abrirlo para que los goals se cierren solos."
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::add-todo "Write app.py" :status "in-progress")
+    (h::assert (h::harness-fact (h::fact-type "command-exec")
+                                (h::timestamp (get-universal-time))
+                                (h::data (list :command "pytest -q"
+                                               :exit-code 0
+                                               :output "1 passed"
+                                               :turn-id (h::current-turn-id)))))
+    (h::reconcile-todos (h::collect-active-facts))
+    (ok (string= "in-progress" (todo-slot (first (active-todos)) "status"))
+        (format nil "un comando no escribe ficheros; quedo ~A"
+                (todo-slot (first (active-todos)) "status")))))
+
+
+(deftest protocol/el-verdict-llega-al-modelo-con-su-paso
+  "I1 cerrado de verdad: asertar el veredicto no basta, tiene que LLEGAR.
+
+   El invariante 1 se puede cumplir a medias y seguir siendo inutil: si el
+   harness aserta el veredicto pero el contexto no lo renderiza, el modelo
+   recibe un turno entero sin enterarse de nada y el estado solo existe para
+   el debugger. Este test falla si el VERDICT se deja de renderizar.
+
+   Tambien fija el detalle de que :step viaje. Y que 'result' distinga
+   applied de failed: :applied y :failed son keywords y los DOS son truthy,
+   asi que un test de verdad sobre el texto renderizado es la unica forma de
+   pillar un (if (data-get data :verdict)) que diga 'applied' siempre."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir) (h::*session-id* "s"))
+      (with-turn-engine
+        (reset-turn-engine)
+        (h::assert-step-verdict (list :step 1 :action :write-file :path "uno.txt")
+                                (list :applied t))
+        (h::assert-step-verdict (list :step 2 :action :edit-file :path "uno.txt")
+                                (list :applied nil
+                                      :reason "old_string not found"))
+        (let ((yaml (build-yaml-context "sigue")))
+          (ok (search "verdict:" yaml) "el veredicto se renderiza en el contexto")
+          (ok (search "step: 1" yaml) "el veredicto conserva su numero de paso")
+          (ok (search "step: 2" yaml)
+              "cada veredicto apunta a SU paso, no a un 'fallo' generico")
+          (ok (search "result: applied" yaml) "un paso ok se distingue de uno roto")
+          (ok (search "result: failed" yaml)
+              "un fallo NO se presenta como applied aunque el keyword sea truthy")
+          (ok (search "old_string not found" yaml)
+              "el motivo del rechazo viaja al modelo, no solo al debugger"))))))
+
+
+(deftest protocol/el-plan-sobrevive-como-plan
+  "Cierre de I1/I4: el plan no solo se puede recuperar, se LEE.
+
+   El test de I1 cuenta hechos con :step. Eso prueba que la informacion no se
+   perdio, pero no que el modelo la pueda usar: hoy el modelo ve una lista de
+   veredictos sueltos (paso 2 fallo) sin ver que PIDO en el paso 2. Para
+   reintentar bien necesita el par, no dos mitades.
+
+   Asi que se exige un bloque plan: en el que cada paso aparece con su accion, su
+   objetivo, y el veredicto del harness al lado, incluyendo 'pending' para lo que
+   aun no se ha ejecutado. Pending es lo que hace util el bloque: convierte el
+   contexto en un estado de la maquina y no en un parte.
+
+   Y se exige lo que I4 pedia: el batch-plan NO se retracta al ejecutarse. Si
+   desaparece con el intention, esto es I1 con otro nombre.
+
+   OJO con como se monta el pending: SELECT-RELEVANT-FACTS llama a (RUN), asi
+   que construir el contexto EJECUTA el plan entero. No hay forma de ver un
+   paso pendiente asi. El estado real donde un paso queda pending es despues de
+   un aborto: CANCEL-INTENTIONS-ON-ABORT retracta las intenciones que quedan y el
+   plan se queda sin ejecutarlas. Ahi se comprueba."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir) (h:*session-id* "s"))
+      (with-turn-engine
+        (reset-turn-engine)
+        (h::write-file "uno.txt" "contenido real")
+        (h::assert-batch-intention (list :action :write-file :path "uno.txt"
+                                         :content "1") 1)
+        (h::assert-batch-intention (list :action :edit-file :path "uno.txt"
+                                         :old-string "nada de esto"
+                                         :new-string "x") 2)
+        (h::assert-batch-intention (list :action :read-file :path "uno.txt") 3)
+        (h::assert (h::harness-fact (h::fact-type "verdict")
+                                    (h::timestamp (get-universal-time))
+                                    (h::data (list :step 1 :action :write-file
+                                                   :target "uno.txt"
+                                                   :verdict :applied :turn-id 1))))
+        (h::assert (h::harness-fact (h::fact-type "verdict")
+                                    (h::timestamp (get-universal-time))
+                                    (h::data (list :step 2 :action :edit-file
+                                                   :target "uno.txt"
+                                                   :verdict :failed
+                                                   :reason "old_string not found in uno.txt"
+                                                   :turn-id 1))))
+        ;; Estado post-aborto: el plan del paso 3 sobrevive, su intencion no.
+        (h::assert (h::harness-fact (h::fact-type "batch-abort")
+                                    (h::timestamp (get-universal-time))
+                                    (h::data (list :reason "Blind write attempt" :turn-id 1))))
+        (let* ((plans (batch-plan-facts))
+               (yaml (build-yaml-context "sigue"))
+               (plan (plan-section yaml)))
+          (ok (= 3 (length plans))
+              (format nil "los 3 pasos del plan quedan registrados; hay ~D" (length plans)))
+          (ok (and (equal 1 (h::data-get (first plans) :step))
+                   (eql :write-file (h::data-get (first plans) :action)))
+              "y en orden, con su numero de paso y su accion")
+          (ok (search "plan:" yaml) "el plan se renderiza en el contexto")
+          (ok (search "step: 1" plan) "el bloque lista los pasos")
+          (ok (search "applied" plan) "con el veredicto del harness al lado")
+          (ok (search "pending" plan)
+              "un paso sin ejecutar se ve PENDING: el estado de la maquina, no un parte")
+          (ok (search "old_string not found" plan)
+              "el motivo del fallo queda unido a SU paso"))))))
+
+
+(deftest protocol/un-paso-malformado-no-arrastra-a-los-demas
+  "El plan se renderiza desde hechos, y un hecho puede llegar roto.
+
+   Un batch-plan sin :step, o con un :step que no es un numero, no puede
+   reventar el render entero: perder el estado de los pasos buenos por un dato
+   basura en uno es la peor forma de perderlo, porque ademas es silenciosa. Se
+   descarta el paso malo y el resto se muestra igual.
+
+   Aqui no se usa assert-batch-intention porque se normaliza y dejaria el dato
+   bueno: se aserta el hecho a proposito, como entraria desde disco o de un
+   motor Rete con estado viejo."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir) (h:*session-id* "s"))
+      (with-turn-engine
+        (reset-turn-engine)
+        (dolist (step '(1 2 3))
+          (h::assert-batch-intention (list :action :read-file :path "a.txt") step))
+        ;; Dos hechos basura intercalados, como si el estado estuviera sucio.
+        (h::assert (h::harness-fact (h::fact-type "batch-plan")
+                                    (h::timestamp (get-universal-time))
+                                    (h::data (list :action :read-file :turn-id 1))))
+        (h::assert (h::harness-fact (h::fact-type "batch-plan")
+                                    (h::timestamp (get-universal-time))
+                                    (h::data (list :step "no-so-numero" :action :read-file
+                                                   :turn-id 1))))
+        ;; Esto NO debe lanzar: es el fallo que se vigila.
+        (let ((yaml (build-yaml-context "sigue")))
+          (ok (search "plan:" yaml) "los pasos validos se siguen mostrando")
+          (ok (search "step: 1" yaml))
+          (ok (search "step: 2" yaml))
+          (ok (search "step: 3" yaml)
+              "un paso sin numero no borra a los demas"))))))
 
 
 (deftest config/retry-does-not-repeat-client-errors

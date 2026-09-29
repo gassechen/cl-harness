@@ -128,7 +128,11 @@ working context via structured facts. Help them with their task."))
        (let ((path (second parts)))
          (if path
              (let ((result (read-file path)))
-               (format t "~A~%" (getf result :contents)))
+               ;; I6: el fallo se imprime con su NOMBRE (:reason), no colado
+               ;; dentro de :contents.
+               (if (getf result :applied)
+                   (format t "~A~%" (getf result :contents))
+                   (format t "~A~%" (getf result :reason))))
              (format t "~&Usage: :read FILEPATH~%")))
        t)
 
@@ -193,6 +197,65 @@ working context via structured facts. Help them with their task."))
 
 
 
+(defun turn-action-summary (turn)
+  "A short factual account of what the batch actually did in TURN, derived from
+   the facts it produced.
+
+   Stands in for the model's own prose when the batch left its 'response' field
+   empty. The model can execute a whole batch and say nothing; recorded as-is
+   the turn became an empty string, and the next turn then saw itself as having
+   said nothing at all."
+  (let ((lines (loop for f in (collect-active-facts)
+                    for d = (fact-data-of f)
+                    when (eql (data-get d :turn-id) turn)
+                      collect
+                      (cond ((string= (fact-type-of f) "file-read")
+                             (format nil "read ~A" (path-basename (or (data-get d :path) ""))))
+                            ((string= (fact-type-of f) "file-write")
+                             (if (data-get d :refused)
+                                 (format nil "refused to overwrite ~A" (path-basename (or (data-get d :path) "")))
+                                 (format nil "wrote ~A (~A bytes)" (path-basename (or (data-get d :path) "")) (data-get d :bytes))))
+                            ((string= (fact-type-of f) "file-edit")
+                             (format nil "~A ~A~@[ (~A)~]"
+                                     (if (data-get d :applied) "edited" "FAILED to edit")
+                                     (path-basename (or (data-get d :path) ""))
+                                     (data-get d :reason)))
+                            ((string= (fact-type-of f) "command-exec")
+                             (format nil "ran `~A` (exit ~A)" (or (data-get d :command) "") (or (data-get d :exit-code) "?")))
+                            (t nil)))))
+    (when lines
+      (format nil "[Actions] ~{~A~^, ~A~}." (sort (remove-duplicates lines :test #'string=) #'string<)))))
+
+(defun raw-batch-blob-p (text)
+  "True when TEXT is a raw ToolUse batch rather than something said to the user.
+
+   Structural test via the batch JSON parser -- deliberately NOT a substring
+   search for \"tool_calls\"/\"read_file\"/\"write_file\", which matched any
+   answer that merely mentioned a tool name and threw away real prose."
+  (multiple-value-bind (payload error) (parse-batch-json text)
+    (and (null error)
+         (hash-table-p payload)
+         (batch-sequence-p (gethash "tool_calls" payload)))))
+
+(defun conversational-response-p (response turn)
+  "The text to remember RESPONSE as the model's turn TURN statement.
+
+   Three cases, none of which may be stored raw:
+   - a raw batch: machinery, not conversation. Feeding it back is how the
+     model used to re-read its own tool calls as if they were a prior claim.
+   - an empty string: the batch ran but said nothing.
+   - anything else: the model's own words, kept as written.
+   The first two fall back to what really happened, so the turn is never
+   remembered as silence or as a JSON envelope."
+  (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) (or response "")))
+        (summary (turn-action-summary turn)))
+    (cond ((zerop (length trimmed)) (or summary ""))
+          ((raw-batch-blob-p trimmed)
+           ;; Never fall back to the blob: storing it is precisely the
+           ;; self-poisoning this replaces. With no facts to describe, say so.
+           (or summary "[Actions] batch executed, nothing recorded"))
+          (t trimmed))))
+
 (defun process-turn (user-message system-prompt)
   "Single turn: build context → call LLM → register response.
    In batch mode, it runs Rete to execute intentions and calls LLM again."
@@ -206,7 +269,7 @@ working context via structured facts. Help them with their task."))
                             (data (list :text user-message
                                         :turn-id turn))))
                   (naive-context-string)))
-         (context (build-yaml-context user-message)) ;; <--- ACÁ SE GENERA EL DUMP INICIAL
+         (context (build-yaml-context user-message))
          (streamed (llm-stream-p))
          (response (handler-case
                        (progn
@@ -234,23 +297,24 @@ working context via structured facts. Help them with their task."))
                          (not (search "[LLM ERROR]" response :test #'char=))
                          (not (batch-complete-p)))
               do (let ((fingerprint (batch-fingerprint response)))
-                   ;; A model that re-requests the IDENTICAL batch is not
-                   ;; reacting to the tool result: it is stuck. Abort instead of
-                   ;; paying for the same failure again.
-                   (if (and (plusp (batch-repeat-tolerance))
-                            (gethash fingerprint seen))
-                       (progn
-                         (incf repeats)
-                         (when (> repeats (batch-repeat-tolerance))
-                           ;; Razon unica: *LAST-LLM-CALL-INFO* se escribe una
-                           ;; sola vez al final, con :PATH = ABORTED.
-                           (setf aborted :batch-repeated)))
+                (if (and (plusp (batch-repeat-tolerance))
+                         (gethash fingerprint seen))
+                    (progn
+                      (incf repeats)
+                      ;; A model that re-requests the IDENTICAL batch is not
+                      ;; reacting to the tool result: it is stuck. Abort instead
+                      ;; of paying for the same failure again.
+                      ;; *LAST-LLM-CALL-INFO* is written once at the end, with
+                      ;; :PATH = :BATCH-REPEATED, so set it here only as the
+                      ;; abort reason.
+                      (when (> repeats (batch-repeat-tolerance))
+                        (setf aborted :batch-repeated)))
                        (progn
                          (setf (gethash fingerprint seen) t)
                          (format t "~&[DEBUG process-turn] Disparando (run) - Ronda ~A...~%" i)
                          (detect-blind-writes)
                          (run)
-                         (let ((new-context (build-yaml-context user-message))) ;; <--- ACÁ SE GENERA EL DUMP ACTUALIZADO
+                         (let ((new-context (build-yaml-context user-message)))
                            (incf batch-iterations)
                            (setf response
                                  (handler-case
@@ -262,15 +326,15 @@ working context via structured facts. Help them with their task."))
                    response
                    (not (search "[LLM ERROR]" response :test #'char=))
                    (not (batch-complete-p)))
-          ;; The loop only ends early on those three conditions, so reaching
-          ;; here with a pending batch means batch_max_iterations ran out.
-          (setf aborted :iterations))
-        (when aborted
-          ;; Sin directivas "~:" en ningun mensaje: en este Lisp "~:P"/"~:A" no
-          ;; consumen argumento, asi que el FORMAT se come el valor equivocado y
-          ;; el tope configurado nunca se imprimia (decia "maximo 2" con
-          ;; batch_max_iterations=8).
-          (format t "~&[HARNESS BATCH ABORT] ~A tras ~D ronda(s) (maximo ~D)~%"
+        ;; The loop only ends early on those three conditions, so reaching
+        ;; here with a pending batch means batch_max_iterations ran out.
+        (setf aborted :iterations))
+    (when aborted
+      ;; NOTE: no "~:" directives anywhere in this message. In this Lisp
+      ;; "~:P"/"~:A" do NOT consume an argument, so the FORMAT swallowed the
+      ;; wrong value and the configured cap was never printed (it said
+      ;; "maximo 2" with batch_max_iterations=8).
+      (format t "~&[HARNESS BATCH ABORT] ~A tras ~D ronda(s) (maximo ~D)~%"
                   (case aborted
                     (:batch-repeated "el modelo repitio el mismo lote")
                     (:iterations "se agoto batch_max_iterations")
@@ -280,27 +344,41 @@ working context via structured facts. Help them with their task."))
           (setf *last-llm-call-info*
                 (list :iterations batch-iterations :path aborted)))))
     ;; -------------------------------
-    
+
+    ;; --- POLÍTICA DE EPOCHS AUTOMÁTICA ---
+    (when (and (> *turn-counter* 0)
+               (zerop (mod *turn-counter* 5)))
+      (create-epoch (format nil "Consolidated context up to turn ~A" *turn-counter*) *turn-counter*)
+      (when *debug-mode*
+        (format t "~&[DEBUG process-turn] Epoch creado en turno ~A. Limpiando hechos viejos.~%" *turn-counter*)))
+    ;; --------------------------------------
+
     (record-context-metrics context user-message
                             :naive-str naive
                             :real-prompt (getf *last-llm-usage* :prompt)
                             :real-completion (getf *last-llm-usage* :completion)
                             :llm-iterations batch-iterations
                             :llm-path (getf *last-llm-call-info* :path))
+    
+    ;; FIX AUTO-ENVENENAMIENTO: la respuesta del modelo nunca se guarda cruda.
+    ;; Un lote de tool_calls es maquinaria, no conversación, y un texto vacío
+    ;; dejaba el turno registrado como silencio aunque el lote hubiera hecho
+    ;; trabajo real. En ambos casos se registra lo que efectivamente pasó.
     (when (and response (not (search "[LLM ERROR]" response :test #'char=)))
       (assert (harness-fact (fact-type "llm-response")
                 (timestamp (get-universal-time))
-                (data (list :text response
+                (data (list :text (conversational-response-p response turn)
                             :turn-id turn
                             :parent-id turn)))))
+    
     (when *debug-mode*
       (format t "~&[DEBUG process-turn] turn=~A user=~A context-len=~A streamed=~A~%"
               turn user-message (length context) *llm-streamed*)
       (when (and *llm-streamed* response)
         (format t "~&[DEBUG process-turn] response-len=~A~%" (length response))))
+    (save-session)
     (promote-durable-facts)
     response))
-
 
 
 
@@ -348,11 +426,15 @@ working context via structured facts. Help them with their task."))
 
 
 
-(defun run-one-shot (user-message &optional (reset-engine t))
+(defun run-one-shot (user-message &key (reset-engine t) (debug nil))
   "Non-interactive mode (opencode-run style): process a single turn and exit.
    RESET-ENGINE T starts from an empty working memory (fresh process via
-   run.sh); NIL continues the session already living in a saved core image."
+   run.sh); NIL continues the session already living in a saved core image.
+   DEBUG T activa los logs de debug para la corrida."
   (load-config)
+  (when debug
+    (setf *debug-mode* t)
+    (format t "~&[INFO] Debug mode activado.~%"))
   (when reset-engine
     ;; Fresh process: reset both engines and reload persisted long-term memory.
     (boot-memory)

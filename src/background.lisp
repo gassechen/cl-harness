@@ -98,8 +98,11 @@
               (setf (gethash logfile *background-processes*)
                     (list :command command
                           :logfile logfile
-                          :status :launch-failed
-                          :error (princ-to-string e)))))))
+                           :status :launch-failed
+                           ;; I6: mismo nombre que en el resto del sistema. Antes
+                           ;; este :error era el unico :error que sobrevivia, y
+                           ;; ademas no lo lee nadie: es un campo write-only.
+                           :reason (princ-to-string e)))))))
       :name "cl-harness-bg")
     (list :background t
           :command command

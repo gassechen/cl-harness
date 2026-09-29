@@ -29,13 +29,19 @@
           (read-sequence buf s)
           (babel:octets-to-string buf :encoding :utf-8 :errorp nil))))))
 
+
 (defun resolve-path (path)
   "Resolve a RELATIVE PATH against the harness base directory, so the LLM
    can reference project files without absolute paths."
-  (let ((pn (pathname path)))
+  (let* ((clean-path (if (stringp path)
+                         ;; FIX: Sacamos las barras escapadas (\/ -> /)
+                         (cl-ppcre:regex-replace-all "\\\\/" path "/")
+                         path))
+         (pn (pathname clean-path)))
     (if (uiop:absolute-pathname-p pn)
         pn
         (merge-pathnames pn (harness-base-dir)))))
+
 
 (defun sh-quote (s)
   "Single-quote a string for /bin/sh, escaping embedded single quotes.
@@ -141,17 +147,30 @@
    harness base directory).
    Registers as a fact in Rete."
   (let* ((full (resolve-path path))
-         (contents
-           (if (uiop:file-exists-p full) 
-               (read-file-contents full)
-               (format nil "ERROR: File not found: ~A" (namestring full)))))
-    (assert (harness-fact (fact-type "file-read")
-                          (timestamp (get-universal-time))
-                          (data (list :path (namestring full)
-                                      :contents contents
-                                      :turn-id (current-turn-id)
-                                      :parent-id (current-turn-id)))))
-    (list :path (namestring full) :contents contents)))
+         (missing (format nil "File not found: ~A" (namestring full))))
+    (if (uiop:file-exists-p full)
+        (let ((contents (read-file-contents full)))
+          (assert (harness-fact (fact-type "file-read")
+                                (timestamp (get-universal-time))
+                                (data (list :path (namestring full)
+                                            :applied t
+                                            :contents contents
+                                            :turn-id (current-turn-id)
+                                            :parent-id (current-turn-id)))))
+          (list :path (namestring full) :applied t :contents contents))
+        ;; I6: el fallo tiene NOMBRE. Antes se colaba dentro de :contents con
+        ;; el string "ERROR: File not found: ...", con lo que el hecho parecia
+        ;; una lectura buena y ademas la guarda lo exigia. El modelo recibia
+        ;; 'Read app.py' completado sin haber leido nada.
+        (progn
+          (assert (harness-fact (fact-type "file-read")
+                                (timestamp (get-universal-time))
+                                (data (list :path (namestring full)
+                                            :applied nil
+                                            :reason missing
+                                            :turn-id (current-turn-id)
+                                            :parent-id (current-turn-id)))))
+          (list :path (namestring full) :applied nil :reason missing)))))
 
 (defun count-occurrences (text needle)
   "Count non-overlapping occurrences of NEEDLE in TEXT using CL's SEARCH."
@@ -175,35 +194,52 @@
    Registers as a fact in Rete."
   (let* ((full (resolve-path path)))
     (when (zerop (length old-string))
-      (assert (harness-fact (fact-type "file-edit")
-                            (timestamp (get-universal-time))
-                            (data (list :path (namestring full)
-                                        :applied nil
-                                        :reason "old_string must not be empty"
-                                        :turn-id (current-turn-id)
-                                        :parent-id (current-turn-id)))))
-      (return-from edit-file
-        (list :path (namestring full)
-              :applied nil
-              :error (format nil "old_string must not be empty: an empty old_string cannot identify what to replace in ~A. Replace a non-empty exact snippet instead (and keep that snippet inside new_string when inserting)."
-                             (namestring full)))))
-    (let* ((contents (if (probe-file full)
-                         (read-file-contents full)
-                         (return-from edit-file
-                           (list :path (namestring full) :error "File not found"))))
+      ;; I6: un solo nombre y un solo TEXTO. Antes el hecho decia
+      ;; "old_string must not be empty" y el retorno ":error" decia tres lineas
+      ;; mas con lo que el modelo puede reintentar bien. Dos textos para un
+      ;; evento, y el que se guarda en Rete es el inutil: el retorno lo tira
+      ;; la regla. Se calcula UNA vez y se usa en los dos sitios.
+      (let ((why (format nil "old_string must not be empty: an empty old_string cannot identify what to replace in ~A. Replace a non-empty exact snippet instead (and keep that snippet inside new_string when inserting)."
+                         (namestring full))))
+        (assert (harness-fact (fact-type "file-edit")
+                              (timestamp (get-universal-time))
+                              (data (list :path (namestring full)
+                                          :applied nil
+                                          :reason why
+                                          :turn-id (current-turn-id)
+                                          :parent-id (current-turn-id)))))
+        (return-from edit-file
+          (list :path (namestring full)
+                :applied nil
+                :reason why))))
+    (let* ((contents
+             (if (probe-file full)
+                 (read-file-contents full)
+                 ;; I2: esto antes hacia RETURN-FROM SIN ASERTAR NADA. El paso
+                 ;; se intentaba, se rechazaba, y no constaba en ninguna parte:
+                 ;; el modelo veia su turno sin veredicto de este paso.
+                 (let ((why (format nil "File not found: ~A" (namestring full))))
+                   (assert (harness-fact (fact-type "file-edit")
+                                         (timestamp (get-universal-time))
+                                         (data (list :path (namestring full)
+                                                     :applied nil
+                                                     :reason why
+                                                     :turn-id (current-turn-id)
+                                                     :parent-id (current-turn-id)))))
+                   (return-from edit-file
+                     (list :path (namestring full) :applied nil :reason why)))))
            (pos (search old-string contents)))
       (if (null pos)
           (progn
-            (assert (harness-fact (fact-type "file-edit")
-                                  (timestamp (get-universal-time))
-                                  (data (list :path (namestring full)
-                                              :applied nil
-                                              :reason "old_string not found"
-                                              :turn-id (current-turn-id)
-                                              :parent-id (current-turn-id)))))
-            (list :path (namestring full) :applied nil
-                  :error (format nil "old_string not found in ~A"
-                                 (namestring full))))
+            (let ((why (format nil "old_string not found in ~A" (namestring full))))
+              (assert (harness-fact (fact-type "file-edit")
+                                    (timestamp (get-universal-time))
+                                    (data (list :path (namestring full)
+                                                :applied nil
+                                                :reason why
+                                                :turn-id (current-turn-id)
+                                                :parent-id (current-turn-id)))))
+              (list :path (namestring full) :applied nil :reason why)))
           (let* ((new-contents
                    (concatenate 'string
                                 (subseq contents 0 pos)
@@ -246,11 +282,25 @@
     (when (probe-file full)
       (let ((size (with-open-file (s full) (file-length s))))
         (when (> size 2000)
-          (return-from write-file
-            (list :path (namestring full)
-                  :refused t
-                  :error (format nil "~A already exists (~A bytes). write_file is only for NEW files; to modify an existing file use edit_file with the exact snippet to replace."
-                                 (namestring full) size))))))
+          ;; I2 + I6: la negativa se ASERTA y usa :reason, el mismo nombre que
+          ;; el resto. Antes solo existia en el valor devuelto (que la regla
+          ;; descarta) y con :error, asi que el rechazo no dejaba rastro: un
+          ;; paso que el modelo hizo, se le negaron, y no se enteraba.
+          (let ((why (format nil "~A already exists (~A bytes). write_file is only for NEW files; to modify an existing file use edit_file with the exact snippet to replace."
+                             (namestring full) size)))
+            (assert (harness-fact (fact-type "file-write")
+                                  (timestamp (get-universal-time))
+                                  (data (list :path (namestring full)
+                                              :applied nil
+                                              :refused t
+                                              :reason why
+                                              :turn-id (current-turn-id)
+                                              :parent-id (current-turn-id)))))
+            (return-from write-file
+              (list :path (namestring full)
+                    :applied nil
+                    :refused t
+                    :reason why))))))
     (ensure-directories-exist full)
     ;; ACÁ USAMOS CLEAN-CONTENT EN VEZ DE CONTENT:
     (with-open-file (s full :direction :output :if-exists :supersede)
@@ -260,8 +310,9 @@
       (assert (harness-fact (fact-type "file-write")
                             (timestamp (get-universal-time))
                             (data (list :path (namestring full)
+                                        :applied t
                                         :bytes bytes
                                         :turn-id (current-turn-id)
                                         :parent-id (current-turn-id)))))
-      (list :path (namestring full) :bytes bytes))))
+      (list :path (namestring full) :applied t :bytes bytes))))
 

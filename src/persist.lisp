@@ -205,3 +205,13 @@
                                               (if args
                                                   (run-one-shot (format nil "~{~A~^ ~}" args) nil)
                                                   (start-harness nil))))))))
+
+
+(defun restore-facts (path)
+  "Loads facts from a dump file into the active turn engine."
+  (when (probe-file path)
+    (let ((forms (with-open-file (s path) (read s))))
+      (dolist (f forms)
+        (assert (harness-fact (fact-type (getf f :type))
+                              (timestamp (getf f :ts))
+                              (data (getf f :data))))))))

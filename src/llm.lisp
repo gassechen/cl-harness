@@ -329,8 +329,13 @@
      (let ((path (gethash "path" arguments)))
        (if path
            (let ((result (read-file path)))
-             (format nil "File: ~A~%Contents:~%~A"
-                     path (getf result :contents)))
+             ;; I6: el motivo del fallo ya no viaja escondido dentro de
+             ;; :contents. Antes se imprimia "ERROR: File not found" como si
+             ;; fuera el contenido del fichero.
+             (if (getf result :applied)
+                 (format nil "File: ~A~%Contents:~%~A"
+                         path (getf result :contents))
+                 (format nil "read_file failed: ~A" (getf result :reason))))
            "Error: missing path argument")))
     ((string-equal tool-name "write_file")
      (let ((path (gethash "path" arguments))
@@ -338,7 +343,7 @@
        (if (and path content)
            (let ((result (write-file path content)))
              (if (getf result :refused)
-                 (format nil "write_file refused: ~A" (getf result :error))
+                 (format nil "write_file refused: ~A" (getf result :reason))
                  (format nil "Wrote ~A bytes to ~A"
                          (getf result :bytes) (getf result :path))))
            "Error: missing path or content argument")))
@@ -356,7 +361,7 @@
                          (getf result :replaced-chars)
                          (getf result :new-chars)
                          (getf result :matches))
-                 (format nil "Edit failed: ~A" (getf result :error))))
+                 (format nil "Edit failed: ~A" (getf result :reason))))
            "Error: missing path, old_string or new_string argument")))
     (t (format nil "Unknown tool: ~A" tool-name))))
 
@@ -644,7 +649,7 @@
               (format nil "[LLM ERROR] reached ~A tool iterations without a final answer"
                       (llm-max-tool-iterations))))))))
 
-(defun build-openai-compat-messages-with-tools (system-prompt context user-message prior-messages)
+(defun build-openai-compat-messages-with-tools (context user-message prior-messages)
   "Build OpenAI-compatible Chat Completions JSON body with tools."
   (let ((msg (make-hash-table :test 'equal)))
     (setf (gethash "model" msg) (llm-model))
@@ -662,7 +667,7 @@
       (setf (gethash "messages" msg) messages))
     msg))
 
-(defun call-llm-with-tools/static (system-prompt context user-message)
+(defun call-llm-with-tools/static (context user-message)
   "Non-streaming OpenAI-compatible provider call with tool definitions. If the
    model requests tools, execute them and loop until we get a text response or
    reach the max iterations."
@@ -970,6 +975,7 @@ batch_execution_mode:
     - Emit actions, not descriptions. Order tool_calls from first action to last.
     - Do not repeat actions already present in the context.
     - Before write_file or edit_file on an existing path, include a read_file action for that path in the same batch; never overwrite a file you have not read.
+    - For specific function or variable searches inside files, use (exec-command \"grep -n 'pattern' file\") instead of read_file. Only use read_file when you need the full context of a small file.
     - read_file arguments: {\"path\":\"absolute or relative path\"}.
     - write_file arguments: {\"path\":\"new file path\",\"content\":\"full file content\"}.
     - edit_file arguments: {\"path\":\"existing file path\",\"old_string\":\"non-empty exact text currently in the file\",\"new_string\":\"replacement text\"}.
@@ -1006,6 +1012,8 @@ batch_execution_mode:
 (defun batch-json-text (text)
   (if (and (stringp text) (plusp (length text)))
       (let ((clean (string-trim '(#\Space #\Tab #\Newline #\Return) text)))
+        ;; FIX para modelos que rompen la primera llave: "{\"}tool_calls\"
+        (setf clean (cl-ppcre:regex-replace-all "^\\{\"\\}" clean "{"))
         (when (and (>= (length clean) 6)
                    (string= "```" (subseq clean 0 3)))
           (let ((newline (position #\Newline clean)))
@@ -1018,6 +1026,7 @@ batch_execution_mode:
                                          (subseq clean 0 (- (length clean) 3))))))))
         clean)
       ""))
+
 
 
 (defun parse-batch-json (text)
@@ -1123,7 +1132,31 @@ batch_execution_mode:
     (values (nreverse normalized) nil)))
 
 
+(defun assert-batch-plan (data step-id)
+  "PROTOCOLO I1/I4: el PLAN que el LLM propuso, como hecho que NO se retracta.
+
+   La intencion se retracta al ejecutarse (eso evita que la regla dispare en
+   bucle), asi que el plan se desvanecia y solo quedan resultados sueltos: el
+   modelo ve 'el paso 2 fallo' sin haber pedido un paso 2. Este hecho es el otro
+   lado del JOIN y se queda.
+
+   Deliberadamente NO se guarda la intencion entera. :content de un write_file
+   puede ser el fichero completo, y volcarlo al contexto en cada paso es como
+   vaciarle el portapapeles al modelo. Lo que el modelo no sabe de su propio
+   plan es lo que ya le pasa: el estado. De ahi que aqui solo haya paso, accion
+   y objetivo."
+  (assert (harness-fact
+           (fact-type "batch-plan")
+           (timestamp (get-universal-time))
+           (data (list :step step-id
+                       :action (data-get data :action)
+                       :target (or (data-get data :path) (data-get data :command))
+                       :turn-id (current-turn-id)))))
+  t)
+
+
 (defun assert-batch-intention (data step-id)
+  (assert-batch-plan data step-id)
   (assert (harness-fact
            (fact-type "intention")
            (timestamp (get-universal-time))
@@ -1186,6 +1219,17 @@ batch_execution_mode:
                        (unless (stringp response)
                          (return-from parse-llm-batch-to-intentions
                            (values nil nil "batch JSON response must be a string")))
+                       ;; PROTOCOLO I5: tool_calls vacio es una PROPUESTA de fin de
+                       ;; turno, no un hecho. Con goals sin recoger NO se acepta: se
+                       ;; devuelve el motivo por la misma via que un JSON invalido, asi
+                       ;; el modelo recibe en el turno siguiente cuales quedan abiertas.
+                       (let ((open (open-goal-tasks)))
+                         (when open
+                           (return-from parse-llm-batch-to-intentions
+                             (values nil nil
+                                     (format nil "DONE rejected: ~D goal(s) are still open: ~{~A~^, ~}. Finish them with actions, or state plainly what you could not do and why."
+                                             (length open)
+                                             (subseq open 0 (min 5 (length open))))))))
                        (assert (harness-fact
                                 (fact-type "batch-complete")
                                 (timestamp (get-universal-time))

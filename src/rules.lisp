@@ -340,6 +340,20 @@
                        :turn-id (data-get ?da :turn-id)
                        :parent-id (data-get ?da :turn-id))))))
 
+
+(defrule prevent-duplicate-read (:salience 15)
+  "Si el LLM pide leer un archivo que ya leyó en este turno, cancela la intención."
+  (?intent (harness-fact (fact-type "intention") (data ?d)))
+  (test (eql (data-get ?d :action) :read-file))
+  (harness-fact (fact-type "file-read") (data ?fr-data))
+  (test (and (eql (data-get ?fr-data :turn-id) (data-get ?d :turn-id))
+             (string= (path-basename (data-get ?fr-data :path))
+                      (path-basename (data-get ?d :path)))))
+  =>
+  (retract ?intent))
+
+
+
 (defun detect-tool-loop ()
   "Scan the CURRENT turn's command-exec facts for a repeating failing family.
    Returns three values (FAMILY COUNT COMMANDS) when at least *loop-min-count*
@@ -536,33 +550,47 @@
 (defrule execute-intention-read (:salience 5)
   (?f (harness-fact (fact-type "intention") (data ?d)))
   (test (eq (data-get ?d :action) :read-file))
+  (test (eql (data-get ?d :status) :pending))
   =>
   ;; Llama a tu función original. Ella misma hará el (assert (harness-fact "file-read" ...))
-  (read-file (data-get ?d :path))
+  (assert-step-verdict ?d (read-file (data-get ?d :path)))
   ;; Retraemos la intención para que no se ejecute de nuevo en el próximo (run)
   (retract ?f))
 
 (defrule execute-intention-write (:salience 4)
   (?f (harness-fact (fact-type "intention") (data ?d)))
   (test (eq (data-get ?d :action) :write-file))
+  (test (eql (data-get ?d :status) :pending))
   =>
-  (write-file (data-get ?d :path) (data-get ?d :content))
+  (assert-step-verdict ?d (write-file (data-get ?d :path) (data-get ?d :content)))
   (retract ?f))
 
 (defrule execute-intention-edit (:salience 4)
   (?f (harness-fact (fact-type "intention") (data ?d)))
-  (test (eq (data-get ?d :action) :edit-file))
+  (test (eql (data-get ?d :action) :edit-file))
+  (test (eql (data-get ?d :status) :pending))
   =>
-  (edit-file (data-get ?d :path) (data-get ?d :old-string) (data-get ?d :new-string))
+  ;; PROTOCOLO I2: aquí NO se pre-valida old_string. La regla duplicaba un guard
+  ;; que la ACCIÓN ya tiene, y lo hacía peor: cuando lo detectaba, sólo logueaba
+  ;; y retractaba sin asertar nada, así que el paso desaparecía del mundo y el
+  ;; modelo no veía ni que se intentó. Delegando en EDIT-FILE hay UN solo sitio
+  ;; donde vive la regla, y todo edit rechazado queda igual de registrado:
+  ;; (file-edit :applied nil :reason ...) más el VERDICT con su :step.
+  (assert-step-verdict
+   ?d (edit-file (data-get ?d :path)
+                 (or (data-get ?d :old-string) "")
+                 (or (data-get ?d :new-string) "")))
   (retract ?f))
+
 
 
 (defrule execute-intention-command (:salience 3)
   (?f (harness-fact (fact-type "intention") (data ?d)))
   (test (eql (data-get ?d :action) :exec-command))
+  (test (eql (data-get ?d :status) :pending))
   =>
   (format t "~&[DEBUG rule] Ejecutando comando en Rete...~%") ;; <--- ESTA LÍNEA
-  (exec-command (data-get ?d :command))
+  (assert-step-verdict ?d (exec-command (data-get ?d :command)))
   (retract ?f))
 
 
@@ -588,8 +616,7 @@
             for d = (fact-data-of f)
             for type = (fact-type-of f)
             when (and (string= type "intention")
-                      (or (eql (data-get d :action) :write-file)
-                          (eql (data-get d :action) :edit-file))
+                         (eql (data-get d :action) :edit-file)
                       (eql (data-get d :turn-id) turn))
               unless (member (path-basename (or (data-get d :path) "")) read-paths :test #'string=)
                 do (assert (harness-fact
@@ -623,3 +650,79 @@
   =>
   (retract ?intent))
 
+
+;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; ;; GOALS
+;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(defrule auto-create-todo-on-action (:salience 20)
+  (?intent (harness-fact (fact-type "intention") (data ?d)))
+  =>
+  (let ((action (data-get ?d :action))
+        (path (data-get ?d :path))
+        (command (data-get ?d :command)))
+    (add-todo (cond
+                ((eql action :read-file) (format nil "Read ~A" path))
+                ((eql action :write-file) (format nil "Write ~A" path))
+                ((eql action :edit-file) (format nil "Edit ~A" path))
+                ((eql action :exec-command) (format nil "Run: ~A" command))
+                (t "Unknown action"))
+              :status "in-progress")))
+
+
+
+
+;; (defrule auto-complete-todo-on-read (:salience 10)
+
+;;   (?f (harness-fact (fact-type "file-read") (data ?d)))
+;;   (?todo (agent-todo (task ?t))
+;;                        (status "in-progress")
+;;                        (test (search (data-get ?d :path) ?t)))
+;;   =>
+;;   (set-todo-status (get-slot-value ?todo 'id) "completed"))
+
+
+;; (defrule auto-complete-todo-on-write (:salience 10)
+
+;;   (?f (harness-fact (fact-type "file-write") (data ?d)))
+;;   (?todo (agent-todo (task ?t))
+;;                        (status "in-progress")
+;;                        (test (search (data-get ?d :path) ?t)))
+;;   =>
+;;   (set-todo-status (get-slot-value ?todo 'id) "completed"))
+
+
+;; (defrule auto-complete-todo-on-edit (:salience 10)
+
+;;   (?f (harness-fact (fact-type "file-edit") (data ?d)))
+;;   (?todo (agent-todo (task ?t))
+;;                        (status "in-progress")
+;;                        (test (search (data-get ?d :path) ?t)))
+;;   =>
+;;   (set-todo-status (get-slot-value ?todo 'id) "completed"))
+
+
+
+;; (defrule auto-complete-todo-on-command (:salience 10)
+
+;;   (?f (harness-fact (fact-type "command-exec") (data ?d)))
+;;   (?todo (agent-todo (task ?t))
+;;                        (status "in-progress")
+;;                        (test (search (data-get ?d :path) ?t)))
+;;   =>
+;;   (set-todo-status (get-slot-value ?todo 'id) "completed"))
+
+(defrule prevent-duplicate-edit (:salience 15)
+  "Si el LLM pide hacer el MISMO edit exacto que ya hizo en este turno, cancela."
+  (?intent (harness-fact (fact-type "intention") (data ?d)))
+  (test (eql (data-get ?d :action) :edit-file))
+  (harness-fact (fact-type "file-edit") (data ?fe-data))
+  (test (and (eql (data-get ?fe-data :turn-id) (data-get ?d :turn-id))
+             (string= (path-basename (data-get ?fe-data :path))
+                      (path-basename (data-get ?d :path)))
+             ;; ACÁ CHEQUEAMOS QUE SEA EXACTAMENTE EL MISMO EDIT:
+             (string= (data-get ?fe-data :old-string)
+                      (data-get ?d :old-string))
+             (string= (data-get ?fe-data :new-string)
+                      (data-get ?d :new-string))))
+  =>
+  (retract ?intent))
