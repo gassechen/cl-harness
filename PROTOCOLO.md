@@ -179,7 +179,12 @@ No es deuda de formato, es deuda de mensaje:
    contexto lleva ahora un bloque `plan:` donde cada paso aparece con su veredicto al
    lado, y `pending` para lo que aún no se ha ejecutado.
 
+   El `plan:` que aparece en el contexto **ya no es YAML**: es la tarjeta COBOL de §2.3.
+   Este bloque de abajo se conserva porque explica el problema que la tarjeta resolvió, no
+   porque sea la forma actual de nada.
+
    ```yaml
+   # ANTES (YAML plano, eliminado en d2e45f0)
    plan:
      - step: 1
        action: READ-FILE
@@ -191,6 +196,11 @@ No es deuda de formato, es deuda de mensaje:
        verdict: failed
        reason: old_string not found in /tmp/.../uno.txt
    ```
+
+   Dos cosas que solo se ven al mirar el YAML: `step` y `verdict` están **en la misma
+   entrada**, o sea en la misma clave que el modelo controla, y `step` no distingue un
+   turno de otro. Lo primero lo arregla la separación por divisiones; lo segundo, el
+   `T<n>` de la etiqueta.
 
    `pending` es lo que lo hace útil: convierte el contexto en un **estado de la máquina**
    y no en un parte. Antes el modelo veía resultados sueltos —"el paso 2 falló"— sin
