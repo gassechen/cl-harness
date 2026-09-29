@@ -483,7 +483,14 @@
         (let* ((head-len (floor (* max 0.6)))
                (tail-len (floor (* max 0.4)))
                (omitted (- (length text) head-len tail-len)))
-          (format nil "~A~%~%... [TRUNCATED]: original ~A chars, ~A omitted from the middle. Use read_file/grep/sed to inspect a specific section ...~%~A"
+          ;; El aviso nombra solo rutas que existen de verdad. Antes decia
+          ;; "Use read_file/grep/sed" y las tres eran Fiction para este texto:
+          ;; no hay herramienta grep, read_file no tiene offset ni limit (y
+          ;; releer un fichero largo vuelve a truncar por el mismo sitio), y la
+          ;; salida de un comando no se escribe en ningun fichero, asi que no hay
+          ;; nada que read_file pueda abrir. Un aviso que manda a un sitio
+          ;; inalcanzable no es una ayuda: es un turno gastado.
+          (format nil "~A~%~%... [TRUNCATED]: original ~A chars, ~A omitted from the middle. The full text is NOT on disk: read_file cannot reopen it. Re-run the command piped to head/tail/grep to get the section you need ...~%~A"
                   (subseq text 0 head-len)
                   (length text) omitted
                   (subseq text (- (length text) tail-len))))

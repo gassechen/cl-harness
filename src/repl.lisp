@@ -24,11 +24,38 @@
                   (merge-pathnames "system-prompt.txt" base)))))))
 
 (defun load-system-prompt ()
-  "Load the system prompt from file."
-  (if (probe-file (system-prompt-path))
-      (read-file-contents (system-prompt-path))
-      "You are a helpful coding assistant. You have access to the user's
-working context via structured facts. Help them with their task."))
+  "The system prompt, or NIL if there is none.
+
+   NO HAY VALOR POR DEFECTO, y quitarlo fue deliberado. Antes, si no se
+   encontraba el fichero, esta funcion devolvia \"You are a helpful coding
+   assistant... Help them with their task\". Ese texto era una puerta giratoria:
+   decia que el agente servia para cualquier cosa, y el modelo se lo creia. Un
+   harness que se autod describe como asistente general deja de ser lo que es
+   y se convierte en un opencode con mas pasos.
+
+   Esto no es un opencode. Aqui no hay busqueda web, ni edicion multiarchivo
+   autonome, ni nada de eso. Su alcance es estrecho y conviene que lo diga quien
+   lo va a usar, no el codigo: el prompt se escribe fuera y se trae con
+   CL_HARNESS_SYSTEM_PROMPT, *system-prompt-path*, o system-prompt.md/.txt en el
+   directorio base.
+
+   Devolver NIL en vez de una cadena es lo honesto: si el prompt falta, el modelo
+   no debe recibir doctrina inventada. Se avisa al arrancar (ver warn-missing-
+   system-prompt) y se sigue, porque el harness sin prompt puede ser justo lo que
+   alguien quiere depurar."
+  (let ((path (system-prompt-path)))
+    (when (probe-file path)
+      (read-file-contents path))))
+
+(defun warn-missing-system-prompt ()
+  "Dice, en el arranque, que no hay system prompt y donde se busca.
+   Silencio aqui seria el otro extremo: el usuario creeria que su prompt se
+   cargo cuando en realidad nunca se leyo."
+  (format t "~&[aviso] No hay system prompt (~A no existe).~%" (system-prompt-path))
+  (format t "~&        El modelo NO recibira ninguna doctrina: el alcance de este~%")
+  (format t "~&        harness (escribir codigo) lo define quien lo usa.~%")
+  (format t "~&        Ponlo en system-prompt.md, o export CL_HARNESS_SYSTEM_PROMPT.~%~%")
+  (finish-output))
 
 (defun print-welcome ()
   (format t "~&╔══════════════════════════════════════════╗~%")
@@ -441,9 +468,11 @@ working context via structured facts. Help them with their task."))
     (reset-turn-counter)
     (new-session-id))
   (metrics-reset)
-  (let* ((system-prompt (load-system-prompt))
-         (response (or (process-turn user-message system-prompt)
-                       "[LLM ERROR] empty response")))
+  (let ((system-prompt (load-system-prompt)))
+    (unless system-prompt
+      (warn-missing-system-prompt))
+    (let ((response (or (process-turn user-message system-prompt)
+                        "[LLM ERROR] empty response")))
     (unless *llm-streamed*
       (format t "~&assistant> ~A~%" response))
     (save-session)
@@ -461,7 +490,7 @@ working context via structured facts. Help them with their task."))
                                                       :exhaustion-partial
                                                       :exhaustion-error)))
                              1
-                             0)))))
+                             0))))))
 
 (defun start-harness (&optional (reset-engine t))
   "Start the interactive REPL loop.
@@ -479,6 +508,8 @@ working context via structured facts. Help them with their task."))
   (print-welcome)
   (setf *running* t)
   (let ((system-prompt (load-system-prompt)))
+    (unless system-prompt
+      (warn-missing-system-prompt))
     (loop while *running*
           do (format t "~&user> ")
              (force-output *standard-output*)

@@ -1156,6 +1156,58 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
               "y no es su turno: los dos campos ya no dicen lo mismo"))))))
 
 
+(deftest protocol/el-harness-no-se-vende-como-assistente-general
+  "El system prompt NO lo escribe el harness.
+
+   load-system-prompt devolvia, cuando no encontraba el fichero, \"You are a
+   helpful coding assistant... Help them with their task\". Un solo default de
+   esos, y el modelo se volvia opencode: creia que podia hacer de todo, pedia
+   cosas que este harness no tiene, y el fallo se manifestaba DOS turnos tarde,
+   como un refusal raro del proveedor, no como un prompt equivocado. La causa
+   raiz era invisible porque el default funcionaba.
+
+   Esto no es un opencode: no hay busqueda web, ni edicion multiarchivo
+   autonoma. Su alcance es estrecho -- escribir codigo -- y quien lo define es
+   quien lo usa, no el codigo.
+
+   El test fija las DOS mitades, que es donde esta el fallo real:
+     1. sin fichero, no hay prompt inventado (NIL, no una cadena)
+     2. con fichero, se lee el suyo y no se mezcla con doctrina ajena
+   Si solo fijara la primera, alguien podria 'arreglar' el aviso devolviendo un
+   default mas cauto y la trampa volveria a cierra."
+  ;; Por *system-prompt-path* y no por *base-dir*: harness-base-dir da prioridad
+  ;; al env CL_HARNESS_DIR sobre *base-dir*, asi que atar solo *base-dir* aqui
+  ;; no ataba nada, y el test pasaba o fallaba segun el entorno desde el que se
+  ;; lanzara. Los tests que dependan de rutas deben atar la variable con MAYOR
+  ;; prioridad, no la mas comoda.
+  (with-temp-dir (dir)
+    ;; 1. Sin prompt, sin doctrina inventada.
+    (let ((h::*system-prompt-path* (merge-pathnames "nada.md" dir)))
+      (ok (null (h::load-system-prompt))
+          "sin system prompt el harness devuelve NIL, no un 'helpful assistant'")
+      ;; Y el aviso lo dice en vez de callarse: el usuario creeria que su
+      ;; prompt se cargo cuando en realidad nunca se leyo.
+      (ok (search "No hay system prompt"
+                  (with-output-to-string (s) (let ((*standard-output* s))
+                                               (h::warn-missing-system-prompt))))
+          "arrancar sin prompt avisa, con la ruta que busco"))
+    ;; 2. Con prompt, es el suyo y solo el suyo. Let independiente del de arriba:
+    ;; si las dos mitades comparten binding, un fallo en la primera secuestra a la
+    ;; segunda y el diagnostico senala el sitio equivocado -- que es lo que paso.
+    (let ((p (merge-pathnames "system-prompt.md" dir)))
+      (with-open-file (out p :direction :output :if-exists :supersede)
+        (write-string "Eres un programador de Python. Nada mas." out))
+      ;; LET y no LET*: los inicializadores de un LET se evaluan EN PARALELO, no
+      ;; en orden, asi que (let ((path p) (got (load ...)))) calcula got con el
+      ;; binding VIEJO. El error no es de CL: es de lectura. LET* ata uno a uno.
+      (let* ((h::*system-prompt-path* p)
+             (got (h::load-system-prompt)))
+        (ok (and got (search "Python" got))
+            "con fichero, el prompt es el del usuario")
+        (ok (not (search "coding assistant" (or got "")))
+            "y no se le anade doctrina de opencode por debajo")))))
+
+
 (deftest protocol/plan-done-y-nada-mas
   "El nombre del hecho de fin de turno decia una cosa y hacia otra.
 
