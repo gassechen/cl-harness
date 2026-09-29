@@ -221,11 +221,19 @@
 
 
 (defun collect-facts-of-type (facts type)
-  "Los hechos de TYPE dentro de FACTS, como datos, en orden de llegada."
-  (mapcar (lambda (f)
-            (when (string= type (fact-type-of f))
-              (fact-data-of f)))
-          facts))
+  "Los hechos de TYPE dentro de FACTS, como datos, en orden de llegada.
+
+   FILTER, no MAPCAR: la version anterior usaba (mapcar (lambda (f) (when ...)
+   ...) facts), que devuelve una lista de la MISMA LONGITUD que FACTS con
+   NILs en las posiciones que no casan. No se notaba porque casi siempre se
+   filtraba despues con REMOVE-IF-NOT, pero (length ...) sobre el resultado
+   contaba tambien los huecos: 2 hechos de los que 1 es file-read daban
+   longitud 2, y un consumidor razonable leia que habia 2 lecturas. Un
+   selector que devuelve huecos es un selector roto por la forma de la
+   llamada, no por la del codigo."
+  (loop for f in facts
+        when (string= type (fact-type-of f))
+          collect (fact-data-of f)))
 
 
 (defun open-goal-tasks ()

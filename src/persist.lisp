@@ -149,6 +149,86 @@
   (metrics-to-json)
   (format t "~&Session ~A saved.~%" *session-id*))
 
+(defun data-get-ci (plist key)
+  "Like DATA-GET, but also accepts the OLD uppercase key (:CONTENTS for
+   :contents). Dumps written by an earlier era -- or read back on a machine
+   with a different reader -- can arrive with the keys in uppercase, and then
+   every DATA-GET in the codebase sees NIL. A fact that looks EMPTY is worse
+   than one that looks wrong, because nothing complains. This one function
+   is what lets the migration see the old facts at all."
+  (or (getf plist key)
+      (getf plist (intern (string-upcase (symbol-name key)) (find-package "KEYWORD")))))
+
+
+(defun audit-restored-facts ()
+  "Return a list of human-readable notes about facts that look like they come
+   from an older version of this codebase. NIL means nothing suspicious.
+
+   The point is not to REJECT old data -- an old session is still a real
+   session, and throwing it away loses work. The point is that loading it
+   silently makes the restored state indistinguishable from the current one:
+   you get a green screen and a broken session. Naming the drift is the
+   difference between debugging and divination."
+  (let ((notes nil)
+        (facts (collect-active-facts)))
+    (flet ((note (fmt &rest args)
+             (push (apply #'format nil fmt args) notes)))
+      ;; I2: :reason no existe todavia, asi que los fallos se guardaban
+      ;; DENTRO de :contents. Un hecho que dice "lei esto" con un motivo de
+      ;; error en :contents no es un hecho roto, es un hecho MENTIROSO.
+      (dolist (f facts)
+        (let ((d (fact-slot f 'data)))
+          (let ((contents (data-get-ci d :contents)))
+            (when (and (string= (fact-slot f 'fact-type) "file-read")
+                       (stringp contents)
+                       (search "not found" contents))
+              (note "hecho file-read con un motivo de error dentro de :contents (~A); lo muevo a :reason"
+                    (data-get-ci d :path))))))
+      ;; :parent-id se elimino de los hechos resultado: era ruido, no
+      ;; jerarquia real. Solo agent-todo lo conserva, y ese se exime.
+      (dolist (f facts)
+        (let ((d (fact-slot f 'data)))
+          (when (and (not (string= (fact-slot f 'fact-type) "agent-todo"))
+                     (or (data-get d :parent-id) (data-get-ci d :parent-id)))
+            (note "hecho ~A trae :parent-id, campo que ya no existe"
+                  (fact-slot f 'fact-type)))))
+      (nreverse notes))))
+
+
+(defun sanitize-i2-facts ()
+  "Move an I2-era error string out of :contents and into :reason.
+
+   Only touches the file-read facts that carry the recognizable error text.
+   A dump written before I2 stored the failure as if it were the file's
+   contents; restored as-is, it tells the model it just read a file that does
+   not exist. Retracting and re-asserting is the honest form of the fix: the
+   fact on the net is now shaped like the current code's facts."
+  (let ((fixed 0))
+    (dolist (f (collect-active-facts))
+      ;; string=, no eql: los strings de los hechos restaurados vienen del
+      ;; dump compilado y no son eq al literal de aqui. eql sobre dos strings
+      ;; compara identidad del objeto, no contenido -- y por eso el fix
+      ;; "no hacia nada" en silencio, sin ningun error que delatara nada.
+      (when (string= (fact-slot f 'fact-type) "file-read")
+        (let* ((d (fact-slot f 'data))
+               (contents (data-get-ci d :contents)))
+          (when (and (stringp contents)
+                     (or (search "ERROR: File not found" contents)
+                         (search "File not found" contents)))
+            (let ((path (data-get-ci d :path))
+                  (turn (data-get-ci d :turn-id))
+                  (new (list :path path
+                             :applied nil
+                             :reason contents
+                             :turn-id turn)))
+              (retract f)
+              (assert (harness-fact (fact-type "file-read")
+                                    (timestamp (get-universal-time))
+                                    (data new)))
+              (incf fixed))))))
+    fixed))
+
+
 (defun restore-session (&optional (session-id nil))
   "Restore facts from a .lisp dump file.
    When SESSION-ID is given, it becomes the active session (continuity:
@@ -169,7 +249,21 @@
               (restore-facts))
             ;; Restore long-term memory into the mem engine as well.
             (load-mem-engine)
-            (format t "~&Session ~A restored.~%" sid))
+            ;; Un dump de otra epoca se carga entero: rechazarlo perderia
+            ;; sesiones validas. Pero cargar en SILENCIO es lo que hacia
+            ;; imposible sterimar por que fallo, asi que despues se audita y se
+            ;; avisa de lo que vino de mas. Verificar-despues y no
+            ;; verificar-durante: los dumps son codigo ejecutable, y no se
+            ;; puede saber que forma tiene uno hasta haberlo evaluado.
+            (let ((findings (audit-restored-facts)))
+              (if (null findings)
+                  (format t "~&Session ~A restored.~%" sid)
+                  (progn
+                    (format t "~&Session ~A restored WITH WARNINGS:~%" sid)
+                    (dolist (f findings)
+                      (format t "~&  ! ~A~%" f))
+                    (format t "~&  (estado heredado de una version anterior)~%"))))
+            (sanitize-i2-facts))
           (format t "~&No dump found for session ~A.~%" sid)))))
 
 (defun refresh-fact-timestamps ()
@@ -207,11 +301,17 @@
                                                   (start-harness nil))))))))
 
 
-(defun restore-facts (path)
-  "Loads facts from a dump file into the active turn engine."
-  (when (probe-file path)
-    (let ((forms (with-open-file (s path) (read s))))
-      (dolist (f forms)
-        (assert (harness-fact (fact-type (getf f :type))
-                              (timestamp (getf f :ts))
-                              (data (getf f :data))))))))
+;; BORRADO: habia un SEGUNDO `defun restore-facts (path)` aqui al final, y no
+;; estaba muerto por descuido: estaba vivo, y pisaba al bueno.
+;;
+;; El bueno --el que usa restore-session-- es el que el propio serializador
+;; emite DENTRO del dump: un (defun restore-facts () ...) re-evaluable. El malo,
+;; al definirse despues en este fichero, lo sobreescribia con una version que
+;; leia un formato que NINGUN serializador escribe: (getf f :type),
+;; (getf f :ts). El dump real es un (assert (harness-fact (fact-type ...))).
+;;
+;; O sea: la restauracion estaba rota desde antes de todo esto, y se rompia en
+;; silencio, con un "Session ... restored." en pantalla. Solo dejaba rastro un
+;; WARNING de redefinicion que nadie leia.
+;;
+;; Los tests persistence/ de abajo fijan el viaje real con datos, no solo tipos.

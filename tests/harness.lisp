@@ -1223,7 +1223,12 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
    El test comprueba las tres divisiones y que el veredicto de la maquina
    sobrevive al viaje de ida y vuelta."
   (with-temp-dir (dir)
-    (let ((*base-dir* dir))
+    ;; cl-harness::*base-dir* y no *base-dir*: este simbolo NO esta importado
+    ;; en el paquete de pruebas, asi que un (let ((*base-dir* dir)) ...) liga
+    ;; CL-HARNESS/TESTS::*BASE-DIR*, que no lee nadie. El test pasaba verde y
+    ;; dejaba uno.txt y dos.txt en la raiz del proyecto: los tests que "no
+    ;; dependen del disco" si dependian del disco, del equivocado.
+    (let ((cl-harness::*base-dir* dir))
       (with-turn-engine
         (reset-turn-engine)
         (h::write-file "uno.txt" "contenido real\n")
@@ -1285,6 +1290,211 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                 "un plan sin ejecutar se declara PENDING, no desaparece")
             (ok (search "01." card2)
                 "y conserva su numero de paso aunque no se haya ejecutado")))))))
+
+(defun fact-signature (facts)
+  "Una firma comparable de FACTS: tipo + datos relevantes, en orden estable.
+
+   Se mide el DATO, no el tipo. Un hecho que vuelve con el tipo correcto y el
+   motivo vacio es un hecho que miente igual: el viaje se respeta cuando el
+   contenido coincide, no cuando el nombre coincide.
+
+   Se comparan solo los campos que el dump garantiza. El TIMESTAMP se excluye a
+   proposito: el serializador lo re-emite fresco al restaurar, asi que exigirlo
+   seria exigir algo que el formato nunca prometio. Los payloads grandes tambien
+   fuera del cuerpo de la comparacion por :contents truncado: lo que se prueba
+   es que el dato llega, no que el recorte sea identico byte a byte."
+  (let ((out '()))
+    (dolist (f (sort (copy-list facts)
+                     (lambda (a b) (string< (format nil "~A" (h::fact-type-of a))
+                                            (format nil "~A" (h::fact-type-of b))))))
+      (let ((d (h::fact-data-of f)))
+        (push (list (h::fact-type-of f)
+                    (h::data-get d :path)
+                    (h::data-get d :applied)
+                    (h::data-get d :reason)
+                    (h::data-get d :step)
+                    (h::data-get d :verdict)
+                    (h::data-get d :action)
+                    (h::data-get d :turn-id))
+              out)))
+    (nreverse out)))
+
+(deftest persistence/un-viaje-de-ida-y-vuelta-no-cambia-los-hechos
+  "Escribir, volcar, restaurar: los hechos tienen que volver IGUALES.
+
+   Este es el invariante que faltaba, y no porgazateorico. El dump de disco es
+   CODIGO -- un (assert (harness-fact ...)) que se vuelve a cargar -- y por eso
+   un cambio de vocabulario lo rompe en silencio: nadie ve un error, el dump
+   carga bien y aparecen hechos con la forma de la version vieja.
+
+   Ya paso. Los batch-plan，随后 el batch-complete se renombro a plan-done y el
+   :parent-id desaparecio de los hechos resultado, sin tocar el serializador. Un
+   dump de la epoca anterior, restaurado hoy, resucita :PARENT-ID (un campo que
+   ya no existe) y hechos tipados con nombres que nadie emite. Carga sin quejarse
+   y el estado queda mezclado entre dos versiones del protocolo.
+
+   El test fija el viaje entero en DOS motores distintos, que es como pasa de
+   verdad: no basta con recargar en la misma red, porque ahi los hechos siguen
+   vivos y el assert parece funcionar."
+  ;; dumps_dir por CONFIG y no *base-dir*: harness-base-dir prioriza el env
+  ;; CL_HARNESS_DIR sobre *base-dir*, asi que atar solo *base-dir* deja que el
+  ;; entorno de quien lance decida donde acaba el dump. Mismo trope que con el
+  ;; system prompt: hay que atar lo que GANA, no lo que es comodo. Aqui
+  ;; config-value "dumps_dir" es lo que gana, y se ata en memoria con
+  ;; with-test-config, sin tocar el entorno de la maquina.
+  (with-temp-dir (dir)
+    ;; Los TRES directorios, no solo los dos del dump: save-session escribe
+    ;; tambien metricas, y metrics-dir cae a harness-base-dir (= el cwd) si no
+    ;; se ata. Un solo directorio sin atar hacia que el test escribiera en el
+    ;; proyecto real, que es el modo de fallo que se quiere evitar.
+    (with-test-config (("dumps_dir" (merge-pathnames "dumps/" dir))
+                      ("sessions_dir" (merge-pathnames "sessions/" dir))
+                      ("metrics_dir" (merge-pathnames "metrics/" dir)))
+      ;; El base-dir TAMBIEN, y no es opcional: (h::run) es lisa:run, el motor
+      ;; Rete, y escribe ahi. Sin atarlo no es que el test falle por lo que
+      ;; prueba: escribe en el cwd del proyecto. De ahi el error NIL-is-not-a-
+      ;; stream que costó tres intentos de adivinar. Se atan las TRES cosas --
+      ;; config, base-dir y session-id -- y no solo la que se recuerda.
+      (let ((cl-harness::*base-dir* dir) (h:*session-id* "rt-test"))
+      ;; --- ida: un turno con de todo, incluidos los casos que rompen ---
+      (with-turn-engine
+        (h::reset-turn-engine)
+        (h::write-file "uno.txt" "contenido real\n")
+        (h::edit-file "uno.txt" "contenido real" "editado")
+        (h::edit-file "uno.txt" "no esta" "x")            ; FAILED con motivo
+        (h::read-file "no-existe.txt")                     ; FAILED, I2
+        ;; :path, NO :target. :target es la etiqueta de la tarjeta COBOL y
+        ;; nunca llega a ejecutarse: las reglas leen :path. Este test lo
+        ;; descobrio al reventar con "NIL is not of type ... FILE-STREAM" --
+        ;; write-file recibia NIL. No es un fallo de este test: es que la
+        ;; diferencia entre etiqueta y ruta no estaba escrita en ningun sitio,
+        ;; y se nota justo cuando alguien usa la API a mano.
+        (h::assert-batch-intention (list :action :write-file :path "dos.txt"
+                                         :content "hola")
+                                   1)
+        (h::run)
+        (let ((before (fact-signature (h::collect-active-facts)))
+              (before-types (sort (mapcar (lambda (f) (h::fact-type-of f))
+                                          (h::collect-active-facts))
+                                  #'string<)))
+          (ok (plusp (length before-types))
+              (format nil "el turno tiene hechos que perder; hay ~D tipos"
+                      (length before-types)))
+          ;; Volcar. Asi lo hace save-session en cada :save.
+          (h::save-session)
+          (ok (probe-file (h::session-facts-path))
+              "el dump se escribe a disco")
+          ;; --- vuelta, en un motor NUEVO ---
+          (h::reset-turn-engine)
+          (ok (= 0 (length (h::collect-active-facts)))
+              "el motor nuevo arranca vacio: si no, el test probaria nada")
+          (h::restore-session "rt-test")
+          (let ((after (fact-signature (h::collect-active-facts)))
+                (after-types (sort (mapcar (lambda (f) (h::fact-type-of f))
+                                           (h::collect-active-facts))
+                                   #'string<)))
+            (ok (equal before-types after-types)
+                (format nil "los tipos vuelven iguales; antes ~S despues ~S"
+                        before-types after-types))
+            ;; El contenido, no solo el tipo. Un hecho que vuelve con el tipo
+            ;; correcto y el motivo vacio es un hecho que miente igual que antes.
+            (ok (equal before after)
+                (format nil "los DATOS vuelven intactos; antes ~D hechos, despues ~D;~%  antes=~S~%  despues=~S"
+                        (length before) (length after) before after))
+            ;; Y explicitamente: el motivo de un rechazo sigue a su hecho. Es el
+            ;; dato que I6 puso en su sitio y el que mas se pierde al volcar.
+            ;; :test CHAR-EQUAL no sirve: AFTER es una lista de TUPLAS, y el
+            ;; test se compara contra la tupla entera, no contra su contenido.
+            ;; Con char-equal nunca puede encontrar un string dentro de una
+            ;; tupla. La busqueda va sobre la propia tupla: si alguna posicion
+            ;; es el motivo, el motivo viajo.
+            (ok (some (lambda (entry)
+                        (some (lambda (field)
+                                (and (stringp field)
+                                     (search "old_string not found" field)))
+                              entry))
+                      after)
+                "el motivo del rechazo sobrevive al viaje"))))))))
+
+(deftest persistence/un-dump-viejo-no-resucita-el-bug-de-i2
+  "Un dump escrito con la forma anterior no debe colarse de contrabando.
+
+   Cuando un fichero de facts llega por una via que NO es la de la prueba
+   anterior -- restaurado a mano, copiado de otra maquina, de un dump de hace
+   semanas -- su forma no se ha inventado este codigo. Ese fichero puede traer
+   :PARENT-ID en hechos resultado (campo que se elimino), o el error de I2
+   escondido dentro de :CONTENTS en vez de en :reason.
+
+   La segunda es la grave: es un hecho que AFIRMA que leyo el contenido de un
+   fichero, y su 'contenido' es la cadena 'ERROR: File not found'. Si eso vuelve
+   al contexto, el modelo cree que ha leido un fichero que no existe. No es un
+   dato viejo, es un dato falso restaurado con toda la autoridad de un hecho.
+
+   Que el dump viejo cargue es inevitable -- no se puede rechazar un fichero
+   entero sin perder las sesiones validas. Lo que NO debe pasar es que sobreviva
+   en silencio: un aviso mientras se restaura."
+  (with-temp-dir (dir)
+    ;; Los TRES directorios, no solo los dos del dump: save-session escribe
+    ;; tambien metricas, y metrics-dir cae a harness-base-dir (= el cwd) si no
+    ;; se ata. Un solo directorio sin atar hacia que el test escribiera en el
+    ;; proyecto real, que es el modo de fallo que se quiere evitar.
+    (with-test-config (("dumps_dir" (merge-pathnames "dumps/" dir))
+                      ("sessions_dir" (merge-pathnames "sessions/" dir))
+                      ("metrics_dir" (merge-pathnames "metrics/" dir)))
+      (let ((h:*session-id* "viejo"))
+      (h::ensure-dirs)
+      ;; Escribo a mano un dump con la forma de antes de I2, tal como lo
+      ;; produciria el serializador de la epoca pasada.
+      (with-open-file (s (h::session-facts-path) :direction :output :if-exists :supersede)
+        (format s ";;; Session viejo facts dump~%")
+        (format s "(setf *turn-counter* 1)~%")
+        (format s "(setf *todo-counter* 0)~%")
+        (format s "(setf *epoch-counter* 0)~%")
+        (format s "(defun restore-facts ()~%  (progn~%")
+        ;; I2 roto: el motivo escondido dentro de :contents.
+        (format s "    (assert (harness-fact (fact-type ~S)~%" "file-read")
+        (format s "                                 (timestamp (get-universal-time))~%")
+        (format s "                                 (data (quote ~S))))~%"
+                (list :path "/tmp/no-existe.txt"
+                      :contents "ERROR: File not found: /tmp/no-existe.txt"
+                      :turn-id 1 :parent-id 1))
+        ;; :parent-id residual, campo que ya no existe en el codigo.
+        (format s "    (assert (harness-fact (fact-type ~S)~%" "file-write")
+        (format s "                                 (timestamp (get-universal-time))~%")
+        (format s "                                 (data (quote ~S))))~%"
+                (list :path "a.txt" :applied t :bytes 3 :turn-id 1 :parent-id 1))
+        (format s "    t))~%"))
+      ;; El motor de Rete, la captura de stdout y la restauracion van JUNTOS,
+      ;; en el MISMO with-turn-engine que las aserciones. Separarlos hacia que
+      ;; la restauracion Happens en un motor y las aserciones mirasen a otro
+      ;; vacio -- y de ahi el "WARNED is unbound": no era el aviso, era que el
+      ;; let de masNIVEL se evaluaba con un cuerpo que aun no existia.
+      ;; FIXME: con-output-to-string solo captura stdout, no el aviso real.
+      (let ((warned nil))
+        (h::with-turn-engine
+          (h::reset-turn-engine)
+          (setf warned
+                (with-output-to-string (o)
+                  (let ((*standard-output* o))
+                    (h::restore-session "viejo"))))
+          (let ((reads (h::collect-facts-of-type (h::collect-active-facts) "file-read")))
+            ;; 1. El hecho entra: no se puede rechazar el fichero entero.
+            (ok (= 1 (length reads))
+                "el dump viejo se restaura: perder la sesion entera seria peor")
+            ;; 2. Pero AVISA. Un restaurado silencioso de datos de otra epoca es
+            ;; justo lo que hace imposible sterimar por que fallo.
+            (ok (or (search "parent-id" warned)
+                    (search "PARENT-ID" warned)
+                    (search "restaurado" warned))
+                (format nil "y avisa de lo que trae de otra version; aviso=~S" warned))
+            ;; 3. Y un hecho que AFIRMA haber leido un fichero inexistente no se
+            ;; queda con la mentira puesta como contenido.
+            (let ((contents (h::data-get (first reads) :contents)))
+              (ok (not (and (stringp contents)
+                            (or (search "ERROR: File not found" contents)
+                                (search "not found" contents))))
+                  (format nil "el motivo del I2 no vuelve disfrazado de :contents; hay ~S"
+                          contents))))))))))
 
 (deftest protocol/plan-done-y-nada-mas
   "El nombre del hecho de fin de turno decia una cosa y hacia otra.
