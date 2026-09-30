@@ -524,22 +524,30 @@
   (dolist (d order)
     (let* ((n (data-get d :step))
            (turn (data-get d :turn-id))
-           ;; EMPAREJAR POR (turn-id, step), NO POR step SOLO.
+           ;; La ronda del plan. Normalizada a 1: un plan sin :round (hecho a
+           ;; mano, o de una version anterior) es la ronda 1, no "otra".
+           (round (or (data-get d :round) 1))
+           ;; EMPAREJAR POR (turn-id, round, step), NO POR step SOLO.
            ;;
-           ;; El numero de paso se reinicia cada turno: 02. del turno 1 y 02.
-           ;; del turno 2 son el mismo numero y turnos distintos. Emparejando
-           ;; solo por :step, el paso 2 del turno 2 se llevaba el veredicto del
-           ;; turno 1 -- y como el plan de ambos turnos suele tener el MISMO
-           ;; numero de pasos, eso no es un caso raro: es cualquier sesion de
-           ;; dos turnos. La tarjeta se ve perfecta, con STATE rellenado, solo
-           ;; que con el dato de otro turno. Un paso que se escribio bien
-           ;; aparecia como FAILED, con el motivo de un fallo que no era suyo.
+           ;; El numero de paso se reinicia cada TURNO y cada RONDA. Dos casos
+           ;; reales, no teoricos:
            ;;
-           ;; :turn-id a NIL (un plan sin turno) solo empareja con veredictos
-           ;; sin turno, para no cruzarlos con los que si lo tienen.
+           ;;  - Turnos: 02. del turno 1 y 02. del turno 2 son el mismo numero
+           ;;    y turnos distintos. Emparejando solo por :step, el paso 2 del
+           ;;    turno 2 se llevaba el veredicto del turno 1.
+           ;;
+           ;;  - Rondas: un turno tiene varias respuestas del LLM y cada una
+           ;;    renumera desde 1. Ese mismo turno puede tener un 01. WRITE, un
+           ;;    01. EXEC y un 01. READ, y con solo (turn-id, step) los tres
+           ;;    cogian el PRIMER veredicto step 1 -- el del write -- y el EXEC
+           ;;    salia APPLIED aunque hubiera fallado.
+           ;;
+           ;; :turn-id o :round a NIL solo emparejan entre si (via la
+           ;; normalizacion), para no cruzarlos con los que si los tienen.
            (v (find-if (lambda (vd)
                          (and (eql (data-get vd :step) n)
-                              (eql (data-get vd :turn-id) turn)))
+                              (eql (data-get vd :turn-id) turn)
+                              (eql (or (data-get vd :round) 1) round)))
                        verdicts))
            (verdict (data-get v :verdict))
            ;; OJO: :APPLIED y :FAILED son keywords y los dos son truthy. Hay
@@ -550,12 +558,14 @@
                         (symbol-name (if (keywordp verdict) verdict :failed)))
                       "pending")))
       ;; El turno va en la etiqueta, porque la numeracion de COBOL se REINICIA
-      ;; por turno y sola no distingue 02. del turno 1 de 02. del turno 2. Sin
-      ;; esto la tarjeta tiene dos 01. y dos 02. y no hay forma de saber cuales
-      ;; pertenecen a cual, que es justo lo que el formato tiene que evitar.
-      (format s "    ~A  T~A ~A  ~A~%"
+      ;; por turno y sola no distingue 02. del turno 1 de 02. del turno 2. La
+      ;; RONDA se anade solo cuando es >1 -- en el caso comun de una sola
+      ;; respuesta por turno no hay nada que desambiguar y la etiqueta no se
+      ;; ensucia.
+      (format s "    ~A  T~A~@[ R~A~] ~A  ~A~%"
               (cobol-step-label n)
               (or turn "-")
+              (when (> round 1) round)
               (cobol-verb (or (data-get d :action) "?"))
               (or (data-get d :target) "-"))
       ;; PENDING cuando no hay veredicto: lo que el modelo pidio y todavia no
@@ -689,7 +699,13 @@
                           (collect-active-todos)))
         (plan-keys (make-hash-table :test #'equal)))
     (dolist (d (plan-steps-of facts))
-      (setf (gethash (cons (data-get d :step) (data-get d :turn-id)) plan-keys) t))
+      ;; Clave con CONS anidado, no LIST: en este paquete LIST es la de LISA y
+      ;; devuelve un patron, no una lista.
+      (setf (gethash (cons (data-get d :step)
+                           (cons (or (data-get d :round) 1)
+                                 (data-get d :turn-id)))
+                     plan-keys)
+            t))
     (dolist (f facts)
       (let* ((type (fact-type-of f))
              (data (fact-data-of f))
@@ -699,7 +715,9 @@
         ;; misma verdad dos veces. El que no tiene paso -- porque el cap de
         ;; batch-plan lo retiro -- se cae al flujo para no perderse.
         (when (or (not (string= type "verdict"))
-                  (not (gethash (cons (data-get data :step) (data-get data :turn-id))
+                  (not (gethash (cons (data-get data :step)
+                                      (cons (or (data-get data :round) 1)
+                                            (data-get data :turn-id)))
                                 plan-keys)))
           ;; Carry the full ORDER KEY, not the bare timestamp: two events in the
           ;; same second used to be re-sorted here with no tiebreaker, which is how

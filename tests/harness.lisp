@@ -19,6 +19,8 @@
                 #:reset-turn-engine #:reset-mem-engine
                 #:durable-type-p #:promote-durable-facts #:mem-engine-facts
                 #:collect-active-facts #:retract-oldest-of-type #:fact-slot
+                ;; rondas
+                #:*batch-round*
                 ;; metrics
                 #:metrics-reset #:build-context
                 ;; config
@@ -1382,6 +1384,12 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
     (let ((cl-harness::*base-dir* dir))
       (with-turn-engine
         (h::reset-turn-engine)
+        ;; Ambos turnos son de UNA sola ronda. Se fija explicito porque este
+        ;; test encadena parse+run a mano y no pasa por process-turn, que es el
+        ;; que reinicia la ronda: sin esto, el test hereda la ronda de la ultima
+        ;; ronda del turno anterior que se ejecutara antes, y las etiquetas salen
+        ;; con un R2 que aqui no existe.
+        (setf cl-harness::*batch-round* 1)
         ;; --- turno 1: dos pasos, el segundo se rechaza ---
         (incf cl-harness::*turn-counter*)
         (h::parse-llm-batch-to-intentions
@@ -1445,6 +1453,145 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
           (ok (not (search "02.  T4 WRITE-FILE  t2b.txt~%        STATE = FAILED" card))
               (format nil "el paso 2 del turno 2 se empareja con su propio turno; tarjeta=~S"
                       card)))))))
+
+
+(deftest protocol/dos-rondas-en-un-turno-no-comparten-paso
+  "La numeracion de pasos se reinicia por RONDA, no solo por turno.
+
+   Un turno de usuario tiene varias respuestas del LLM y cada una propone su
+   lote con los pasos 1..N. El paso 1 de la ronda 1 y el paso 1 de la ronda 2
+   son el MISMO par `(turn-id, step)`: con esa clave el JOIN los confunde. Aqui
+   la ronda 1 escribe a.txt (APPLIED) y la ronda 2 edita un fichero que no
+   existe (FAILED). Como el primer veredicto con step 1 es APPLIED, un JOIN sin
+   la ronda le pega ese APPLIED al edit que fallo -- la tarjeta se ve perfecta y
+   esconde el fallo. Con la ronda en la clave, cada paso conserva su STATE."
+  (with-temp-dir (dir)
+    (let ((cl-harness::*base-dir* dir))
+      (with-turn-engine
+        (h::reset-turn-engine)
+        ;; El turno se toma de rebote porque NO tiene por que ser el 1: la
+        ;; suite deja el contador donde lo dejara el test anterior y esta
+        ;; prueba no depende de eso. La etiqueta sale del turno real, asi que
+        ;; se compone con el, no con un 1 de madera.
+        (let ((turn (incf cl-harness::*turn-counter*)))
+          ;; --- ronda 1: escribe a.txt, APPLIED ---
+          (setf cl-harness::*batch-round* 1)
+          (h::parse-llm-batch-to-intentions
+           "{\"tool_calls\":[{\"name\":\"write_file\",\"arguments\":{\"path\":\"a.txt\",\"content\":\"a\"}}]}")
+          (h::run)
+          ;; --- ronda 2: MISMO turno, MISMO numero de paso, pero falla ---
+          (setf cl-harness::*batch-round* 2)
+          (h::parse-llm-batch-to-intentions
+           "{\"tool_calls\":[{\"name\":\"edit_file\",\"arguments\":{\"path\":\"noexiste.txt\",\"old_string\":\"nada\",\"new_string\":\"b\"}}]}")
+          (h::run)
+          (let* ((facts (h::collect-active-facts))
+                 (card (h::render-plan-card facts))
+                 (p1 (or (search (format nil "01.  T~A WRITE-FILE  a.txt" turn) card) 0))
+                 (p2 (or (search (format nil "01.  T~A R2 EDIT-FILE  noexiste.txt" turn) card)
+                         (length card)))
+                 ;; Bloques independientes del orden en que sort los deje.
+                 (r1-block (if (< p1 p2) (subseq card p1 p2) (subseq card p1)))
+                 (r2-block (if (< p2 p1) (subseq card p2 p1) (subseq card p2))))
+            ;; El paso de la ronda 2 lleva su ronda en la etiqueta; el de la
+            ;; ronda 1 no, porque con una sola respuesta no hay ambiguedad.
+            (ok (search (format nil "01.  T~A WRITE-FILE  a.txt" turn) card)
+                "el paso de la ronda 1 conserva su identidad sin sufijo de ronda")
+            (ok (search (format nil "01.  T~A R2 EDIT-FILE  noexiste.txt" turn) card)
+                "el paso de la ronda 2 lleva su ronda: mismo turno y mismo numero")
+            ;; Cada STATE sigue a SU paso.
+            (ok (search "STATE = APPLIED" r1-block)
+                "la ronda 1 se queda con su APPLIED")
+            (ok (not (search "STATE = FAILED" r1-block))
+                "y no se le contagia el FAILED de la ronda 2")
+            (ok (search "STATE = FAILED" r2-block)
+                "la ronda 2 se queda con su FAILED")
+            (ok (not (search "STATE = APPLIED" r2-block))
+                (format nil "y no se le contagia el APPLIED de la ronda 1; r2=~S"
+                        r2-block)))))))
+    ;; La ronda se devuelve a 1: el estado global de la ronda es de la ronda del
+    ;; turno, y un test que se la deja puesta se la pasa al siguiente.
+    (setf cl-harness::*batch-round* 1))
+
+
+(deftest protocol/un-turno-que-revienta-no-deja-la-ronda-puesta
+  "La ronda baja a 1 aunque el turno muera por excepcion.
+
+   El reinicio va dentro de un UNWIND-PROTECT precisamente porque el cuerpo de
+   un turno hace trabajo a mitad -- run, las reglas, build-context, save-session
+   -- que puede morir. Con el reinicio al final del cuerpo, una excepcion se
+   saltaba por encima y *batch-round* se quedaba en la ultima ronda.
+
+   No es cosmetico. La ronda se graba DENTRO del hecho (:round de
+   ASSERT-BATCH-PLAN) y forma parte de la clave del JOIN (turn-id, round, step).
+   Un valor fugado no ensucia solo una variable: sella los pasos del turno
+   siguiente con una ronda que no es suya, y sus veredictos dejan de encajar.
+
+   La excepcion se inyecta en BUILD-CONTEXT, no en CALL-LLM: la de LLM ya va en
+   HANDLER-CASE dentro de PROCESS-TURN y ahi no se escapa nada. Lo que se quiere
+   es un fallo en la zona que NO esta protegida, y para que la ronda ya haya
+   subido a 2 tiene que caer en la tercera llamada: las dos primeras son la de
+   entrada y la de la primera iteracion del bucle.
+
+   OJO, y esto es lo que hacia que la primera version de este test no probara
+   nada: NUNCA con (let ((*batch-round* 1)) ...). Eso crea un binding LEXICO
+   que sombrea la global, y el aserto de abajo midia la local, que vale 1 siempre.
+   Con el codigo mutado -- el cleanup del unwind-protect anulado -- el test
+   pasaba igual. La ronda se toca por su nombre global, sin let."
+  (with-temp-dir (dir)
+    (let ((cl-harness::*base-dir* dir))
+      (with-turn-engine
+        (h::reset-turn-engine)
+        (metrics-reset)
+        ;; Se parte de una ronda que NO es 1, para que el aserto final no pueda
+        ;; pasar por casualidad: si el cleanup no corre, el valor con el que
+        ;; sale el turno muerto es el ultimo que le puso el bucle.
+        (setf cl-harness::*batch-round* 1)
+        (let ((builds 0)
+              (inyectado nil)
+              (original (symbol-function 'h::build-context)))
+          (unwind-protect
+               (progn
+                 (setf (symbol-function 'h::build-context)
+                       (lambda (msg)
+                         (declare (ignore msg))
+                         (incf builds)
+                         (when (> builds 3)
+                           (setf inyectado t)
+                           (error "fallo inyectado en build-context"))
+                         (funcall original msg)))
+                 (with-test-config (("llm_provider" "batch")
+                                    ("llm_stream" nil)
+                                    ("batch_max_iterations" 8)
+                                    ("batch_repeat_tolerance" 0))
+                   (with-mocked-call-llm
+                       ((format nil
+                                 "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.lisp\"}}}]}"))
+                     ;; La excepcion se atrapa FUERA de PROCESS-TURN, que es
+                     ;; justo lo que hace quien lo llama: el REPL muere, un
+                     ;; embedder sigue. El fallo no es de PROCESS-TURN.
+                     (handler-case (h::process-turn "lee a.lisp" "prompt")
+                       (error () nil)))))
+            (setf (symbol-function 'h::build-context) original))
+          ;; Precondicion: si el error no llego a dispararse, el test no esta
+          ;; midiendo nada y pasaria por la rama que no importa.
+          (ok inyectado
+              (format nil "el fallo inyectado tiene que ocurrir; hubo ~D llamadas a build-context"
+                      builds))
+          (ok (= 1 cl-harness::*batch-round*)
+              (format nil "un turno que revienta no puede dejar la ronda puesta; salio ~A"
+                      cl-harness::*batch-round*))
+          ;; Y la consecuencia, medida: el siguiente turno sella sus pasos en la
+          ;; ronda 1, no en la que filtro el turno muerto.
+          (h::assert-batch-plan
+           (list :step 1 :action :read-file :path "a.lisp"
+                 :turn-id 99 :round cl-harness::*batch-round*)
+           1)
+          (let* ((facts (h::collect-active-facts))
+                 (plans (h::collect-facts-of-type facts "batch-plan"))
+                 (round (h::data-get (first plans) :round)))
+            (ok (= 1 round)
+                (format nil "el turno siguiente se sella en la ronda 1; se sello en la ~A"
+                        round))))))))
 
 
 (defun fact-signature (facts)

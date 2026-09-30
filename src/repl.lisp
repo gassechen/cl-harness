@@ -288,124 +288,150 @@
    In batch mode, it runs Rete to execute intentions and calls LLM again."
   (setf *loop-alerted-turn* nil)
   (incf *turn-counter*)
-  (let* ((turn *turn-counter*)
-         (batch-iterations 1)
-         (naive (progn
-                  (assert (harness-fact (fact-type "user-input")
-                            (timestamp (get-universal-time))
-                            (data (list :text user-message
-                                        :turn-id turn))))
-                  (naive-context-string)))
-         (context (build-context user-message))
-         (streamed (llm-stream-p))
-         (response (handler-case
-                       (progn
-                         (setf *last-llm-usage* nil)
-                         (setf *llm-call-log* nil)
-                         (setf *llm-response-model* nil)
-                         (setf *last-llm-call-info* nil)
-                         (when streamed
-                           (format *standard-output* "~&assistant>~%")
-                           (force-output *standard-output*))
-                         (call-llm system-prompt context user-message))
-                     (error (e) (format nil "[LLM ERROR] ~A" e)))))
+  ;; La ronda del LLM se reinicia con el turno. La primera respuesta es la
+  ;; ronda 1; el bucle de abajo la sube antes de cada llamada siguiente, para
+  ;; que cada lote del mismo turno tenga su propia identidad de paso.
+  (setf *batch-round* 1)
+  ;; UNWIND-PROTECT, no un setf al final. El cuerpo de un turno hace trabajo de
+  ;; verdad a mitad -- run, las reglas de Rete, build-context, save-session -- y
+  ;; cualquiera de esos puede morir. Con el reinicio al final, una excepcion se
+  ;; saltaba por encima y *batch-round* se quedaba en la ultima ronda del turno
+  ;; que murio. Como es global y plano, el valor se lo quedaba el turno
+  ;; siguiente, y ahi si hacia dano: la ronda se graba DENTRO del hecho
+  ;; (:round de assert-batch-plan) y forma parte de la clave del JOIN
+  ;; (turn-id, round, step). Un plan de la ronda 1 sellado con round=3 ya no
+  ;; encuentra su veredicto, y el fallo se ve tres turnos mas tarde, cuando el
+  ;; modelo pregunta por que el paso 1 no lo tiene.
+  ;;
+  ;; El (setf *batch-round* 1) de ARRIBA no sobra: son dos defensas distintas.
+  ;; Esta da entrada a CUALQUIER turno, esta da salida a ESTE turno.
+  (unwind-protect
+    (let* ((turn *turn-counter*)
+           (batch-iterations 1)
+           (naive (progn
+                    (assert (harness-fact (fact-type "user-input")
+                              (timestamp (get-universal-time))
+                              (data (list :text user-message
+                                          :turn-id turn))))
+                    (naive-context-string)))
+           (context (build-context user-message))
+           (streamed (llm-stream-p))
+           (response (handler-case
+                         (progn
+                           (setf *last-llm-usage* nil)
+                           (setf *llm-call-log* nil)
+                           (setf *llm-response-model* nil)
+                           (setf *last-llm-call-info* nil)
+                           (when streamed
+                             (format *standard-output* "~&assistant>~%")
+                             (force-output *standard-output*))
+                           (call-llm system-prompt context user-message))
+                       (error (e) (format nil "[LLM ERROR] ~A" e)))))
     
-    ;; --- EJECUCIÓN CONTROLADA POR RETE ---
-    (when (and (string-equal (llm-provider) "batch")
-               response
-               (not (search "[LLM ERROR]" response :test #'char=)))
-      (let ((max-rounds (or (batch-max-iterations) most-positive-fixnum))
-            (seen (make-hash-table :test 'equal))
-            (repeats 0)
-            (aborted nil))
-        (loop for i from 1
-              while (and response
-                         (< i max-rounds)
-                         (not (search "[LLM ERROR]" response :test #'char=))
-                         (not (plan-done-p)))
-              do (let ((fingerprint (batch-fingerprint response)))
-                (if (and (plusp (batch-repeat-tolerance))
-                         (gethash fingerprint seen))
-                    (progn
-                      (incf repeats)
-                      ;; A model that re-requests the IDENTICAL batch is not
-                      ;; reacting to the tool result: it is stuck. Abort instead
-                      ;; of paying for the same failure again.
-                      ;; *LAST-LLM-CALL-INFO* is written once at the end, with
-                      ;; :PATH = :BATCH-REPEATED, so set it here only as the
-                      ;; abort reason.
-                      (when (> repeats (batch-repeat-tolerance))
-                        (setf aborted :batch-repeated)))
-                       (progn
-                         (setf (gethash fingerprint seen) t)
-                         (format t "~&[DEBUG process-turn] Disparando (run) - Ronda ~A...~%" i)
-                         (detect-blind-writes)
-                         (run)
-                         (let ((new-context (build-context user-message)))
-                           (incf batch-iterations)
-                           (setf response
-                                 (handler-case
-                                     (call-llm system-prompt new-context user-message)
-                                   (error (e)
-                                     (setf aborted :llm-error)
-                                     (format nil "[LLM ERROR] ~A" e)))))))))
-        (when (and (not aborted)
-                   response
-                   (not (search "[LLM ERROR]" response :test #'char=))
-                   (not (plan-done-p)))
-        ;; The loop only ends early on those three conditions, so reaching
-        ;; here with a pending batch means batch_max_iterations ran out.
-        (setf aborted :iterations))
-    (when aborted
-      ;; NOTE: no "~:" directives anywhere in this message. In this Lisp
-      ;; "~:P"/"~:A" do NOT consume an argument, so the FORMAT swallowed the
-      ;; wrong value and the configured cap was never printed (it said
-      ;; "maximo 2" with batch_max_iterations=8).
-      (format t "~&[HARNESS BATCH ABORT] ~A tras ~D ronda(s) (maximo ~D)~%"
-                  (case aborted
-                    (:batch-repeated "el modelo repitio el mismo lote")
-                    (:iterations "se agoto batch_max_iterations")
-                    (t "error del proveedor"))
-                  batch-iterations
-                  max-rounds)
-          (setf *last-llm-call-info*
-                (list :iterations batch-iterations :path aborted)))))
-    ;; -------------------------------
+      ;; --- EJECUCIÓN CONTROLADA POR RETE ---
+      (when (and (string-equal (llm-provider) "batch")
+                 response
+                 (not (search "[LLM ERROR]" response :test #'char=)))
+        (let ((max-rounds (or (batch-max-iterations) most-positive-fixnum))
+              (seen (make-hash-table :test 'equal))
+              (repeats 0)
+              (aborted nil))
+          (loop for i from 1
+                while (and response
+                           (< i max-rounds)
+                           (not (search "[LLM ERROR]" response :test #'char=))
+                           (not (plan-done-p)))
+                do (let ((fingerprint (batch-fingerprint response)))
+                  (if (and (plusp (batch-repeat-tolerance))
+                           (gethash fingerprint seen))
+                      (progn
+                        (incf repeats)
+                        ;; A model that re-requests the IDENTICAL batch is not
+                        ;; reacting to the tool result: it is stuck. Abort instead
+                        ;; of paying for the same failure again.
+                        ;; *LAST-LLM-CALL-INFO* is written once at the end, with
+                        ;; :PATH = :BATCH-REPEATED, so set it here only as the
+                        ;; abort reason.
+                        (when (> repeats (batch-repeat-tolerance))
+                          (setf aborted :batch-repeated)))
+                         (progn
+                           (setf (gethash fingerprint seen) t)
+                           (format t "~&[DEBUG process-turn] Disparando (run) - Ronda ~A...~%" i)
+                           (detect-blind-writes)
+                           (run)
+                           (let ((new-context (build-context user-message)))
+                             (incf batch-iterations)
+                             ;; La siguiente respuesta del LLM es una ronda nueva
+                             ;; del MISMO turno. Sus pasos vuelven a numerarse
+                             ;; desde 1, y sin subir la ronda el JOIN plan<->veredicto
+                             ;; cruzaria los lotes.
+                             (setf *batch-round* (1+ i))
+                             (setf response
+                                   (handler-case
+                                       (call-llm system-prompt new-context user-message)
+                                     (error (e)
+                                       (setf aborted :llm-error)
+                                       (format nil "[LLM ERROR] ~A" e)))))))))
+          (when (and (not aborted)
+                     response
+                     (not (search "[LLM ERROR]" response :test #'char=))
+                     (not (plan-done-p)))
+          ;; The loop only ends early on those three conditions, so reaching
+          ;; here with a pending batch means batch_max_iterations ran out.
+          (setf aborted :iterations))
+      (when aborted
+        ;; NOTE: no "~:" directives anywhere in this message. In this Lisp
+        ;; "~:P"/"~:A" do NOT consume an argument, so the FORMAT swallowed the
+        ;; wrong value and the configured cap was never printed (it said
+        ;; "maximo 2" with batch_max_iterations=8).
+        (format t "~&[HARNESS BATCH ABORT] ~A tras ~D ronda(s) (maximo ~D)~%"
+                    (case aborted
+                      (:batch-repeated "el modelo repitio el mismo lote")
+                      (:iterations "se agoto batch_max_iterations")
+                      (t "error del proveedor"))
+                    batch-iterations
+                    max-rounds)
+            (setf *last-llm-call-info*
+                  (list :iterations batch-iterations :path aborted)))))
+      ;; -------------------------------
 
-    ;; --- POLÍTICA DE EPOCHS AUTOMÁTICA ---
-    (when (and (> *turn-counter* 0)
-               (zerop (mod *turn-counter* 5)))
-      (create-epoch (format nil "Consolidated context up to turn ~A" *turn-counter*) *turn-counter*)
+      ;; --- POLÍTICA DE EPOCHS AUTOMÁTICA ---
+      (when (and (> *turn-counter* 0)
+                 (zerop (mod *turn-counter* 5)))
+        (create-epoch (format nil "Consolidated context up to turn ~A" *turn-counter*) *turn-counter*)
+        (when *debug-mode*
+          (format t "~&[DEBUG process-turn] Epoch creado en turno ~A. Limpiando hechos viejos.~%" *turn-counter*)))
+      ;; --------------------------------------
+
+      (record-context-metrics context user-message
+                              :naive-str naive
+                              :real-prompt (getf *last-llm-usage* :prompt)
+                              :real-completion (getf *last-llm-usage* :completion)
+                              :llm-iterations batch-iterations
+                              :llm-path (getf *last-llm-call-info* :path))
+    
+      ;; FIX AUTO-ENVENENAMIENTO: la respuesta del modelo nunca se guarda cruda.
+      ;; Un lote de tool_calls es maquinaria, no conversación, y un texto vacío
+      ;; dejaba el turno registrado como silencio aunque el lote hubiera hecho
+      ;; trabajo real. En ambos casos se registra lo que efectivamente pasó.
+      (when (and response (not (search "[LLM ERROR]" response :test #'char=)))
+        (assert (harness-fact (fact-type "llm-response")
+                  (timestamp (get-universal-time))
+                  (data (list :text (conversational-response-p response turn)
+                              :turn-id turn
+                              :parent-id turn)))))
+    
       (when *debug-mode*
-        (format t "~&[DEBUG process-turn] Epoch creado en turno ~A. Limpiando hechos viejos.~%" *turn-counter*)))
-    ;; --------------------------------------
-
-    (record-context-metrics context user-message
-                            :naive-str naive
-                            :real-prompt (getf *last-llm-usage* :prompt)
-                            :real-completion (getf *last-llm-usage* :completion)
-                            :llm-iterations batch-iterations
-                            :llm-path (getf *last-llm-call-info* :path))
-    
-    ;; FIX AUTO-ENVENENAMIENTO: la respuesta del modelo nunca se guarda cruda.
-    ;; Un lote de tool_calls es maquinaria, no conversación, y un texto vacío
-    ;; dejaba el turno registrado como silencio aunque el lote hubiera hecho
-    ;; trabajo real. En ambos casos se registra lo que efectivamente pasó.
-    (when (and response (not (search "[LLM ERROR]" response :test #'char=)))
-      (assert (harness-fact (fact-type "llm-response")
-                (timestamp (get-universal-time))
-                (data (list :text (conversational-response-p response turn)
-                            :turn-id turn
-                            :parent-id turn)))))
-    
-    (when *debug-mode*
-      (format t "~&[DEBUG process-turn] turn=~A user=~A context-len=~A streamed=~A~%"
-              turn user-message (length context) *llm-streamed*)
-      (when (and *llm-streamed* response)
-        (format t "~&[DEBUG process-turn] response-len=~A~%" (length response))))
-    (save-session)
-    (promote-durable-facts)
-    response))
+        (format t "~&[DEBUG process-turn] turn=~A user=~A context-len=~A streamed=~A~%"
+                turn user-message (length context) *llm-streamed*)
+        (when (and *llm-streamed* response)
+          (format t "~&[DEBUG process-turn] response-len=~A~%" (length response))))
+      (save-session)
+      (promote-durable-facts)
+      response)
+    ;; El cleanup del unwind-protect de arriba: baja la ronda tanto si el turno
+    ;; llego aqui como si se fue por una excepcion a mitad.
+    (setf *batch-round* 1)))
 
 
 

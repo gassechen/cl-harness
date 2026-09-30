@@ -1158,6 +1158,12 @@ batch_execution_mode:
            (data (list :step step-id
                        :action (data-get data :action)
                        :target (or (data-get data :path) (data-get data :command))
+                       ;; La ronda: un turno puede tener varias respuestas del
+                       ;; LLM y cada una renumera los pasos desde 1. Sin esto,
+                       ;; `(turn-id, step)` no basta para el JOIN y el paso 2 de
+                       ;; la ronda 1 se empareja con el veredicto del paso 2 de
+                       ;; la ronda 3.
+                       :round (current-batch-round)
                        :turn-id (current-turn-id)))))
   t)
 
@@ -1169,6 +1175,7 @@ batch_execution_mode:
            (timestamp (get-universal-time))
            (data (append data
                          (list :turn-id (current-turn-id)
+                               :round (current-batch-round)
                                :step step-id
                                :status :pending)))))
   t)

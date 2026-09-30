@@ -30,9 +30,28 @@
 (defparameter *turn-counter* 0
   "Monotonic turn number; incremented at the start of each process-turn.")
 
+(defparameter *batch-round* 1
+  "Ronda (respuesta del LLM) dentro del turno actual.
+
+   Un turno de usuario puede tener VARIAS respuestas del LLM: process-turn
+   itera hasta que el plan termina. Cada respuesta propone su propio lote con
+   los pasos numerados 1..N, asi que :step se reinicia y `(turn-id, step)` NO
+   identifica un paso dentro de un turno: el paso 2 del lote 1 y el paso 2 del
+   lote 3 son el mismo par. El JOIN plan<->veredicto usaba solo esos dos
+   campos, asi que emparejaba por el PRIMER veredicto con ese numero y le
+   pegaba al paso el motivo de otro.
+
+   La ronda se suma a la clave: `(turn-id, round, step)`. La fija process-turn
+   antes de cada llamada al LLM; los tests que no la tocan trabajan en la
+   ronda 1.")
+
 (defun current-turn-id ()
   "Turn context for facts asserted between turns (0 = pre-session setup)."
   *turn-counter*)
+
+(defun current-batch-round ()
+  "Ronda del turno en curso. 1 si nadie la ha fijado (p. ej. en un test)."
+  (or *batch-round* 1))
 
 (defun reset-turn-counter ()
   (setf *turn-counter* 0))
@@ -94,10 +113,19 @@
                                 ;; veredicto mal sellado se emparejaba con el
                                 ;; paso equivocado de otro turno, y la tarjeta
                                 ;; de COBOL ensenaba un FAILED donde hubo un
-                                ;; APPLIED. El JOIN es por (turn-id, step): si
-                                ;; uno de los dos lados miente, cruza.
+                                ;; APPLIED.
+                                ;;
+                                ;; El JOIN es por (turn-id, round, step): la
+                                ;; RONDA hace falta ademas del turno porque un
+                                ;; turno tiene varias respuestas del LLM y cada
+                                ;; una renumera desde 1. Con solo (turn-id, step)
+                                ;; el paso 2 de una ronda se llevaba el veredicto
+                                ;; del paso 2 de otra. La ronda se hereda de la
+                                ;; intencion para no volver a mentir.
                                 :turn-id (or (data-get data :turn-id)
-                                             (current-turn-id)))
+                                             (current-turn-id))
+                                :round (or (data-get data :round)
+                                           (current-batch-round)))
                            (when why (list :reason why))))))))
 
 ;;; ============================================
