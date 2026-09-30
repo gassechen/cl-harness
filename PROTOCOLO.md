@@ -39,7 +39,7 @@ estado, el `PLAN` es una propuesta. El LLM nunca queda bloqueado esperando.
 ### 2.1 `PLAN`
 
 El LLM propone N pasos ordenados. Formato actual: JSON ToolUse, validado por
-`normalize-batch-tool-calls` (`src/llm.lisp:1167`). **No cambiar** — ya está en la
+`normalize-batch-tool-calls` (`src/llm.lisp:1129`). **No cambiar** — ya está en la
 distribución de entrenamiento del modelo y ya tiene validación de esquema.
 
 Estados operacionales por objetivo (ruta), que es la unidad: un turno con tres
@@ -68,7 +68,9 @@ esto porque Y", "esto es una precondición", "voy a comprobar X".
 ### 2.3 `VERDICT`
 
 Lo escribe **solo** el harness, proyectado de los hechos de resultado. Se lleva la
-identidad del paso (`:step`) y un motivo acotado.
+identidad del paso (`:turn-id`, `:round`, `:step`) y un motivo acotado. Los tres campos son
+la clave del `JOIN` con el `PLAN`, y los tres se heredan de la **intención**, no del reloj:
+ver §4.8 y §4.9.
 
 `VERDICT` no viaja suelto: se renderiza **dentro de la tarjeta `PLAN`**, en la
 división que el modelo no controla. Es decir, el mismo formato sirve para las dos
@@ -156,6 +158,46 @@ llega a 0, y solo entonces.
 `PROGRAM-ID` es el id de sesión, no del turno: la tarjeta sobrevive a los turnos, que
 es justo lo que exige I4.
 
+#### La gramática, que es lo que hay que saber para no malinterpretarlo
+
+Lo que emite `build-context`, en orden. Cuatro espacios por nivel de sangría, y un
+valor de varias líneas pone `CLAVE =` a solas y sigue en las líneas siguientes con 12
+espacios.
+
+| Bloque | Cuándo aparece | Qué lleva |
+|---|---|---|
+| `IDENTIFICATION DIVISION.` | siempre | `PROGRAM-ID. <id de sesión>.` |
+| `EPOCH.` / `BASELINE-TURN.` / `SUMMARY.` | si se consolidó un epoch | Va **dentro** de la identificación: es la identidad del programa, no una sección más |
+| `PROCEDURE DIVISION.` | **siempre**, aunque no haya plan | Un bloque por paso del `batch-plan`: `01.  T3 WRITE-FILE  math_utils.py`, su `STATE = …` y su `REASON` si lo hay |
+| `DATA DIVISION.` | siempre | `GOAL ABIERTO. N` y las bananas, con `STATUS`, `PRIORITY` y `PARENT` |
+| `WARNING DIVISION.` | solo si `collect-tool-loops` detecta reintentos | `LOOP.` y qué dejar de hacer |
+| `TURN n.` | uno por turno, del más viejo al actual | `USER.` con su `TEXT`, los hechos de resultado y los veredictos sin tarjeta |
+| `MEMORY DIVISION.` | si hay memoria durable | Lo consolidado; va **dentro** del programa, antes del `GOBACK` |
+| `GOBACK.` | siempre | Cierre |
+
+Cinco detalles que el ejemplo de arriba no enseña:
+
+- **`PROCEDURE DIVISION` y `DATA DIVISION` se emiten aunque estén vacías.** Un programa
+  sin división de procedimiento no es un programa vacío: es un programa *mal formado*,
+  y un modelo que lee «aquí no hay `PROCEDURE`» aprende que la forma del formato cambia
+  según el turno. Una sección vacía se lee como lo que es: no me pidió nada.
+- **`R<n>` solo sale cuando la ronda es mayor que 1** (§4.9). Con una sola respuesta del
+  LLM por turno no hay nada que desambiguar, y la etiqueta no lleva ruido.
+- **Un veredicto sin paso en la tarjeta aparece como `STEP 01` dentro de su `TURN`**, no
+  en la `PROCEDURE`. Pasa cuando el tope de `batch-plan` ya se llevó el plan viejo y
+  dejó los veredictos atrás: es el único sitio donde el modelo se entera de que algo
+  falló. El que **sí** tiene paso no se repite, o diríamos la misma verdad dos veces.
+- **`GOAL ABIERTO. N` cuenta los goals sin completar**, no los que existen. `N` en cero
+  es lo que habilita `DONE`.
+- **`MEMORY DIVISION` va dentro del programa a propósito.** Fuera del `GOBACK` no sería
+  parte de este turno, sería un anexo pegado detrás.
+
+Con `*debug-mode*` activo (`:debug` en el REPL), cada `build-context` vuelca el programa
+**tal cual se le envió al modelo** a `debug/debug-<unix-time>.cob`, bajo `harness-base-dir`
+—que prioriza `CL_HARNESS_DIR` sobre `*base-dir*` sobre el cwd—, creando la carpeta si no
+existe. Es la misma cadena, no una reimpresión: comparar el fichero con lo que el modelo
+vio no admite medias tintas.
+
 Fijado por `protocol/el-plan-se-lee-como-un-programa-cobol`, que comprueba las tres
 divisiones y que el veredicto de la máquina sobrevive al viaje de ida y vuelta.
 
@@ -183,9 +225,9 @@ Verificables, y **escritos para que la suite los afirme sin LLM en el bucle**.
 
 | # | Invariante | Estado actual |
 |---|---|---|
-| I1 | Todo `PLAN` emite exactamente un `VERDICT` por paso antes del siguiente turno | **CUMPLIDO** — `assert-step-verdict` (`src/facts.lisp:56`) ata `:step` a cada resultado; las 4 reglas `execute-intention-*` lo envuelven. Fijado por `protocol/el-plan-sobrevive-a-la-ejecucion` y `protocol/el-verdict-llega-al-modelo-con-su-paso` |
+| I1 | Todo `PLAN` emite exactamente un `VERDICT` por paso antes del siguiente turno | **CUMPLIDO** — `assert-step-verdict` (`src/facts.lisp:82`) ata `:step` a cada resultado; las 4 reglas `execute-intention-*` lo envuelven. Fijado por `protocol/el-plan-sobrevive-a-la-ejecucion` y `protocol/el-verdict-llega-al-modelo-con-su-paso` |
 | I2 | El harness emite `VERDICT` incluso cuando se niega a intentar el paso | **CUMPLIDO** — la regla `edit` ya no pre-valida: delega en `edit-file`, cuyo guard aserta `(file-edit :applied nil :reason …)`. Un solo sitio con la regla. Fijado por `protocol/un-paso-rechazado-deja-veredicto` |
-| I3 | `GOAL` cierra solo con `VERDICT`, nunca con `NOTE` ni por coincidencia de texto | **Correcto y fijado** — `todo-evidence-types` (`src/context.lisp:334`) es 1:1 estricto; `protocol/un-comando-nunca-cierra-un-goal-de-fichero` lo protege |
+| I3 | `GOAL` cierra solo con `VERDICT`, nunca con `NOTE` ni por coincidencia de texto | **Correcto y fijado** — `todo-evidence-types` (`src/context.lisp:372`) es 1:1 estricto; `protocol/un-comando-nunca-cierra-un-goal-de-fichero` lo protege |
 | I4 | Ningún `PLAN` se borra antes de que su resultado esté escrito | **CUMPLIDO** — el `(retract ?f)` va *después* del `assert-step-verdict` en las 4 reglas, y además `assert-batch-intention` aserta un `batch-plan` que nadie retracta. El plan sobrevive a su propia ejecución |
 | I5 | `DONE` se valida contra el estado antes de aceptarse | **CUMPLIDO** — `parse-llm-batch-to-intentions` consulta `open-goal-tasks` y devuelve el rechazo por la vía del error de parseo, para que el modelo reciba en el turno siguiente cuáles quedan. Fijado por `protocol/done-se-valida-contra-los-goals-abiertos` |
 | I6 | Un campo tiene un solo nombre en todo el sistema | **CUMPLIDO** — un solo nombre, `:reason`, en hechos y valores devueltos. Fijado por `protocol/un-rechazo-tiene-un-solo-nombre` |
@@ -202,10 +244,10 @@ No es deuda de formato, es deuda de mensaje:
 
 1. ~~**No existe `VERDICT`.**~~ Resuelto: `verdict` es un hecho de primera clase.
    Y ya existe también `batch-plan`, que es el otro lado del JOIN. Un hecho `batch-plan`
-   por paso —`:step`, `:action`, `:target`— que **no se retracta** al ejecutarse, a
-   diferencia de `intention`, que sí lo hace para que la regla no dispare en bucle. El
-   contexto lo renderiza como la `PROCEDURE DIVISION` del programa (§2.3): cada paso
-   con su veredicto al lado, y `PENDING` para lo que aún no se ha ejecutado.
+   por paso —`:step`, `:action`, `:target`, `:turn-id`, `:round`— que **no se retracta** al
+   ejecutarse, a diferencia de `intention`, que sí lo hace para que la regla no dispare en
+   bucle. El contexto lo renderiza como la `PROCEDURE DIVISION` del programa (§2.3): cada
+   paso con su veredicto al lado, y `PENDING` para lo que aún no se ha ejecutado.
 
    El `plan:` de abajo se conserva porque explica el problema que la tarjeta resolvió,
    no porque sea la forma actual de nada. Ya no hay `plan:`: hay `PROCEDURE DIVISION`.
@@ -233,11 +275,13 @@ No es deuda de formato, es deuda de mensaje:
    y no en un parte. Antes el modelo veía resultados sueltos —"el paso 2 falló"— sin
    haber pedido un paso 2.
 
-   En el `batch-plan` se guarda deliberadamente **solo** paso, acción y objetivo, no la
-   intención entera: `:content` de un `write_file` puede ser el fichero completo, y
-   volarlo al contexto en cada paso es vaciarle el portapapeles al modelo. Lo único que
-   el modelo no sabe de su propio plan es el estado, y el estado es justo lo que el
-   harness le devuelve.
+   En el `batch-plan` se guarda deliberadamente **solo** paso, acción, objetivo, turno y
+   ronda: no la intención entera. `:content` de un `write_file` puede ser el fichero
+   completo, y volarlo al contexto en cada paso es vaciarle el portapapeles al modelo. Lo
+   único que el modelo no sabe de su propio plan es el estado, y el estado es justo lo que
+   el harness le devuelve. `:turn-id` y `:round` no son contexto: son la mitad de la clave
+   del JOIN (§4.9), y sin ellos el `STATE` que se pinta al lado del paso puede ser el de
+   otro.
 
    El renderer **tolera hechos basura a propósito**: un `batch-plan` sin `:step`, o con
    un `:step` que no es entero, se salta. Perder el estado de los pasos buenos por un
@@ -356,9 +400,53 @@ No es deuda de formato, es deuda de mensaje:
    `parse` + `run` sin avanzar el contador está probando dos veces el mismo turno, y todo
    lo que afirma sería verdad por casualidad, no por el código.
 
+9. **El número de paso se reinicia por ronda, y eso era el mismo bug un nivel más abajo.**
+   El turno no es la única unidad que reinicia la numeración: un turno de usuario tiene
+   **varias respuestas del LLM**, y cada una propone su lote con los pasos `1..N`. Un turno
+   puede tener un `01. WRITE`, un `01. EXEC` y un `01. READ`, y los tres son el mismo par
+   `(turn-id, step)`. Con la clave de §8 el `01. EXEC` cogía el veredicto del `01. WRITE`
+   — el primero que aparecía — y salía `APPLIED` aunque hubiera fallado.
+
+   El daño era silencioso porque en la sesión que lo destapó todos los pasos eran `APPLIED`:
+   el cruce no se ve cuando los dos lados coinciden.
+
+   La clave del JOIN es ahora **`(turn-id, round, step)`**. `assert-batch-plan` y
+   `assert-batch-intention` sellan `:round` con `current-batch-round`; `assert-step-verdict`
+   lo **hereda de la intención** —no de `current-batch-round`—, porque releer el valor global
+   reintroduciría exactamente el fallo de §8 en la versión de la ronda. `process-turn` fija
+   la ronda: `1` al abrir el turno y `(1+ i)` antes de cada llamada al LLM dentro del bucle.
+   Y la **baja al terminar el turno**: subida y no bajada, se escapaba a la siguiente sesión.
+
+   La bajada va en un `unwind-protect`, no como un `setf` al final del cuerpo. El cuerpo de
+   un turno hace trabajo de verdad a mitad —`run`, las reglas de Rete, `build-context`,
+   `save-session`— y cualquiera de esos puede morir. Con el reinicio al final, una excepción
+   se saltaba por encima y `*batch-round*` se quedaba en la última ronda. No es cosmético: la
+   ronda se graba **dentro** del hecho (`:round`) y forma parte de la clave del JOIN, así que
+   el valor fugado sella los pasos del turno siguiente con una ronda que no es suya y sus
+   veredictos dejan de encajar. El fallo se vería dos turnos después, cuando el modelo pregunta
+   por qué el paso 1 no tiene veredicto. El `setf` de **entrada** no sobra: son dos defensas
+   distintas —esta da entrada a cualquier turno, el `unwind-protect` da salida a este turno—.
+
+   Fijado por `protocol/un-turno-que-revienta-no-deja-la-ronda-puesta`, que inyecta un fallo en
+   `build-context` en la cuarta llamada (con la ronda ya en 2) y mide dos cosas: que la ronda
+   sale a 1, y que el plan del turno siguiente se sella en la ronda 1. Anulando el cleanup del
+   `unwind-protect`, el test falla con la ronda en 3 y el plan siguiente en la ronda 3.
+
+   En la tarjeta la ronda solo aparece cuando es `> 1` (`01. T1 R2 EDIT-FILE …`): con una
+   sola respuesta por turno no hay nada que desambiguar y la etiqueta no se ensucia. La
+   ausencia de `:round` se normaliza a `1`, para que un plan escrito a mano o un dump de
+   otra versión empareje con la ronda 1 en vez de quedarse sin veredicto.
+
+   Fijado por `protocol/dos-rondas-en-un-turno-no-comparten-paso`: un turno, dos rondas, un
+   paso `1` que se aplica y un paso `1` que falla. Sin la ronda en la clave, el segundo sale
+   `STATE = APPLIED` con el motivo del primero, y el fallo desaparece de la tarjeta.
+
 ## 5. Tests que fijan el protocolo
 
-Sin red, sin LLM, sobre el harness. Los cinco primeros están escritos y verdes:
+Sin red, sin LLM, sobre el harness. La suite entera son **86 tests / 284 checks** y se
+corre con `./run-tests.sh` (código 0 si pasa, 1 si falla, 2 si el sistema no carga). De
+esos, los que **fijan un invariante del protocolo** son los de abajo; los demás cubren
+parseo, acciones, goals, métricas y configuración.
 
 - `protocol/el-plan-sobrevive-a-la-ejecucion` — `PLAN` de 3 pasos → los 3 tienen veredicto. (I1)
 - `protocol/un-paso-rechazado-deja-veredicto` — `edit` con `old_string` vacío → aparece
@@ -383,6 +471,14 @@ Sin red, sin LLM, sobre el harness. Los cinco primeros están escritos y verdes:
 - `protocol/el-plan-se-lee-como-un-programa-cobol` — la tarjeta tiene las tres divisiones,
   el `veredicto` de la máquina sobrevive al viaje, y los ficheros del test no salen del
   directorio temporal. (§2.3)
+- `context/el-contexto-no-es-yaml` — ninguna clave del YAML viejo sobrevive en el
+  contexto, y el programa entero se lee como un solo dialecto. (§2.3)
+- `context/goal-abierto-no-cuenta-los-completados` — `GOAL ABIERTO. N` sale de los goals
+  **sin completar**, no de los que existen: un goal cerrado bajo un rótulo `ABIERTO`.
+  (§2.3)
+- `context/render-shows-file-write-before-its-command` — dos hechos del mismo segundo se
+  ordenan con su clave de orden, no por timestamp: un comando salía por encima del
+  `write` que lo había producido.
 - `persistence/un-viaje-de-ida-y-vuelta-no-cambia-los-hechos` — siete tipos de hechos y
   sus datos sobreviven a `save` → motor nuevo → `restore`, y el motivo de un rechazo sigue
   a su hecho.
@@ -391,7 +487,15 @@ Sin red, sin LLM, sobre el harness. Los cinco primeros están escritos y verdes:
   no devuelve `"ERROR: File not found"` disfrazado de `:contents`.
 - `protocol/dos-turnos-no-comparten-paso` — el paso 2 del turno 1 y el del turno 2 se
   emparejan con su propio veredicto. Aquí falló, y no por poco: una escritura que había
-  funcionado aparecía como `FAILED` con el motivo de un fallo ajeno. (§2.3)
+   funcionado aparecía como `FAILED` con el motivo de un fallo ajeno. (§2.3)
+- `protocol/dos-rondas-en-un-turno-no-comparten-paso` — dos respuestas del LLM en el mismo
+  turno, las dos con un paso `1`: cada una conserva su veredicto. El fallo que falla es el
+   segundo paso, que se ejecutó con `STATE = APPLIED` y el motivo de otro. (§2.3)
+- `protocol/un-turno-que-revienta-no-deja-la-ronda-puesta` — un turno que muere por excepción
+  a mitad no deja `*batch-round*` puesta, y el turno siguiente se sella en la ronda 1. La
+  precondición se comprueba: si el fallo inyectado no llegara a dispararse, el test pasa por
+  la rama que no importa y no mide nada. (§4.9)
+
 - `protocol/plan-done-y-nada-mas` — `DONE` sin goals abiertos se acepta, y nadie emite
   ya el nombre viejo.
 
@@ -422,4 +526,19 @@ Las dos mutaciones que se hicieron:
   hasta que haya una razón para tocarlo.
 - **Orden de trabajo:** resuelto por los hechos, no por decreto. Los tests se
   escribieron primero y el documento salió de ellos; el orden contrario ya había
-  produzido antes un §2.3 entero que describía un formato que nadie implementó.
+  producido antes un §2.3 entero que describía un formato que nadie implementó.
+- **`restore-session` sigue ejecutando el dump con `load`.** El dump es código Lisp: un
+  `(assert (harness-fact …))` que se vuelve a evaluar. Hoy se audita **después** de
+  cargar, así que un dump manipulado ejecuta código antes de que exista el aviso. La
+  auditoría de verdad va **antes**: leer el fichero, buscar las formas viejas
+  (`:parent-id`, `:contents` con `ERROR: File not found`) y avisar antes de ejecutar
+  nada. Cuesta un parser y no un `load`; está pendiente, no resuelto.
+- **`debug/` crece sin podar.** Cada `build-context` con `*debug-mode*` escribe un
+  `debug-<timestamp>.cob` y nadie los borra: una sesión larga con depuración activa deja
+  un fichero por turno. El timestamp completo ordena bien, pero no hay tope ni limpieza.
+  Decidir si `debug/` se poda por antigüedad o si lo borra `:clear`.
+- **Un veredicto huérfano se renderiza como `STEP NN` sin turno ni ronda.** Solo ocurre
+  cuando el tope de `batch-plan` retiró el plan y dejó los veredictos, así que es la ruta
+  rara; pero dos veredictos huérfanos del mismo turno y distinta ronda con el mismo
+  número de paso salen indistinguibles. Llevar la ronda también ahí es barato; no está
+  hecho porque el caso no se ha visto en una sesión real.

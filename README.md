@@ -37,10 +37,10 @@ reducción.
 
 *cl-harness* es un *REPL* interactivo y una librería ASDF. Como REPL, recibe
 instrucciones del usuario, mantiene un estado estructurado (hechos en la memoria
-de trabajo del motor de turno), construye un bloque de contexto en YAML —que
-incluye la memoria a largo plazo—, lo envía a un LLM con herramientas
-disponibles, ejecuta las herramientas que el modelo pida, y registra el
-resultado todo en la memoria de hechos.
+de trabajo del motor de turno), construye el contexto como un **programa COBOL**
+—con la memoria a largo plazo dentro, como `MEMORY DIVISION`—, lo envía a un LLM
+con herramientas disponibles, ejecuta las herramientas que el modelo pida, y
+registra el resultado todo en la memoria de hechos.
 
 Ejemplo de sesión:
 
@@ -106,11 +106,11 @@ el conocimiento durable del proyecto.
                     │  1. incf *turn-counter*                      │
                     │  2. assert hechos (user-input, tools, ...)   │
                     │  3. snapshot línea base "naive"              │
-                    │  4. build-yaml-context → YAML (+ long_term)  │
+                    │  4. build-context → COBOL (+ MEMORY DIV.)    │
                     │  5. call-llm (tool-use + loop detector /     │
                     │     batch: parser JSON ToolUse)               │
                     │  6. (batch) bucle (run)+re-llamada hasta     │
-                    │     batch-complete                           │
+                    │     plan-done                                │
                     │  7. assert respuesta + métricas              │
                     │  8. promote-durable-facts → *mem-engine*     │
                     └───────┬──────────────────────┬───────────────┘
@@ -130,13 +130,13 @@ el conocimiento durable del proyecto.
         │ context.lisp:          │      └──────────────────────────┘
         │  caps por tipo         │
         │  scoring + selección   │      ┌──────────────────────────┐
-        │  render YAML           │      │ Background (background)  │
+        │  render COBOL          │      │ Background (background)  │
         └──────────┬─────────────┘      │ daemon genérico por      │
                    │  promote durables   │ timeout + logfile        │
         ┌──────────▼────────────────────┴──────────────────────────┐
         │ Motor Rete de MEMORIA (*mem-engine*)                     │
         │  mem-dedup-durable  ·  hechos durables (errores/writes)  │
-        │  render long_term_memory:  en cada turno                 │
+        │  render MEMORY DIVISION     en cada turno                │
         └──────────┬───────────────────────────────────────────────┘
                    │
         ┌──────────▼─────────────────────────────────────────────┐
@@ -180,7 +180,7 @@ API: `with-turn-engine`, `with-mem-engine`, `reset-turn-engine`,
 | `engines.lisp`      | **Los dos motores LISA**, promoción turn→mem, `boot-memory`, resets         |
 | `facts.lisp`        | Templates Lisa (`harness-fact`, `context-slot`, `agent-todo`, `context-epoch`), contadores |
 | `rules.lisp`        | Reglas Rete (TTL, dedup, epoch, loops, **intenciones batch**, frenos de emergencia) + helpers imperativos |
-| `context.lisp`      | Render YAML, bloque `long_term_memory`, scoring y selección por presupuesto |
+| `context.lisp`      | Render del programa COBOL, `MEMORY DIVISION`, scoring y selección por presupuesto |
 | `metrics.lisp`      | Métricas por turno: contexto curado vs naive vs uso real; stats por tool    |
 | `actions.lisp`      | Primitivas POSIX: `exec-command`, `read-file`, `write-file`, `edit-file` → hechos |
 | `background.lisp`   | Daemonización genérica de comandos que exceden el timeout (Bordeaux Threads) |
@@ -208,7 +208,7 @@ Todo lo que ocurre se registra como un hecho. El template base es:
 
 Donde `data` es un plist con el payload y los metadatos causales *dentro* del
 plist (no como slots del template), de modo que persistencia, dedup y render
-YAML no necesitan cambios si se agrega metadato:
+del contexto no necesitan cambios si se agrega metadato:
 
 ```lisp
 (assert (harness-fact (fact-type "command-exec")
@@ -230,7 +230,7 @@ YAML no necesitan cambios si se agrega metadato:
 | `tool-loop`      | Loop de herramientas detectado por regla   | Sí                  | No        |
 | `intention`      | Acción batch pendiente (read/write/edit/exec) | No (ciclo pending→retract) | No |
 | `batch-abort`    | Aborto del batch (freno de emergencia)     | No                  | No        |
-| `batch-complete` | Marca de fin de batch (el LLM no pidió más acciones) | No        | No        |
+| `plan-done`      | Fin de turno: el LLM no pidió más acciones y no quedan goals abiertos | No | No        |
 | `agent-todo`     | Objetivo/todo (backward-chaining)          | No (ciclo pending→completed) | No |
 | `context-epoch`  | Checkpoint de consolidación                | 1 activo (se reemplaza) | No    |
 
@@ -238,7 +238,7 @@ Los hechos evocables (evidentials: `command-exec`, `file-read`, `file-write`,
 `tool-loop`) son *re-derivables*: si caducan, el agente puede volver a
 ejecutarlos. La conversación no es re-derivable y por eso nunca caduca por TTL.
 Los `agent-todo`/`context-epoch` existen como plantillas y se renderizan en el
-YAML, pero el harness no los crea automáticamente (uso experimental). Los
+contexto, pero el harness no los crea automáticamente (uso experimental). Los
 `intention` son insumos del *modo batch* (§7) y se retractan tras ejecutarse o
 si un freno de emergencia los cancela.
 
@@ -264,7 +264,7 @@ negativo para correr después del resto:
 - **`prune-superseded-by-epoch`** (salience -40): si hay un *epoch* activo con
   *baseline-seq*, retracta los evidenciales previos al baseline (experimental).
 
-Además, `build-yaml-context` aplica *caps imperativos por tipo*
+Además, `build-context` aplica *caps imperativos por tipo*
 (`retract-oldest-of-type`) para conversación y evidenciales, protegiendo
 siempre a los comandos fallidos.
 
@@ -324,10 +324,10 @@ con evidencia, no timeout) **o** `file-write` (una acción realmente tomada sobr
 el proyecto). La conversación **no** es durable.
 
 `boot-memory` (al arrancar un proceso/sesión nueva) resetea ambos motores, carga
-`dumps/longterm-mem.lisp` en el motor de memoria y corre sus reglas. El bloque
-`long_term_memory:` se agrega al YAML de **cada** turno (ver §5).
+`dumps/longterm-mem.lisp` en el motor de memoria y corre sus reglas. Lo que
+consolida se emite como `MEMORY DIVISION` en **cada** turno (ver §5).
 
-### 5. Selección por scoring y render YAML
+### 5. Selección por scoring y render COBOL
 
 Tras el podado, `select-relevant-facts` puntúa cada hecho restante dentro de un
 presupuesto (`max_context_chars`) y un tope (`max_context_facts`). El scoring
@@ -348,26 +348,84 @@ degrada* el payload de un hecho que se selecciona: se emite íntegro, salvo un
 recorte de cabeza/cola con aviso explícito para payloads gigantes
 (`truncate-payload`, `max_fact_payload_chars`).
 
-`grouped-context-string` renderiza los hechos agrupados por *turn-id*, y
-`build-yaml-context` **agrega al final** el bloque de memoria larga:
+`grouped-context-string` renderiza los hechos agrupados por *turn-id* como un
+**programa COBOL** único, y `build-context` es quien lo llama tras podar y
+seleccionar. Esta es la salida real de `build-context` sobre una sesión con dos
+turnos, un goal abierto y un error en memoria; lo único editado es el
+`PROGRAM-ID`, que se genera en cada corrida:
 
-```yaml
-context:
-  session: session-1893450568
-  turns:
-    3:
-      exec: ls -la -> exit 0
-        output: total 40 ...
-      user: "¿qué SO corre?"
-    4:
-      assistant: "El sistema es Linux 6.18.36 ..."
-long_term_memory:
-  - error: pytest -q -> exit 1
-    evidence: "FAILED tests/test_synth.py::test_accent_changes_sustain ..."
-  - action: wrote /proyecto/synth/engine.py (8421 bytes)
+```
+IDENTIFICATION DIVISION.
+PROGRAM-ID. session-3999758320.
+
+PROCEDURE DIVISION.
+    01.  T3 WRITE-FILE  /tmp/proyecto/math_utils.py
+        STATE = APPLIED
+    02.  T3 EDIT-FILE  /tmp/proyecto/nope.py
+        STATE = FAILED
+        REASON = File not found: /tmp/proyecto/nope.py
+
+DATA DIVISION.
+
+GOAL ABIERTO. 1
+    todo-1  Edit nope.py
+        STATUS = in-progress
+        PRIORITY = normal
+
+TURN 2.
+    EXEC-COMMAND.
+        COMMAND = pytest -q
+        EXIT-CODE = 1
+        OUTPUT =
+            1 failed, 1 passed in 0.42s
+
+
+TURN 3.
+    USER.
+        TEXT = crea el helper y verifica
+    WRITE-FILE  /tmp/proyecto/math_utils.py
+        STATE = APPLIED
+        BYTES = 28
+    EDIT-FILE  /tmp/proyecto/nope.py
+        STATE = FAILED
+        REASON = File not found: /tmp/proyecto/nope.py
+    EXEC-COMMAND.
+        COMMAND = echo 1 passed
+        EXIT-CODE = 0
+        OUTPUT =
+            1 passed
+
+
+MEMORY DIVISION.
+    WROTE. /tmp/proyecto/math_utils.py
+        BYTES = 28
+    ERROR. pytest -q
+        EXIT-CODE = 1
+        EVIDENCE =
+            1 failed, 1 passed in 0.42s
+
+
+GOBACK.
 ```
 
-Se aplica escaping YAML (`escape-yaml`) para valores con caracteres especiales.
+Fíjate en lo que ya no está: `MEMORY DIVISION` es memoria **dentro** del
+programa, no un bloque colgado detrás de `GOBACK` como antes. `DATA DIVISION` se
+emite aunque no haya goals, y cuando los hay lleva el recuento en la cabecera
+(`GOAL ABIERTO. 1`) para que el modelo sepa que hay un goal **sin tener que
+contarlos**. Y las líneas `OUTPUT =` sin nada detrás significan salida vacía: el
+valor multilínea va a la línea siguiente, indentado, sin truncar.
+
+Lo que aporta este formato, desarrollado en detalle en `PROTOCOLO.md` §2.3:
+un solo dialecto en vez de dos anidados, el **veredicto pegado al paso que
+juzga** (`01.` con su `STATE` al lado), y el paso **identificado** por
+`(turno, ronda, número)` —`T3`, y `R2` cuando el mismo turno tuvo más de una
+respuesta del LLM—. El YAML plano daba a la acción y al estado la misma clave,
+y un `02.` no se distinguía del `02.` de otro turno.
+
+No hay escaping: el dato va de seguido, sin comillas ni escapes, porque un escape
+que no se deshace exacto es una forma de corromper el contenido de un fichero.
+(`escape-yaml` sigue vivo, pero solo en `src/metrics.lisp`, que vuelca telemetría
+y no habla con el modelo.)
 
 ### 6. Loop de tool-use
 
@@ -394,9 +452,9 @@ memoria de hechos y alimenta el pruning de turnos futuros.
 Con `llm_provider: "batch"` no hay tool-use nativo HTTP: `call-batch-llm` pide al modelo
 un lote de acciones compatible con ToolUse y lo convierte en intenciones Rete.
 La compresión de contexto no depende del modo de ejecución: Rete y
-`build-yaml-context` son compartidos por batch y ToolUse nativo. El objetivo de
+`build-context` son compartidos por batch y ToolUse nativo. El objetivo de
 la experimentación es, por un lado, permitir modelos que no exponen ToolUse
-nativo y, por otro, medir `context-tokens` (YAML curado) contra
+nativo y, por otro, medir `context-tokens` (contexto curado) contra
 `naive-tokens`. La compatibilidad ya está validada; el ahorro de contexto es
 una hipótesis condicional hasta medir una corrida comparable.
 
@@ -437,7 +495,7 @@ El flujo es:
    `:parent-id`, `:step` y `:status :pending`.
 3. `process-turn` ejecuta `(run)`, las reglas `execute-intention-*` llaman a las
    funciones POSIX originales y retractan cada intención. Luego reconstruye el
-   contexto y vuelve a llamar al modelo hasta encontrar `batch-complete`. El
+   contexto y vuelve a llamar al modelo hasta encontrar `plan-done`. El
    bucle tiene dos topes configurables: `batch_max_iterations` (default 8, 0 =
    sin tope) y `batch_repeat_tolerance` (default 1), que corta cuando el modelo
    vuelve a pedir *exactamente* el mismo lote — señal de que no reaccionó al
@@ -557,7 +615,7 @@ tabla por herramienta; `metrics-to-json` vuelca todo a
 
 > **Caveat honesto:** `reduction_pct` compara el contexto curado por Rete contra
 > el snapshot naive **previo al podado**, pero el contexto final además incluye
-> el bloque `long_term_memory:` (que el naive no tiene). Por eso puede ser
+> la `MEMORY DIVISION` (que el naive no tiene). Por eso puede ser
 > **negativo** y no debe leerse como "ahorro real". Hay corridas con `+29,27%`
 > o `+22,00%` y una corrida larga con `-35,90%`: la reducción depende de la poda,
 > del formato y del volumen de hechos. Esta métrica es independiente de batch y
@@ -655,7 +713,7 @@ propia): el valor del `config.json` tiene prioridad sobre la variable.
 | `:dump`                | Crea imagen ejecutable con el estado actual       |
 | `:clear`               | Vacía la **memoria de turno** (conserva reglas y memoria larga) |
 | `:clearall`            | Reset completo: ambos motores + memoria en disco + contadores + métricas + session id nuevo |
-| `:context`             | Muestra el YAML curado (+ `long_term_memory`) que se enviaría hoy |
+| `:context`             | Muestra el contexto curado (programa COBOL) que se enviaría hoy |
 | `:metrics`             | Muestra tabla de reducción por turno              |
 | `:model NAME` / `:provider P` | Cambian modelo/proveedor en caliente       |
 
@@ -778,11 +836,11 @@ dependencias.
 
 ## Validación realizada
 
-- *Offline (0 llamadas API)*: **suite automatizada de 52 casos, 52/52 PASS**
-  (`./run-tests.sh`, `RESULTADO: OK`). Cubre aislamiento entre motores, reglas
+- *Offline (0 llamadas API)*: **suite automatizada de 86 tests / 284 checks, `RESULTADO: OK`**
+  (`./run-tests.sh`, código 0). Cubre aislamiento entre motores, reglas
   por engine (incl. `mem-dedup-durable` en el motor de memoria), detección de
   loops, sin falsos positivos, promoción durable (se conservan
-  errores/escrituras, no la conversación), bloque `long_term_memory` en el
+  errores/escrituras, no la conversación), `MEMORY DIVISION` en el
   contexto, dump/restore/boot-memory, parser y normalización batch, dedup/TTL,
   topes por tipo, guardas de escritura, métricas, topes del bucle batch y
   política de reintentos HTTP. El suite es offline **por contrato**: durante la
@@ -867,7 +925,7 @@ Arranque directo con SBCL + Quicklisp (el proyecto se encuentra vía
 - **Suite de tests** (offline, sin llamadas al proveedor):
 
   ```shell
-  ./run-tests.sh              # 52 casos; exit 0 = todo pasó
+  ./run-tests.sh              # 86 casos; exit 0 = todo pasó
   ./run-tests.sh metrics      # sólo los casos cuyo nombre coincide
   ./run-tests.sh config/retry # sólo los de reintentos HTTP
   ```

@@ -11,7 +11,7 @@
 
 cl-harness es una **capa de gestión de contexto para agentes LLM**: mantiene los
 hechos de una sesión en un motor Rete (Lisa), los poda con reglas explícitas, los
-selecciona por relevancia estructural y los renderiza como un bloque YAML con
+selecciona por relevancia estructural y los renderiza como un programa COBOL con
 presupuesto de caracteres. Sobre esa memoria ejecuta acciones POSIX
 (`read_file`, `write_file`, `edit_file`, `exec_command`) que pueden planificarse
 por JSON batch o por tools nativas del proveedor.
@@ -31,18 +31,18 @@ Lo que **no** es:
 | Archivo | Líneas | Responsabilidad |
 |---|---:|---|
 | `src/packages.lisp` | 68 | API pública (46 símbolos exportados) |
-| `src/config.lisp` | 159 | Lectura de `config.json` y getters de límites |
+| `src/config.lisp` | 193 | Lectura de `config.json` y getters de límites |
 | `src/engines.lisp` | 107 | Dos motores Lisa: working memory y memoria durable |
-| `src/facts.lisp` | 140 | Plantillas de hechos, contadores de turno, todos y epochs |
-| `src/rules.lisp` | 625 | Poda por reglas, deduplicación, loops, ejecución de intenciones |
-| `src/context.lisp` | 451 | Relevancia, selección, render YAML |
-| `src/metrics.lisp` | 178 | Métricas por turno, baseline `naive`, export JSON |
-| `src/actions.lisp` | 242 | Acciones POSIX y sus hechos |
-| `src/background.lisp` | 121 | Relanzamiento de comandos como daemons |
-| `src/llm.lisp` | 1 077 | Proveedores, tools, streaming, modo batch JSON |
-| `src/persist.lisp` | 207 | Dumps, memoria durable en disco, core image |
-| `src/repl.lisp` | 356 | Turno, REPL, comandos, un modo one-shot |
-| `src/main.lisp` | 62 | Entry points, handlers de señales |
+| `src/facts.lisp` | 309 | Plantillas de hechos, contadores de turno, todos y epochs |
+| `src/rules.lisp` | 726 | Poda por reglas, deduplicación, loops, ejecución de intenciones |
+| `src/context.lisp` | 883 | Relevancia, selección, render del programa COBOL |
+| `src/metrics.lisp` | 221 | Métricas por turno, baseline `naive`, export JSON |
+| `src/actions.lisp` | 308 | Acciones POSIX y sus hechos |
+| `src/background.lisp` | 124 | Relanzamiento de comandos como daemons |
+| `src/llm.lisp` | 1 270 | Proveedores, tools, streaming, modo batch JSON |
+| `src/persist.lisp` | 317 | Dumps, memoria durable en disco, core image |
+| `src/repl.lisp` | 564 | Turno, REPL, comandos, un modo one-shot |
+| `src/main.lisp` | 59 | Entry points, handlers de señales |
 
 ## 3. Lo que sí hace
 
@@ -71,7 +71,7 @@ Lo que **no** es:
   de loop), conservando ambas versiones si el contenido cambió
   (`src/rules.lisp:44`, `src/rules.lisp:126`).
 - **Topes por tipo** aplicados en cada render: se retractan los hechos viejos de
-  cada tipo por encima de `max_facts_per_type` (`src/context.lisp:432`).
+  cada tipo por encima de `max_facts_per_type` (`src/context.lisp:836`).
 - **Presupuesto de caracteres** y **truncado de payload** con cabeza y cola, para
   que un archivo enorme no ahogue el contexto (`src/context.lisp:135`,
   `src/context.lisp:190`).
@@ -94,25 +94,38 @@ no de texto.
 
 ### 3.4 Render del contexto
 
-`build-yaml-context` corre las reglas, aplica topes, selecciona y renderiza
-(`src/context.lisp:428`). Secciones del YAML:
+`build-context` corre las reglas, aplica topes, selecciona y renderiza
+(`src/context.lisp:836`). Emite **un programa COBOL**, no un YAML. Bloques, en
+orden de aparición:
 
-| Sección | Origen |
-|---|---|
-| `context.session` | id de sesión |
-| `context.epoch` | checkpoint, si existe |
-| `context.goals` | `agent-todo`, si existen |
-| `context.warnings` | hechos `tool-loop` |
-| `context.prior_turns` | turnos cerrados, agrupados por causalidad |
-| `context.current_turn` | eventos del turno en curso |
-| `long_term_memory` | bloque aparte con el motor de memoria (`src/context.lisp:403`) |
+| Bloque | Origen | ¿Siempre? |
+|---|---|---|
+| `IDENTIFICATION DIVISION.` + `PROGRAM-ID.` | id de sesión | sí |
+| `EPOCH.` / `BASELINE-TURN.` / `SUMMARY.` | checkpoint | solo si hay epoch |
+| `PROCEDURE DIVISION.` | `batch-plan`: un bloque por paso, con su `VERDICT` al lado | sí, vacía si no hay plan |
+| `DATA DIVISION.` + `GOAL ABIERTO. N` | `agent-todo` **sin completar** | sí, con `GOAL ABIERTO. 0` si no hay ninguno |
+| `WARNING DIVISION.` | hechos `tool-loop` | solo si hay loops |
+| `TURN n.` | turnos, agrupados por `turn-id` (cerrados y en curso) | por turno con hechos |
+| `MEMORY DIVISION.` | lo consolidado del motor de memoria, dentro del programa | solo si hay hechos durables |
+| `GOBACK.` | cierre | sí |
+
+`PROCEDURE` y `DATA` se emiten aunque estén vacías a propósito: un programa sin
+`PROCEDURE DIVISION` no es un programa vacío, es un programa mal formado, y un
+modelo que lee "hoy no hay PROCEDURE" aprende que el formato cambia de forma
+(`src/context.lisp:745`). En cambio `MEMORY DIVISION` sí se omite cuando no hay
+nada durable (`src/context.lisp:800`), porque una división vacía de memoria
+sería ruido: "no recuerdo nada" ya lo dice la ausencia.
+
+La gramática completa —incluido por qué `PROCEDURE` y `DATA` se emiten aunque
+estén vacías y cómo se identifica un paso por `(turno, ronda, número)`— está en
+[`PROTOCOLO.md`](./PROTOCOLO.md) §2.3.
 
 Los archivos leídos y las salidas de comando se truncan al renderizar, no al
-leer (`src/context.lisp:253`).
+leer (`src/context.lisp:171`).
 
 ### 3.5 Transportes de ejecución
 
-`call-llm` despacha por `llm_provider` (`src/llm.lisp:1061`):
+`call-llm` despacha por `llm_provider` (`src/llm.lisp:1254`):
 
 | `llm_provider` | Ruta | Streaming | Notas |
 |---|---|---|---|
@@ -177,7 +190,7 @@ daemon con logfile (`src/actions.lisp:46`, `src/actions.lisp:63`,
 - Por turno: tokens de contexto, tokens `naive`, tokens reales del proveedor,
   iteraciones, ruta de llamada, y estadísticas por herramienta
   (`src/metrics.lisp:45`).
-- Totales con `reduction_pct` = cuánto ahorra el YAML frente a `naive`
+- Totales con `reduction_pct` = cuánto ahorra el contexto curado frente a `naive`
   (`src/metrics.lisp:92`).
 - El baseline `naive` se captura **antes** de la poda, que es lo que hace válida
   la comparación (`src/metrics.lisp:35`).
@@ -204,7 +217,7 @@ máximos, streaming, modelo, endpoint y clave.
 
 ### 4.1 Verificación y calidad
 
-- **Ya hay suite automatizada (52 casos, toda en verde).** Vive en
+- **Ya hay suite automatizada (86 casos, 284 checks, toda en verde).** Vive en
   `tests/harness.lisp`, expuesta como el sistema `"cl-harness/tests"` en
   `cl-harness.asd` y ejecutable con `./run-tests.sh` (o `./run-tests.sh metrics`
   para filtrar por nombre). Los casos se registran a mano en `*test-cases*`
@@ -249,27 +262,37 @@ máximos, streaming, modelo, endpoint y clave.
 - **`write_file` y `edit_file` aceptan rutas absolutas** fuera del directorio de
   trabajo (`src/actions.lisp:32`).
 - **El guard de `old_string` vacío solo existe en el validador batch**
-  (`src/llm.lisp:960`) y en el prompt del protocolo. En la ruta de tools nativas
+  (`src/llm.lisp:1129`) y en el prompt del protocolo. En la ruta de tools nativas
   y en la acción `edit-file` no hay guarda: un `old_string` vacío hace
   `(search "" ...)` devolver 0 y **prepende** el texto en silencio
-  (`src/actions.lisp:169`).
+  (`src/actions.lisp:171`).
 - **No hay defenses contra prompt injection** vía contenido de archivos: lo que se
-  lee entra al YAML como hechos y el modelo decide si lo obedece.
+  lee entra al contexto como hechos y el modelo decide si lo obedezca.
 - `config.json` y los logs pueden contener la clave si el modelo los lee; el
   harness no los redacta al persistir.
 
 ### 4.4 Memoria y planificación
 
-- **Los todos y los epochs están implementados pero no cableados.**
-  `add-todo`, `complete-todo`, `set-todo-status` y `create-epoch`
-  (`src/facts.lisp:57`, `src/facts.lisp:123`) **no tienen ningún caller** en
-  `src/`: no hay herramienta, ni comando de REPL, ni regla que los invoque.
-- En consecuencia, la regla `prune-superseded-by-epoch` (`src/rules.lisp:136`)
-  nunca se activa en la práctica y el bloque `goals:` del YAML siempre sale
-  vacío.
+- **Los goals están a medio cablear, y cada pieza en un sitio distinto.**
+  `add-todo` (`src/facts.lisp:178`) lo invoca la regla `auto-create-todo-on-action`
+  (`src/rules.lisp:655`), que crea un goal `in-progress` por cada intención del
+  plan; `complete-todo` (`src/facts.lisp:210`) lo invoca `reconcile-todos`
+  (`src/context.lisp:417`), que `build-context` corre en cada turno y que cierra
+  un goal solo si su verbo tiene evidencia 1:1; y `create-epoch`
+  (`src/facts.lisp:292`) lo llama la política automática de `process-turn` cada 5
+  turnos (`src/repl.lisp:401`). Lo que **no** tiene caller es `set-todo-status`
+  (`src/facts.lisp:230`): no hay herramienta ni comando de REPL que lo use, así
+  que un goal solo pasa por `pending` → `in-progress` → `completed`, y no hay
+  forma de reabrirlo o de marcarlo `failed` a mano.
+- Las reglas Rete de auto-completado de goals están **comentadas**, no activas
+  (`src/rules.lisp:672`): el cierre pasó a ser imperativo dentro de
+  `reconcile-todos`, porque cuatro reglas que cerraban goals se solapaban entre
+  sí y con el path de evidencia.
+- La regla `prune-superseded-by-epoch` (`src/rules.lisp:136`) puede llegar a
+  dispararse, y solo cuando el epoch automático ha consolidationado de verdad.
 - **La memoria de trabajo no sobrevive al proceso.** Solo sobreviven la memoria
   durable y los core images. Por eso `run-one-shot` reinicia sesión y métricas en
-  cada ejecución (`src/repl.lisp:272`).
+  cada ejecución (`src/repl.lisp:482`).
 - **No hay memoria semántica ni vectorial**: la relevancia es estructural más
   coincidencia de keywords.
 
@@ -283,8 +306,8 @@ máximos, streaming, modelo, endpoint y clave.
   no es comparable turno a turno como tokens de contexto.
 - **No hay cálculo de costo**, ni de tokens por tipo de hecho, ni por modelo.
 - **No hay logging estructurado**: la salida es `format t` a stdout; el contexto
-  solo se vuelca a `debug.yaml` cuando `*debug-mode*` está activo
-  (`src/context.lisp:447`).
+  solo se vuelca a `debug/debug-<ts>.cob` cuando `*debug-mode*` está activo
+  (`src/context.lisp:874`); esos ficheros no se podan nunca.
 
 ### 4.6 Operabilidad y alcance
 
@@ -315,7 +338,7 @@ máximos, streaming, modelo, endpoint y clave.
 
 | Capacidad | Evidencia | Cómo se comprobó |
 |---|---|---|
-| Poda y render YAML | 8 turnos, 40 hechos finales, YAML estable en ~7 k chars | `EXPERIMENTS/context-growth-8turns-2026-09-25/` |
+| Poda y render (el formato era YAML en esa corrida) | 8 turnos, 40 hechos finales, contexto estable en ~7 k chars | `EXPERIMENTS/context-growth-8turns-2026-09-25/` |
 | Lectura antes de escribir | abort de lote en intención sin lectura previa | regla `cancel-intentions-on-abort` |
 | Deteccion de loops | aviso `[HARNESS LOOP DETECTOR]` y corte del turno | `cl-harness-growth-attempt1/run.log` |
 | Batch JSON con modelo sin tools | 5 llamadas, 9/9 tests, sin `BATCH_JSON_INVALID` | `EXPERIMENTS/batch-freellm-auto-2026-09-25/` |
@@ -339,7 +362,7 @@ máximos, streaming, modelo, endpoint y clave.
 **P1 — verificación y observabilidad (cerrado)**
 
 4. ~~Sistema de tests~~ → `tests/harness.lisp` + sistema `"cl-harness/tests"` +
-   `./run-tests.sh`, 52 casos en verde y guardián offline.
+   `./run-tests.sh`, 86 casos / 284 checks en verde y guardián offline.
 5. ~~Persistir `response.model`~~ → `*llm-response-model*` y
    `*llm-call-log*` por llamada, incluidos en `metrics-to-json`.
 6. ~~Separar `prompt-tokens` por iteración~~ → `*llm-call-log*` acumula el uso
