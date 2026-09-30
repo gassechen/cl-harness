@@ -443,7 +443,7 @@ No es deuda de formato, es deuda de mensaje:
 
 ## 5. Tests que fijan el protocolo
 
-Sin red, sin LLM, sobre el harness. La suite entera son **86 tests / 284 checks** y se
+Sin red, sin LLM, sobre el harness. La suite entera son **91 tests / 305 checks** y se
 corre con `./run-tests.sh` (código 0 si pasa, 1 si falla, 2 si el sistema no carga). De
 esos, los que **fijan un invariante del protocolo** son los de abajo; los demás cubren
 parseo, acciones, goals, métricas y configuración.

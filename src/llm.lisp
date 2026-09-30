@@ -45,6 +45,41 @@
     (cond ((and present (null v)) nil)
           (t t))))
 
+(defparameter *llm-failed-calls* nil
+  "(:error \"HTTP 429\" :status 429 :model \"m\" :endpoint \"url\" :attempt 2) por
+   CADA intento fallido, incluidos los que luego se reintentan con exito.
+
+   Existia un hueco: CAPTURE-USAGE solo anade a *LLM-CALL-LOG* cuando la respuesta
+   trae usage, o sea solo cuando la llamada fue EXITOSA. Una sesion con 9
+   timeouts y 22 exitosos decia 22 llamadas, cuando en realidad fueron 31
+   peticiones. El panel de OpenRouter mostraba los errores y las metricras del
+   harness no, y seemed contradictorio: la misma sesion, dos numeros distintos
+   para lo mismo. Un bucle que falla y reintenta hasta lograr el exito es
+   justamente donde mas caro sale, y era invisible.
+
+   En un turno con 3 intentos y exito al final: 3 peticiones, 1 exito, 2 fallos
+   reintentados. Aqui se cuentan los 3.")
+
+(defun llm-failure-model ()
+  "El modelo al que se atribuyo el fallo. Se prefiere el que YA respondio, que
+   es el que se sabe real, y se cae al configurado si aun no hubo ninguno."
+  (or *llm-response-model*
+      (ignore-errors (llm-model))))
+
+(defun record-llm-failure (reason status attempt)
+  "Anota un intento fallido. NUNCA debe romper la peticion: es contabilidad, no
+   control. Por eso TODO va dentro de IGNORE-ERRORS -- si LLM-MODEL o
+   LLM-ENDPOINT fallan porque no hay config (que es justo lo que pasa en los
+   tests de reintentos, que son offline), perder una anotacion de metricas es
+   infinitamente mejor que perder la llamada o el error original."
+  (ignore-errors
+    (push (list :error reason
+                :status status
+                :model (llm-failure-model)
+                :endpoint (llm-endpoint)
+                :attempt attempt)
+          *llm-failed-calls*)))
+
 (defun capture-usage (resp-obj &key (prompt-key "prompt_tokens")
                                (completion-key "completion_tokens")
                                (log t))
@@ -155,17 +190,27 @@
           do (handler-case
                  (setf result (funcall thunk)
                        done t)
-               (error (e)
-                 (setf last-error e)
-                 (let ((status (http-error-status e)))
-                   (if (and (< attempt tries)
-                            (or (null status) (funcall retryable-p status)))
-                       (wait-before-http-retry
-                        attempt
-                        (if status
-                            (format nil "HTTP ~D" status)
-                            (class-name (class-of e))))
-                       (error e))))))
+                (error (e)
+                  (setf last-error e)
+                  (let ((status (http-error-status e)))
+                    ;; Cada intento fallido se anota, INCLUIDO el que se va a
+                    ;; reintentar: la peticion salio, tardo lo que tardo y puede
+                    ;; haber costado cuota. Omitir los reintentados con exito
+                    ;; seria mentir otra vez, pero al reves: contandose de menos.
+                    ;; Un turno con 3 intentos que acaba bien son 3 peticiones,
+                    ;; no 1.
+                    (record-llm-failure
+                     (cond (status (format nil "HTTP ~D" status))
+                           (t (string (class-name (class-of e)))))
+                     status attempt)
+                    (if (and (< attempt tries)
+                             (or (null status) (funcall retryable-p status)))
+                        (wait-before-http-retry
+                         attempt
+                         (if status
+                             (format nil "HTTP ~D" status)
+                             (class-name (class-of e))))
+                        (error e))))))
     (if done
         result
         (error "llm request failed after ~D attempt~D: ~A"

@@ -150,8 +150,29 @@
 (defun fact-timestamp (f)
   (get-slot-value f 'timestamp))
 
-(defun retract-oldest-of-type (type keep)
-  "Retract all but the newest KEEP facts of the given type, preserving real errors."
+(defun retract-oldest-of-type (type keep &optional protect)
+  "Retract all but the newest KEEP facts of the given type, preserving real errors.
+
+   PROTECT es un predicado opcional sobre el hecho: lo que devuelve T no se
+   retira nunca, por mucho que se pase de KEEP. Lo usa el veredicto, cuya
+   tarjeta puede seguir en pantalla: si el veredicto se va, la tarjeta se
+   renderiza con STATE = PENDING y el contexto afirma que un paso YA EJECUTADO
+   no se ha hecho. Antes las tarjetas y los veredictos se capaban por separado
+   y, al no ser el mismo conjunto, se desalineaban solos: los dos topes van
+   sobre poblaciones de tamano distinto y cada una se queda con SU ventana. No
+   hace falta que lleguen a tocarse para que pase: un veredicto de mas es
+   justo lo que empuja fuera de la ventana el de una tarjeta viva. Es
+   preferible pasarse de KEEP a mentir.
+
+   Que se PUEDA desalinear es un hecho; que ocurriera en la corrida que motivo
+   a mirar esto, no se puede saber. Los volcados son compatibles tanto con un
+   veredicto evictado como con un paso que nunca llego a ejecutarse, y en ese
+   segundo caso el PENDING era honesto. Lo que si se demuestra aqui, con hechos
+   crudos, es el mecanismo.
+
+   El orden es el total (timestamp . id), no la marca de tiempo pelada: dos
+   hechos del mismo segundo se retiraban en orden arbitrario, de modo que la
+   poda no era reproducible ni entre ejecuciones ni dentro de la misma."
   (let* ((result (retrieve (?f) (?f (harness-fact))))
          (facts (remove-if-not (lambda (f)
                                  (string= (get-slot-value f 'fact-type) type))
@@ -163,12 +184,14 @@
                                     (real-error-p type (fact-data-of f)))
                                   facts)
                        facts))
-         (sorted (sort (remove nil prunable) #'<
-                       :key #'fact-timestamp)))
-    (when (> (length sorted) keep)
+         (sorted (remove-if (lambda (f) (and protect (funcall protect f)))
+                            (sort (remove nil prunable) #'fact-order-before-p
+                                  :key #'fact-order-key)))
+         (excess (- (length sorted) keep)))
+    (when (plusp excess)
       (loop for f in sorted
             for i from 0
-            when (< i (- (length sorted) keep))
+            when (< i excess)
             do (retract f)))))
 
 ;;; ============================================================

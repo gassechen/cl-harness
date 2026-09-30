@@ -673,6 +673,65 @@
         (t nil)))
 
 
+(defun plan-step-identity (data)
+  "La identidad de un paso: (step, round, turn-id). Es la MISMA que empareja la
+   tarjeta con su veredicto, y se comparte con el render y con la poda para que
+   las dos cosas no se separen por un cambio de criterio.
+
+   CONS con nil al final, no LIST: en este paquete LIST es la de LISA y
+   devuelve un patron. Y el nil no es cosmetico: (cons a (cons b c)) es una
+   lista PUNTEADA, y una lista punteada no se puede comparar con <."
+  (cons (data-get data :step)
+        (cons (or (data-get data :round) 1)
+              (cons (data-get data :turn-id) nil))))
+
+(defun plan-card-order-key (d)
+  "Clave de orden de las tarjetas de la PROCEDURE: la LINEA DE TIEMPO, que es
+   (turno, ronda, paso).
+
+   El paso va el ULTIMO a proposito, aunque parezca lo contrario: un numero de
+   paso solo significa algo DENTRO de su turno, porque la numeracion de COBOL
+   se reinicia en cada uno. Si el paso fuese la clave principal, las tarjetas
+   saldrian agrupadas por numero a traves de los turnos --
+   01. T1 / 01. T2 / 01. T3 / 02. T1 -- y el modelo leeria un solo turno con
+   numeros repetidos en vez de tres turnos con su propia numeracion.
+
+   Antes solo se ordenaba por :step, y ademas el orden le llegaba ya revuelto:
+   SELECT-RELEVANT-FACTS ordena por puntuacion, y la puntuacion DECAE con la
+   distancia al turno actual, asi que el turno nuevo llegaba primero. Como el
+   SORT de SBCL es estable, cada numero de paso conservaba ese ranking y las
+   tarjetas del turno anterior salian detras de las del actual. En una corrida
+   real el paso 3 de la ronda 5 salia antes que el paso 2 de la ronda 6. No era
+   un barajado aleatorio: era un error DETERMINISTA que ademas parecian
+   intencionado, y el modelo no tenia forma de saber que faltaba tiempo.
+
+   La compara PLAN-CARD-BEFORE-P, no #'<: < solo admite reales y una clave de
+   mas de un campo es una lista."
+  (cons (or (data-get d :turn-id) 0)
+        (cons (or (data-get d :round) 1)
+              (cons (or (data-get d :step) 0) nil))))
+
+(defun plan-card-before-p (a b)
+  "CL:SORT con #:CUR lesser... no: con #'< solo admite REALES, y una lista no es
+   un real, asi que la clave no puede ser una lista: hay que comparar campo a
+   campo. Por eso PLAN-CARD-ORDER-KEY no se pasa directamente a #'<."
+  (let ((ka (plan-card-order-key a))
+        (kb (plan-card-order-key b)))
+    (or (< (first ka) (first kb))
+        (and (= (first ka) (first kb))
+             (or (< (second ka) (second kb))
+                 (and (= (second ka) (second kb))
+                      (< (third ka) (third kb))))))))
+
+(defun live-plan-step-identities ()
+  "Las identidades de las tarjetas batch-plan que siguen en pantalla.
+   COLLECT-FACTS-OF-TYPE devuelve datos, no hechos: no hay que volver a
+   developed el 'data' encima."
+  (let ((live (make-hash-table :test #'equal)))
+    (dolist (d (collect-facts-of-type (collect-active-facts) "batch-plan"))
+      (setf (gethash (plan-step-identity d) live) t))
+    live))
+
 (defun grouped-context-string (facts now-turn &optional memory)
   "Los hechos del turno, agrupados por :turn-id, como PROGRAMA COBOL.
 
@@ -699,12 +758,10 @@
                           (collect-active-todos)))
         (plan-keys (make-hash-table :test #'equal)))
     (dolist (d (plan-steps-of facts))
-      ;; Clave con CONS anidado, no LIST: en este paquete LIST es la de LISA y
-      ;; devuelve un patron, no una lista.
-      (setf (gethash (cons (data-get d :step)
-                           (cons (or (data-get d :round) 1)
-                                 (data-get d :turn-id)))
-                     plan-keys)
+      ;; Misma clave que usa el render para emparejar el veredicto: si las dos
+      ;; cosas calcularan la identidad por su cuenta, un cambio de criterio en
+      ;; una separaria de la otra en silencio.
+      (setf (gethash (plan-step-identity d) plan-keys)
             t))
     (dolist (f facts)
       (let* ((type (fact-type-of f))
@@ -715,10 +772,7 @@
         ;; misma verdad dos veces. El que no tiene paso -- porque el cap de
         ;; batch-plan lo retiro -- se cae al flujo para no perderse.
         (when (or (not (string= type "verdict"))
-                  (not (gethash (cons (data-get data :step)
-                                      (cons (or (data-get data :round) 1)
-                                            (data-get data :turn-id)))
-                                plan-keys)))
+                  (not (gethash (plan-step-identity data) plan-keys)))
           ;; Carry the full ORDER KEY, not the bare timestamp: two events in the
           ;; same second used to be re-sorted here with no tiebreaker, which is how
           ;; a command still came out above the write it read.
@@ -746,7 +800,7 @@
       ;; division de procedimiento no es un programa vacio: es un programa
       ;; MAL FORMADO, y el modelo que lee 'no hay PROCEDURE' aprende que el
       ;; formato cambia de forma. Una seccion vacia se lee: no me pidio nada.
-      (let* ((ordered (sort (plan-steps-of facts) #'< :key (lambda (d) (data-get d :step))))
+      (let* ((ordered (sort (plan-steps-of facts) #'plan-card-before-p))
              (verdicts (collect-facts-of-type facts "verdict")))
         (render-plan-procedure s ordered verdicts))
 
@@ -847,8 +901,16 @@
   ;; contexto se infla sin que nadie lo note. Con tope, lo que se va es el plan
   ;; viejo, que es justo lo que el modelo ya no puede reintentar.
   (retract-oldest-of-type "file-edit" (max-facts-per-type))
+  ;; La tarjeta y su veredicto se podan por la MISMA ventana, y en ese orden:
+  ;; primero se queda la tarjeta, y despues se capan los veredictos PROTEGIENDO
+  ;; los de las tarjetas que siguen en pantalla. Si no, los dos topes van por
+  ;; separado sobre conjuntos distintos y se desalinean solos, que es como una
+  ;; tarjeta se queda sin veredicto y sale con STATE = PENDING.
   (retract-oldest-of-type "batch-plan" (max-facts-per-type))
-  (retract-oldest-of-type "verdict" (max-facts-per-type))
+  (let ((live (live-plan-step-identities)))
+    (retract-oldest-of-type "verdict" (max-facts-per-type)
+                            (lambda (f)
+                              (gethash (plan-step-identity (fact-data-of f)) live))))
   ;; --- GOALS: close what the batch already did, THEN bound the history ---
   ;; Order matters. Reconciling first means the cap evicts finished goals
   ;; instead of unfinished ones, so the goals the model still has to act on

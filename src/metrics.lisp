@@ -76,7 +76,8 @@
    is what makes a runaway loop visible instead of a single opaque total.
    RESPONSE-MODEL is the model the provider reported for this turn."
   (let ((naive (or naive-str (naive-context-string)))
-        (calls (or llm-calls (reverse cl-harness::*llm-call-log*))))
+        (calls (or llm-calls (reverse cl-harness::*llm-call-log*)))
+        (failures (reverse cl-harness::*llm-failed-calls*)))
     (push (list :turn (1+ (length *metrics-events*))
                 :user-chars (length user-str)
                 :context-chars (length context-str)
@@ -89,18 +90,21 @@
                 :llm-path llm-path
                 :response-model (or response-model cl-harness::*llm-response-model*)
                 :llm-calls calls
+                :llm-failures failures
                 :tools (reverse *metrics-tool-calls*))
           *metrics-events*)
     (setf *metrics-tool-calls* nil)
     (setf *metrics-llm-calls* nil)
-    (setf cl-harness::*llm-call-log* nil)))
+    (setf cl-harness::*llm-call-log* nil)
+    (setf cl-harness::*llm-failed-calls* nil)))
 
 (defun metrics-reset ()
   "Clear recorded metrics."
   (setf *metrics-events* nil)
   (setf *metrics-tool-calls* nil)
   (setf *metrics-llm-calls* nil)
-  (setf cl-harness::*llm-call-log* nil))
+  (setf cl-harness::*llm-call-log* nil)
+  (setf cl-harness::*llm-failed-calls* nil))
 
 (defun metrics-tool-totals ()
   "Aggregate per-tool statistics over all recorded turns.
@@ -118,6 +122,52 @@
       (maphash (lambda (k v) (push (cons k v) res)) agg)
       (sort res #'string< :key #'car))))
 
+(defun call-record-models (records)
+  "Los :model de una lista de registros de llamada o de fallo, sin repetir el
+   mismo registro. RECORDS son plists (:model \"m\" ...)."
+  (loop for r in records
+        for m = (getf r :model)
+        when m collect m))
+
+(defun metrics-models (evs)
+  "TODOS los modelos que se usaron en la sesion, sin repetir y ordenados.
+
+   EVS son los eventos de turno, en orden cronologico. Se barren TRES fuentes
+   porque cada una se pierde por su cuenta:
+
+     1. :response-model -- lo que reporto el proveedor en el ULTIMO exito del
+        turno. Es UNO por turno: con enrutado por carga, un turno da cinco
+        modelos distintos y aqui solo salia el ultimo de todos.
+     2. :llm-calls -- el desglose por peticion, que si lleva un :model en cada
+        una.
+     3. :llm-failures -- los intentos que fallaron. Un modelo que solo falla
+        tambien se uso y tambien se paga, asi que dejarlo fuera daria la misma
+        lista incompleta por el otro lado.
+
+   Antes solo se miraba la 1, y por eso la sesion decia 4 modelos cuando el
+   panel de OpenRouter decia 5: el mismo hecho, dos numeros.
+
+   OJO con escribir esto como (loop ... do (loop ... collect m)): el DO evalua
+   el loop interno y se TIRA su valor, asi que la lista se pierde entera y solo
+   queda lo que aporte la fuente 1. MAPCAN si encadena.
+
+   Y OJO con REMOVE-DUPLICATES: sin :TEST usa EQL, y EQL sobre dos strings con
+   el mismo texto pero distinta identidad da NIL, asi que el mismo modelo
+   aparecia dos veces en la lista ('gamma, gamma') porque cada registro trae su
+   propia cadena. Con :TEST STRING= se compara por texto, que es lo que quiere
+   decir 'modelos distintos'."
+  (sort
+   (remove-duplicates
+    (append (loop for e in evs
+                  for m = (getf e :response-model)
+                  when m collect m)
+            (mapcan (lambda (e) (call-record-models (getf e :llm-calls)))
+                    evs)
+            (mapcan (lambda (e) (call-record-models (getf e :llm-failures)))
+                    evs))
+    :test #'string=)
+   #'string<))
+
 (defun metrics-totals ()
   "Aggregate statistics over all recorded turns."
   (let* ((evs (reverse *metrics-events*))
@@ -130,12 +180,12 @@
                            real :initial-value 0))
          (real-comp (reduce (lambda (a e) (+ a (or (getf e :completion-tokens) 0)))
                             real :initial-value 0))
-         (api-calls (reduce (lambda (a e) (+ a (length (getf e :llm-calls))))
-                            evs :initial-value 0))
-         (models (remove-duplicates
-                  (loop for e in evs
-                        for m = (getf e :response-model)
-                        when m collect m)))
+         (ok-calls (reduce (lambda (a e) (+ a (length (getf e :llm-calls))))
+                           evs :initial-value 0))
+         (failures (reduce (lambda (a e) (+ a (length (getf e :llm-failures))))
+                           evs :initial-value 0))
+         (api-calls (+ ok-calls failures))
+         (models (metrics-models evs))
          (iters (reduce (lambda (a e) (+ a (or (getf e :llm-iterations) 0)))
                         evs :initial-value 0))
          (turns (length evs)))
@@ -149,19 +199,28 @@
           :real-completion-tokens (and (plusp (length real)) real-comp)
           :real-turns (length real)
           :api-calls api-calls
+          :api-ok ok-calls
+          :api-failures failures
           :models models
           :llm-iterations iters)))
 
-(defun metrics-summary ()
-  "Print a readable per-turn table and totals. The 'iter' column is the number
+(defun metrics-summary (&optional (stream *standard-output*))
+  "Print a readable per-turn table and totals to STREAM (stdout por defecto).
+   The 'iter' column is the number
    of API requests the tool loop made; 'prompt_tok' is the CUMULATIVE prompt
-   usage across all iterations of the turn (the real cost of the message pile)."
+   usage across all iterations of the turn (the real cost of the message pile).
+
+   STREAM es un PARAMETRO a proposito, no un (format t ...) suelto: el
+   WITH-OUTPUT-TO-STRING de SBCL no re-liga *STANDARD-OUTPUT* (usa WRITE sobre la
+   variable de la macro), asi que (FORMAT T ...) dentro de el se escapa a la
+   consola y la cadena sale vacia. Con STREAM el resumen se puede capturar y
+   testear, que es como se encontraron los tres fallos de esta seccion."
   (let ((evs (reverse *metrics-events*)))
-    (format t "~&=== Session metrics ~A ===~%" *session-id*)
-    (format t "~&~A~%" (format nil "~4A ~4A ~7A ~7A ~9A ~7A ~9A ~13A"
+    (format stream "~&=== Session metrics ~A ===~%" *session-id*)
+    (format stream "~&~A~%" (format nil "~4A ~4A ~7A ~7A ~9A ~7A ~9A ~13A"
                               "turn" "iter" "ctx_tok" "naive_tok" "prompt_tok" "ctx_chr" "naive_ch" "llm_path"))
     (dolist (e evs)
-      (format t "~&~4A ~4A ~7A ~7A ~9A ~7A ~9A ~13A~%"
+      (format stream "~&~4A ~4A ~7A ~7A ~9A ~7A ~9A ~13A~%"
               (getf e :turn)
               (or (getf e :llm-iterations) "-")
               (getf e :context-tokens)
@@ -171,29 +230,47 @@
               (getf e :naive-chars)
               (or (getf e :llm-path) "-")))
     (let ((tot (metrics-totals)))
-      (format t "~&~A~%" (format nil "~4A ~4A ~7A ~7A ~9A ~7A ~9A ~13A"
+      (format stream "~&~A~%" (format nil "~4A ~4A ~7A ~7A ~9A ~7A ~9A ~13A"
                                 "TOT"
                                 (or (getf tot :llm-iterations) "-")
                                 (getf tot :context-tokens)
                                 (getf tot :naive-tokens)
                                 (or (getf tot :real-prompt-tokens) "-")
                                 "" "" ""))
-      (format t "~&Reduction (curated vs naive): ~,1F%~%" (getf tot :reduction-pct))
-      (format t "~&Turns (curated): ~A · Turns (real usage): ~A · API calls: ~A~%"
+      (format stream "~&Reduction (curated vs naive): ~,1F%~%" (getf tot :reduction-pct))
+      (format stream "~&Turns (curated): ~A · Turns (real usage): ~A · API calls: ~A~%"
               (getf tot :turns) (getf tot :real-turns) (getf tot :api-calls))
+      (format stream "~&API calls: ~A ok + ~A fallidos = ~A intentos~%"
+              (getf tot :api-ok) (getf tot :api-failures) (getf tot :api-calls))
       (when (getf tot :models)
-        (format t "~&Models: ~{~A~^, ~}~%" (getf tot :models)))
-      (format t "~&Real completion tokens: ~A~%" (getf tot :real-completion-tokens)))
+        (format stream "~&Models: ~{~A~^, ~}~%" (getf tot :models)))
+      (dolist (e (reverse *metrics-events*))
+        (let* ((f (getf e :llm-failures))
+               (n (length f))
+               ;; YA VIENEN en orden cronologico: RECORD-CONTEXT-METRICS
+               ;; invierte *LLM-FAILED-CALLS*, que se apila por delante. No se
+               ;; reordena, porque lo que interesa es WHEN fallo cada cosa, no
+               ;; agrupar por codigo. Los repetidos se colapsan.
+               (msgs (remove-duplicates
+                      (mapcar (lambda (r) (or (getf r :error) "?")) f))))
+          ;; (when n) NO vale: 0 es verdadero en Common Lisp, asi que un turno
+          ;; sin fallos imprimia '0 intentos fallido:' con la lista vacia. Y
+          ;; ~:[~;s~] imprime la rama THEN cuando el argumento es NO-NIL, o sea
+          ;; que la 's' va con (not (= n 1)) y no con (= n 1).
+          (when (plusp n)
+            (format stream "~&  turno ~A: ~D intento~P fallido~:[~;s~]: ~{~A~^, ~}~%"
+                    (getf e :turn) n n (not (= n 1)) msgs))))
+      (format stream "~&Real completion tokens: ~A~%" (getf tot :real-completion-tokens)))
     (let ((tools (metrics-tool-totals)))
       (when tools
-        (format t "~&~%Tools:~%")
-        (format t "~&~12A ~6A ~11A ~11A ~8A~%"
+        (format stream "~&~%Tools:~%")
+        (format stream "~&~12A ~6A ~11A ~11A ~8A~%"
                 "tool" "calls" "chars_raw" "chars_sent" "saved%")
         (dolist (entry tools)
           (let* ((cc (cdr entry))
                  (raw (getf cc :chars-raw))
                  (sent (getf cc :chars-sent)))
-            (format t "~&~12A ~6A ~11A ~11A ~7,1F~%"
+            (format stream "~&~12A ~6A ~11A ~11A ~7,1F~%"
                     (car entry) (getf cc :count) raw sent
                     (if (zerop raw)
                         0.0

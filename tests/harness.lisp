@@ -2229,3 +2229,265 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                       (if (= calls 1) (error "connection reset") "ok")))))
       (ok (string= "ok" result) "un fallo de transporte también se reintenta")
       (ok (= 2 calls) (format nil "hizo 2 intentos, hizo ~D" calls)))))
+
+
+(defun procedure-section (ctx)
+  "El trozo de la PROCEDURE DIVISION: las tarjetas y su STATE, sin el resto."
+  (let ((ini (search "PROCEDURE DIVISION." ctx))
+        (fin (search "DATA DIVISION." ctx)))
+    (if (and ini fin) (subseq ctx ini fin) "")))
+
+(defun card-turn-labels (ctx)
+  "Los T<n> de las tarjetas de la PROCEDURE DIVISION, en el orden en que salen."
+  (let ((labels '()) (in-proc nil))
+    (dolist (line (uiop:split-string ctx :separator '(#\Newline)))
+      (cond ((search "PROCEDURE DIVISION." line) (setf in-proc t))
+            ((search "DATA DIVISION." line) (setf in-proc nil))
+            (in-proc
+             ;; Las lineas de tarjeta son las unicas con '.  T'; STATE y REASON
+             ;; no la tienen, asi que el marcador basta y no hace falta un regex.
+             (let ((pos (search ".  T" line)))
+               (when pos
+                 (let ((j (+ pos 4)))
+                   (loop while (and (< j (length line))
+                                    (digit-char-p (char line j)))
+                         do (incf j))
+                   (when (< (+ pos 4) j)
+                     (push (parse-integer line :start (+ pos 4) :end j)
+                           labels))))))))
+    (nreverse labels)))
+
+(deftest protocol/las-tarjetas-vienen-en-orden-cronologico
+  "Las tarjetas se ordenan por (paso, turno, ronda), no por relevancia.
+
+   SELECT-RELEVANT-FACTS ordena los hechos por puntuacion, y la puntuacion
+   DECAE con la distancia al turno actual: el turno nuevo puntua mas alto y
+   llega antes al render. Ordenando las tarjetas solo por :step, cada numero de
+   paso conservaba ese ranking, y las tarjetas del turno ANTERIOR salian detras
+   de las del actual. En una corrida real el paso 3 de la ronda 5 salia antes
+   que el paso 2 de la ronda 6, y el modelo leia su propio historial del reves
+   sin ninguna marca de que faltara nada.
+
+   SORT de SBCL es estable, asi que esto no era un barajado aleatorio: era un
+   error DETERMINISTA que ademas parecian intencionado. Por eso el test puede
+   fijar el orden sin depender del azar.
+
+   Aqui el turno 3 es el que mas puntua, asi que sin el desempate por
+   (turno, ronda) sus tarjetas salen primero que las del turno 1."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir) (h:*session-id* "s"))
+      (with-turn-engine
+        (reset-turn-engine)
+        ;; Turnos 1, 2 y 3, con los mismos numeros de paso en los tres. Ahora
+        ;; mismo el 3 puntua mas (distancia 0 al turno actual), luego el 2, luego
+        ;; el 1: ese es el orden en el que LLEGAN al render.
+        (dolist (turn '(1 2 3))
+          (let ((h::*turn-counter* turn) (h::*batch-round* 1))
+            (dolist (step '(1 2))
+              (h::assert-batch-intention
+               (list :action :read-file :path "a.txt") step))))
+        (let* ((ctx (build-context "sigue"))
+               (labels (card-turn-labels ctx)))
+          (ok (equal labels '(1 1 2 2 3 3))
+              (format nil "las tarjetas van en orden cronologico, no por relevancia; salieron ~S"
+                      labels))
+          ;; Y el texto de verdad, que es lo que lee el modelo.
+          (ok (< (search "T1" (procedure-section ctx))
+                 (search "T3" (procedure-section ctx)))
+              "el turno 1 se pinta antes que el turno 3"))))))
+
+(deftest protocol/una-tarjeta-no-sobrevive-a-su-veredicto
+  "Una tarjeta en pantalla siempre tiene su veredicto, aunque el tope los corte.
+
+   MAX-FACTS-PER-TYPE capaba 'batch-plan' y 'verdict' POR SEPARADO. No son el
+   mismo conjunto --hay veredictos de pasos cuya tarjeta ya no esta-- y por eso
+   se desalinean solos: los dos topes van sobre poblaciones de tamano distinto y
+   cada una se queda con SU ventana. Cuando eso pasa, una tarjeta viva se queda
+   sin veredicto y se renderiza con STATE = PENDING aunque el paso este
+   EJECUTADO. El contexto afirma algo falso, y no hay forma de distinguirlo de
+   un paso de verdad pendiente.
+
+   Aqui se reproduce la desincronizacion a proposito: DOS tarjetas con sus dos
+   veredictos, y despues TRES veredictos mas de otra ronda cuyos pasos no tienen
+   tarjeta. Con tope 2 las tarjetas no se podan (hay justo dos), pero los
+   veredictos si, y los tres ultimos se llevan los dos de las tarjetas vivas.
+
+   Los hechos van CRUDOS, sin pasar por ASSERT-BATCH-INTENTION: esa crea un
+   'intention' y las reglas de ejecucion disparan y fabricar veredictos de
+   verdad, con lo que el motor se encarga de tapar justo lo que se quiere medir.
+   Y los tipos van LITERALES porque (fact-type ...) es del DSL, no una funcion."
+  (with-test-config (("max_facts_per_type" 2))
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir) (h:*session-id* "s"))
+        (with-turn-engine
+          (reset-turn-engine)
+          (let ((t0 (get-universal-time)))
+            ;; Las dos tarjetas de la ronda 1, con su veredicto.
+            (h::assert
+             (h::harness-fact (h::fact-type "batch-plan")
+                              (h::timestamp (incf t0))
+                              (h::data (list :step 1 :turn-id 1 :round 1
+                                             :action :read-file :target "a.txt"))))
+            (h::assert
+             (h::harness-fact (h::fact-type "verdict")
+                              (h::timestamp (incf t0))
+                              (h::data (list :step 1 :turn-id 1 :round 1
+                                             :action :read-file :target "a.txt"
+                                             :verdict :applied))))
+            (h::assert
+             (h::harness-fact (h::fact-type "batch-plan")
+                              (h::timestamp (incf t0))
+                              (h::data (list :step 2 :turn-id 1 :round 1
+                                             :action :read-file :target "a.txt"))))
+            (h::assert
+             (h::harness-fact (h::fact-type "verdict")
+                              (h::timestamp (incf t0))
+                              (h::data (list :step 2 :turn-id 1 :round 1
+                                             :action :read-file :target "a.txt"
+                                             :verdict :applied))))
+            ;; Tres veredictos MAS NUEVOS de la ronda 2, SIN tarjeta: como los
+            ;; que deja un paso cuya tarjeta ya caia. Son los que empujan fuera
+            ;; de la ventana los veredictos de las tarjetas que siguen a la vista.
+            (h::assert
+             (h::harness-fact (h::fact-type "verdict")
+                              (h::timestamp (incf t0))
+                              (h::data (list :step 1 :turn-id 1 :round 2
+                                             :action :read-file :target "b.txt"
+                                             :verdict :applied))))
+            (h::assert
+             (h::harness-fact (h::fact-type "verdict")
+                              (h::timestamp (incf t0))
+                              (h::data (list :step 2 :turn-id 1 :round 2
+                                             :action :read-file :target "b.txt"
+                                             :verdict :applied))))
+            (h::assert
+             (h::harness-fact (h::fact-type "verdict")
+                              (h::timestamp (incf t0))
+                              (h::data (list :step 3 :turn-id 1 :round 2
+                                             :action :read-file :target "b.txt"
+                                             :verdict :applied)))))
+          (let ((proc (procedure-section (build-context "sigue"))))
+            (ok (and (search "01." proc) (search "02." proc))
+                "las dos tarjetas de la ronda 1 siguen en pantalla")
+            (ok (not (search "PENDING" proc))
+                "ninguna tarjeta en pantalla dice PENDING: el veredicto de una
+                 tarjeta viva no puede caer en la poda")
+            (ok (= 2 (count-if (lambda (l) (search "STATE = APPLIED" l))
+                              (uiop:split-string proc :separator '(#\Newline))))
+                "las dos tarjetas muestran su veredicto real"
+)))))))
+
+(deftest metrics/los-intentos-fallidos-se-cuentan
+  "API calls son PETICIONES, no aciertos.
+
+   CAPTURE-USAGE solo anade a *LLM-CALL-LOG* cuando la respuesta trae usage, o
+   sea solo cuando la llamada fue exitosa. Un turno con 2 timeouts y un exito
+   reportaba una sola llamada, cuando en realidad salieron tres peticiones: las
+   dos primeras occuparon socket, tardaron lo que tardaron y probablemente
+   costaron cuota. El panel de OpenRouter si las contaba, asi que la misma sesion
+   decia 22 llamadas por un lado y 31 por otro, y no habia forma de saber cual
+   era el bueno.
+
+   El hueco era peor todavia con reintentos: un bucle que falla dos veces y acierta
+   a la tercera se registraba como UNA llamada, que es justo el caso donde mas
+   caro sale y donde mas hace falta verlo.
+
+   No hay red: el THUNK falla con un 503 sintetico, como en
+   CONFIG/RETRY-REPEATS-TRANSIENT-FAILURES."
+  (with-test-config (("llm_http_attempts" 3) ("llm_http_backoff_seconds" 0))
+    (h::metrics-reset)
+    (let* ((calls 0)
+           (result (h::call-with-retry
+                    (lambda ()
+                      (incf calls)
+                      (if (< calls 3) (error (http-failure 503)) "ok")))))
+      (ok (string= "ok" result) "el reintento sigue funcionando")
+      (ok (= 3 calls) "salieron 3 peticiones: 2 fallidas y 1 buena")
+      (ok (= 2 (length h::*llm-failed-calls*))
+          "los 2 intentos fallidos quedan registrados, no solo el que acerto")
+      (h::record-context-metrics "ctx" "u" :naive-str "ctx" :llm-iterations 3)
+      (let ((tot (h::metrics-totals)))
+        (ok (= 2 (getf tot :api-failures))
+            "el turno arrastra los fallos a las metricas del turno")
+        (ok (= 2 (getf tot :api-calls))
+            "API calls cuenta los 2 intentos, no el 1 exito")
+        (ok (= 0 (getf tot :api-ok))
+            "y no inventa ninguno bueno: este turno no tuvo exito de LLM")))
+    (h::metrics-reset)))
+
+(deftest metrics/modelos-todos-no-solo-el-ultimo
+  "La lista de modelos tiene que decir cuantos modelos se usaron de verdad.
+
+   Cada turno llevaba UN solo :response-model, el del ULTIMO exito, y
+   :LLM-CALLS no se llenaba mas que con los exitos. Con el enrutado por carga de
+   OpenRouter un turno da cinco modelos distintos y la sesion entera decia 4
+   mientras el panel decia 5: el mismo hecho, dos numeros, y el de las metricras
+   era el incompleto. No habia forma de saber que se estaban usando mas modelos
+   de los que la session reconocia.
+
+   Se barren las TRES fuentes, y ademas los intentos fallidos: un modelo que solo
+   falla tambien se uso y tambien se paga, y dejarlo fuera repetiria el mismo
+   error por el otro lado."
+  (h::metrics-reset)
+  ;; Turno 1: tres llamadas exitosas con tres modelos distintos. El proveedor
+  ;; solo reporta uno como :response-model.
+  (h::record-context-metrics
+   "ctx" "u" :naive-str "ctx" :llm-iterations 3
+   :response-model "zeta"
+   :llm-calls '((:prompt 1 :completion 1 :model "alfa")
+                 (:prompt 1 :completion 1 :model "beta")
+                 (:prompt 1 :completion 1 :model "zeta")))
+  ;; Turno 2: ningun exito, un 503 de "gamma".
+  (push (list :error "HTTP 503" :status 503 :model "gamma")
+        h::*llm-failed-calls*)
+  (h::record-context-metrics "ctx" "u" :naive-str "ctx" :llm-iterations 0)
+  (let ((tot (h::metrics-totals)))
+    (ok (equal '("alfa" "beta" "gamma" "zeta") (getf tot :models))
+        (format nil "los cuatro modelos, no solo el ultimo :response-model; REAL=~S"
+                (getf tot :models)))
+    (ok (= 3 (getf tot :api-ok)) "3 exitos, contados aparte")
+    (ok (= 1 (getf tot :api-failures)) "1 fallo, tambien contado")
+    (ok (= 4 (getf tot :api-calls)) "4 peticiones en total")
+    (h::metrics-reset)))
+
+(deftest metrics/el-resumen-imprime-los-fallos-sin-reventar
+  "METRICS-SUMMARY es lo primero que mira el usuario, y no lo cubria ningun test.
+
+   Tres fallos se colaron aqui de golpe y los tres son la misma clase de error:
+   dar por bueno algo que solo PARECE que funciona porque el camino feliz nunca
+   se ejecuta. Por eso este test imprime el resumen de verdad y mira el texto.
+
+     - (WHEN N) con N=0 es VERDADERO en Common Lisp, asi que un turno sin fallos
+       imprimia 'turno 1: 0 intentos fallido:' con la lista vacia. Ahora es
+       (WHEN (PLUSP N)).
+     - ~:[~;s~] imprime la rama THEN cuando el argumento es NO-NIL, asi que la
+       's' va con (NOT (= N 1)), no con (= N 1).
+     - REMOVE-DUPLICATES sin :TEST usa EQL, y EQL entre dos cadenas con el
+       mismo texto y distinta identidad da NIL: el mismo modelo salia dos
+       veces, con dos objetos string distintos."
+  (h::metrics-reset)
+  ;; Turno 1: un exito, sin fallos.
+  (h::record-context-metrics "ctx" "u" :naive-str "ctx" :llm-iterations 2
+                             :response-model "alfa"
+                             :llm-calls '((:prompt 1 :completion 1 :model "alfa")))
+  ;; Turno 2: tres fallos, dos de ellos del MISMO modelo y con dos cadenas
+  ;; distintas, que es la forma exacta de colar un duplicado con EQL.
+  (dolist (r '((:error "HTTP 429" :status 429 :model "beta")
+               (:error "HTTP 503" :status 503 :model "beta")
+               (:error "TIMEOUT" :status nil :model "gamma")))
+    (push r h::*llm-failed-calls*))
+  (h::record-context-metrics "ctx" "u" :naive-str "ctx" :llm-iterations 0)
+  (let ((out (with-output-to-string (s) (h::metrics-summary s))))
+    (ok (search "1 ok + 3 fallidos = 4 intentos" out)
+        "el desglose de intentos sale en una linea propia")
+    (ok (search "3 intentos fallidos" out)
+        "el plural de 'intentos' sale bien con 3")
+    (ok (search "HTTP 429, HTTP 503, TIMEOUT" out)
+        "los tres motivos, en orden cronologico")
+    (ok (not (search "0 intentos" out))
+        "un turno sin fallos no imprime una linea de cero intentos")
+    (ok (not (search "1 intentos" out))
+        "ni un plural mal puesto en ningun turno")
+    (ok (search "Models: alfa, beta, gamma" out)
+        "cada modelo una vez, con dos registros distintos de 'beta'")
+    (h::metrics-reset)))
