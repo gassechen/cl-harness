@@ -451,9 +451,25 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
 (deftest rules/durable-type-policy
   (ok (durable-type-p "command-exec" (list :exit-code 1 :output "boom")))
   (ng (durable-type-p "command-exec" (list :exit-code 0 :output "ok")))
-  (ok (durable-type-p "file-write" (list :path "a" :bytes 3)))
+  ;; Los tres de archivos llevan :applied porque WRITE-FILE y EDIT-FILE lo
+  ;; ponen SIEMPRE. El fixture viejo --(:path "a" :bytes 3), sin :applied-- fijaba
+  ;; el contrato equivocado: decia que un file-write sin :applied era durable,
+  ;; y un write rechazado (que afirma :applied nil) entraba a la memoria y se
+  ;; renderizaba como 'WROTE. nope.py / BYTES = '. Un archivo que no existe no
+  ;; se puede rechazar por no existir, asi que ese era el unico hueco.
+  (ok (durable-type-p "file-write" (list :path "a" :bytes 3 :applied t)))
   (ng (durable-type-p "file-read" (list :path "a" :contents "x"))
-      "leer no es conocimiento durable"))
+      "leer no es conocimiento durable")
+  (ng (durable-type-p "file-write" (list :path "nope.py" :applied nil
+                                         :refused t :reason "blind write"))
+      "un write rechazado no es una escritura, no va a la memoria")
+  ;; Y el edit aplicado SI: sin el, el archivo se congela en el tamano de su
+  ;; escritura inicial y los edits no dejan rastro durable.
+  (ok (durable-type-p "file-edit" (list :path "a" :applied t
+                                        :replaced-chars 2 :new-chars 5)))
+  (ng (durable-type-p "file-edit" (list :path "a" :applied nil
+                                        :reason "old_string not found"))
+      "un edit que no se aplico no cambio ningun archivo"))
 
 (deftest rules/promote-durable-facts-to-memory
   (reset-mem-engine)
@@ -2700,6 +2716,125 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
               (ok (search "GOAL ABIERTO. 0" ctx)
                   (format nil "el edit repetido dejo una meta abierta:~%~A"
                           (subseq ctx (or (search "DATA DIVISION." ctx) 0)))))))))))
+
+
+(deftest context/memoria-no-deja-una-escritura-rechazada-como-wrote
+  "La MEMORY DIVISION tiene que distinguir lo que se ESCRIBIO de lo que se EDITO.
+
+   Tres defectos en la misma funcion, y los tres se ven juntos en una tarjeta:
+
+   1. FILE-EDIT no era durable. DURABLE-TYPE-P solo aceptaba COMMAND-EXEC y
+      FILE-WRITE, asi que un archivo escrito y luego editado DOS veces dejaba en
+      la memoria el tamano de su primera escritura, para siempre. El caso real:
+      WROTE. math_utils.py BYTES = 252 con un archivo de 560 bytes en disco, y
+      los dos edits que lo llevaron ahi, con sus chars, guardados en un hecho que
+      la memoria nunca miraba. La verdad ESTABA en los facts.
+
+   2. FILE-EDIT no tenia rama en MEM-CONTEXT-BLOCK. Aunque entrara, no se
+      renderizaba: el cond tenia COMMAND-EXEC y FILE-WRITE y nada mas.
+
+   3. Un WRITE RECHAZado entraba a la memoria. DURABLE-TYPE-P no mira :applied,
+      y WRITE-FILE con :refused t afirma :applied nil. Salia como
+      'WROTE. nope.py / BYTES = ' con el tamano vacio: la memoria decia que
+      habia escrito un archivo que no escribio. Falla en los dos pasos, un
+      ARCHIVO que no existe no se puede rechazar por no existir, y no es una
+      escritura.
+
+   El ORDER-BY es la cuarta cosa que hay que fijar: MEMORY DIVISION sale en
+   orden de_timestamp y la prueba de las dos mitades depende de eso. Si el
+   EDITED saliera antes del WROTE, la linea de la escritura se leeria como si
+   describiera el estado final del archivo, que es justo el numero que no
+   describe nada. Por eso NEW-EDIT lleva timestamp POSTERIOR al write y no da
+   igual: con los dos en el mismo segundo el orden es arbitrario."
+  (with-test-config (("max_facts_per_type" 20))
+    (with-turn-engine
+      (reset-turn-engine)
+      (reset-mem-engine)
+      (let ((base-ts (get-universal-time)))
+        ;; 1. Escritura REAL: applied t, con su tamano.
+        (h::assert
+         (h::harness-fact (h::fact-type "file-write")
+                          (h::timestamp (identity base-ts))
+                          (h::data (list :path "/tmp/proyecto/math_utils.py"
+                                         :applied t :bytes 252 :turn-id 1))))
+        ;; 2. Escritura RECHAZADA: applied nil, refused t, sin bytes.
+        (h::assert
+         (h::harness-fact (h::fact-type "file-write")
+                          (h::timestamp (identity base-ts))
+                          (h::data (list :path "/tmp/proyecto/nope.py"
+                                         :applied nil :refused t
+                                         :reason "blind write refused"
+                                         :turn-id 1))))
+        ;; 3. Edit REAL: el que llevo el archivo de 252 a 560 y que la memoria
+        ;;    no mostraba.
+        (h::assert
+         (h::harness-fact (h::fact-type "file-edit")
+                          (h::timestamp (identity (+ base-ts 5)))
+                          (h::data (list :path "/tmp/proyecto/math_utils.py"
+                                         :applied t
+                                         :replaced-chars 155 :new-chars 306
+                                         :matches 1 :turn-id 1))))
+        (h::promote-durable-facts)
+        (let ((ctx (build-context "sigue")))
+          (ok (search "EDITED. /tmp/proyecto/math_utils.py" ctx)
+              (format nil "el edit no sale en la MEMORY:~%~A" ctx))
+          (ok (search "REPLACED = 155" ctx)
+              "el edit dice cuantos chars reemplazo")
+          (ok (search "NEW = 306" ctx)
+              "el edit dice cuantos chars agrego")
+          (ok (search "WROTE. /tmp/proyecto/math_utils.py" ctx)
+              "la escritura real sigue en la memoria")
+          (ok (not (search "WROTE. /tmp/proyecto/nope.py" ctx))
+              (format nil "un write rechazado sale como WROTE:~%~A" ctx))
+          (ok (not (search "BYTES = " (or (search "BYTES =[^~]*" ctx) "")))
+              "no queda ningun BYTES vacio de un write rechazado")
+          ;; Y el orden: NEWEST-FIRST, asi que el edit que toco el archivo va
+          ;; ANTES que la escritura. El BYTES de la escritura se lee entonces
+          ;; como el estado previo, no como el tamano actual.
+          (ok (> (or (search "WROTE. /tmp/proyecto/math_utils.py" ctx) 0)
+                 (or (search "EDITED. /tmp/proyecto/math_utils.py" ctx) 0))
+              "el EDITED sale antes que el WROTE que el modifico: newest-first")
+          ;; Y la razon del rechazo no se pierde del todo: va en la TURN.
+          (ok (search "blind write refused" ctx)
+              "el motivo del rechazo queda en la TURN DIVISION"))))))
+
+
+(deftest rules/memoria-los-edits-estan-capeados
+  "PROMOTE-DURABLE-FACTS capa los edits en la memoria de largo plazo.
+
+   El cap no es un detalle: DURABLE-TYPE-P acaba de dejar pasar FILE-EDIT, y
+   PROMOTE-DURABLE-FACTS capa COMMAND-EXEC y FILE-WRITE al final. Sin una linea
+   mas, cada edit aplicado de cada turno se acumulaba en la memoria PARA
+   SIEMPRE, y no hacia falta un runaway raro: un turno que edita 20 veces ya
+   deja 20 hechos mas de los que el tope permite, y el contexto de los turnos
+   siguientes se infla sin que nadie lo note.
+
+   Se prueba en el motor de MEMORIA y no en el de turno, que es donde cae el
+   error: los dos topes son llamadas parecidas en sitios distintos y el que se
+   puede olvidar es el nuevo."
+  (with-test-config (("max_facts_per_type" 5))
+    (with-turn-engine
+      (reset-turn-engine)
+      (reset-mem-engine)
+      (dotimes (i 7)
+        (h::assert
+         (h::harness-fact (h::fact-type "file-edit")
+                          (h::timestamp (identity (+ (get-universal-time) i)))
+                          (h::data (list :path (format nil "a~D.py" i)
+                                         :applied t
+                                         :replaced-chars 2 :new-chars 5
+                                         :turn-id 1)))))
+      (h::promote-durable-facts)
+      (let ((paths (mapcar (lambda (f) (h::data-get (h::fact-data-of f) :path))
+                           (h::mem-engine-facts))))
+        (ok (= 5 (length paths))
+            (format nil "la memoria guardo ~D edits y el tope es 5: ~S"
+                    (length paths) paths))
+        ;; Y se van los VIEJOS, no los nuevos.
+        (ok (not (member "a0.py" paths :test #'string=))
+            "el edit mas viejo se podo")
+        (ok (member "a6.py" paths :test #'string=)
+            "el edit mas nuevo se conserva")))))
 
 
 (deftest metrics/los-intentos-fallidos-se-cuentan

@@ -952,6 +952,23 @@
                   ((string= type "file-write")
                    (format s "    WROTE. ~A~%" (cobol-value (or (data-get data :path) "")))
                    (format s "        BYTES = ~A~%" (or (data-get data :bytes) "")))
+                  ((string= type "file-edit")
+                   (format s "    EDITED. ~A~%" (cobol-value (or (data-get data :path) "")))
+                   ;; SIN BYTES, A PROPOSITO. El edit no lleva tamano, y la
+                   ;; tentacion de computarlo --leer el archivo, restar lo
+                   ;; viejo, sumar lo nuevo-- seria inventar un dato que el
+                   ;; harness no midio. Lo que se sabe de verdad es cuanto
+                   ;; salio y cuanto entro, y con eso el modelo puede
+                   ;; reconstruir la diferencia. La escritura que este edit
+                   ;; modifies sigue en la division con SU tamano, y como va
+                   ;; newest-first (SORT ascendente y NREVERSE) el modelo ve
+                   ;; primero el cambio y despues el estado anterior: la
+                   ;; linea de BYTES se lee como lo que es, el tamano que
+                   ;; tenia el archivo ANTES de los edits de arriba.
+                   (format s "        REPLACED = ~A~%"
+                           (or (data-get data :replaced-chars) ""))
+                   (format s "        NEW = ~A~%"
+                           (or (data-get data :new-chars) "")))
                   (t nil))))))))
 
 

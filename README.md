@@ -836,7 +836,7 @@ dependencias.
 
 ## Validación realizada
 
-- *Offline (0 llamadas API)*: **suite automatizada de 94 tests / 321 checks, `RESULTADO: OK`**
+- *Offline (0 llamadas API)*: **suite automatizada de 96 tests / 335 checks, `RESULTADO: OK`**
   (`./run-tests.sh`, código 0). Cubre aislamiento entre motores, reglas
   por engine (incl. `mem-dedup-durable` en el motor de memoria), detección de
   loops, sin falsos positivos, promoción durable (se conservan
@@ -925,7 +925,7 @@ Arranque directo con SBCL + Quicklisp (el proyecto se encuentra vía
 - **Suite de tests** (offline, sin llamadas al proveedor):
 
   ```shell
-  ./run-tests.sh              # 94 casos; exit 0 = todo pasó
+  ./run-tests.sh              # 96 casos; exit 0 = todo pasó
   ./run-tests.sh metrics      # sólo los casos cuyo nombre coincide
   ./run-tests.sh config/retry # sólo los de reintentos HTTP
   ```

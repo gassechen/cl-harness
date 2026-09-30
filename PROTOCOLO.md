@@ -248,6 +248,41 @@ Cinco detalles que el ejemplo de arriba no enseña:
   es lo que habilita `DONE`.
 - **`MEMORY DIVISION` va dentro del programa a propósito.** Fuera del `GOBACK` no sería
   parte de este turno, sería un anexo pegado detrás.
+- **`MEMORY DIVISION` va newest-first** (el `sort` es ascendente y luego hay un `nreverse`).
+  El dato más reciente va primero. Por eso un `EDITED` aparece **arriba** del `WROTE` que
+  modifica, y su `BYTES` se lee como el tamaño que el archivo tenía *antes* de ese edit.
+- **Lo que entra a la memoria durable tiene que haber pasado de verdad.** `durable-type-p`
+  exige `:applied` en `file-write` y en `file-edit`, y sólo admite `command-exec` que sean
+  errores reales. Los tres casos que se excluían contaban cosas que no ocurrieron:
+
+  ```cobol
+      WROTE. /tmp/proyecto/nope.py
+          BYTES =                      ; un write RECHAZADO, con el tamaño vacío
+  ```
+
+  Un write rechazado afirmaba `:applied nil` y entraba igual. Decía que había escrito un
+  archivo que no escribió, y un archivo que no existe no se puede rechazar por no existir,
+  así que era el único hueco de los dos. Un `file-edit` que no se aplicó tampoco es un
+  cambio, y antes no entraba ninguno: la única traza durable de un archivo editado era la
+  de su escritura inicial, para siempre.
+- **`EDITED` no lleva `BYTES`, a propósito.** El edit no mide el tamaño del archivo, y
+  computarlo —leer el archivo, restar lo viejo, sumar lo nuevo— sería inventar un dato que
+  el harness no midió. Lo que sí se sabe de verdad es cuánto salió y cuánto entró:
+
+  ```cobol
+      EDITED. /tmp/proyecto/math_utils.py
+          REPLACED = 155
+          NEW = 306
+  ```
+
+  El caso real que lo destapó: `WROTE. math_utils.py BYTES = 252` con un archivo de 560
+  bytes en disco, y los dos edits que lo llevaron ahí guardados en un hecho que la memoria
+  nunca miraba. La verdad estaba en los facts.
+- **Promover a memoria no re-sella el timestamp.** `promote-durable-facts` lleva el del
+  hecho, no `(get-universal-time)`. Al promoting, todos los hechos de la llamada quedaban
+  con la misma edad, y las dos cosas que ordenan por edad dejaban de poder ordenar: el cap
+  por tipo sacaba un subconjunto arbitrario (con siete edits y tope de cinco se guardaban
+  los tres **más viejos**) y la `MEMORY DIVISION` no tenía línea de tiempo.
 
 Con `*debug-mode*` activo (`:debug` en el REPL), cada `build-context` vuelca el programa
 **tal cual se le envió al modelo** a `debug/debug-<unix-time>.cob`, bajo `harness-base-dir`
@@ -515,7 +550,7 @@ No es deuda de formato, es deuda de mensaje:
 
 ## 5. Tests que fijan el protocolo
 
-Sin red, sin LLM, sobre el harness. La suite entera son **94 tests / 321 checks** y se
+Sin red, sin LLM, sobre el harness. La suite entera son **96 tests / 335 checks** y se
 corre con `./run-tests.sh` (código 0 si pasa, 1 si falla, 2 si el sistema no carga). De
 esos, los que **fijan un invariante del protocolo** son los de abajo; los demás cubren
 parseo, acciones, goals, métricas y configuración.
@@ -570,6 +605,19 @@ parseo, acciones, goals, métricas y configuración.
 
 - `protocol/plan-done-y-nada-mas` — `DONE` sin goals abiertos se acepta, y nadie emite
   ya el nombre viejo.
+
+- `context/memoria-no-deja-una-escritura-rechazada-como-wrote` — un `file-edit` aplicado
+  sale en la `MEMORY DIVISION` con `REPLACED` y `NEW`; un `file-write` **rechazado** no sale
+  como `WROTE`; y la división va newest-first, con el `EDITED` encima del `WROTE` que
+  modificó. También fija que el motivo del rechazo no se pierde: sigue en la `TURN`.
+
+- `rules/memoria-los-edits-estan-capeados` — el cap de `file-edit` en `promote-durable-facts`,
+  en el motor de **memoria** y no en el de turno. Se prueba aparte porque el cap es
+ fácil de olvidar: sin él la suite seguía en `OK` con siete edits y un tope de cinco.
+
+- `rules/durable-type-policy` — el fixture viejo fijaba `durable-type-p` con un `file-write`
+  **sin** `:applied`, que es una forma que `write-file` nunca produce. Fijaba el contrato
+  equivocado. Ahora pide `:applied` para `file-write` y `file-edit`, y niega el rechazo.
 
 - `protocol/lectura-duplicada-se-cancela-no-es-pending` — la lectura repetida en el mismo
   turno sale `CANCELLED` y no deja meta abierta. Es la reproducción de los 9 renders de la
