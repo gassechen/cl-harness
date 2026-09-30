@@ -2237,6 +2237,24 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
         (fin (search "DATA DIVISION." ctx)))
     (if (and ini fin) (subseq ctx ini fin) "")))
 
+(defun card-reason (lines label)
+  "El REASON que sigue a la tarjeta LABEL en LINES, o NIL si no tiene.
+
+   La tarjeta y su REASON van en lineas DISTINTAS, asi que esto mira la
+   tarjeta y luego lo que viene despues. La busqueda la corta la linea STATE
+   de la tarjeta SIGUIENTE: sin ese tope, el REASON de una se atribuiria a la
+   anterior.
+
+   THEREIS va DENTRO del AND y no antes: en un LOOP, THEREIS se evalua antes
+   que WHEN, de modo que (thereis l) (when (search \"REASON =\" l) ...) devolvia
+   la linea STATE --que es justo lo primero que hay-- sin mirar el REASON."
+  (let ((idx (position-if (lambda (l) (search label l)) lines)))
+    (when idx
+      (loop for l in (nthcdr (1+ idx) lines)
+            thereis (and (not (search "STATE =" l))
+                          (search "REASON =" l)
+                          l)))))
+
 (defun card-turn-labels (ctx)
   "Los T<n> de las tarjetas de la PROCEDURE DIVISION, en el orden en que salen."
   (let ((labels '()) (in-proc nil))
@@ -2374,8 +2392,107 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                  tarjeta viva no puede caer en la poda")
             (ok (= 2 (count-if (lambda (l) (search "STATE = APPLIED" l))
                               (uiop:split-string proc :separator '(#\Newline))))
-                "las dos tarjetas muestran su veredicto real"
-)))))))
+                "las dos tarjetas muestran su veredicto real")))))))
+
+(deftest protocol/un-pending-dice-porque-esta-pendiente
+  "Un PENDING sin motivo es un PENDING que el modelo no sabe reintentar.
+
+   RENDER-PLAN-PROCEDURE pintaba STATE = PENDING a secas cuando el paso no
+   tenia veredicto, y con eso JUNTO tres cosas que son distintas:
+
+     - anotado y SIN EJECUTAR: la intencion sigue :pending, el paso esta en la
+       cola de Rete y va a ocurrir. No hay que hacer nada.
+     - el veredicto se PERDIO: la intencion ya se ejecuto y su veredicto no
+       esta. Este hay que rehacerlo.
+     - un batch-plan afirmado a mano, sin intention ni verdict.
+
+   Las tres salian identicas. El modelo leia que un paso seguia pendiente sin
+   forma de saber si era trabajo en vuelo o algo que se habia perdido, y no hay
+   decision que tomar ahi: o se reintenta lo que ya esta en cola, o se abandona
+   lo que si se perdio.
+
+   El caso real que lo destapo: una sesion de 4 turnos donde el modelo planeo
+   dos lecturas en la ronda final, las aserto como intention :pending, y el
+   turno se cerro antes de que Rete las ejecutara. Salieron como PENDING junto a
+   pasos que si se habian aplicado, y sin ninguna marca de que eran trabajo
+   genuinamente inconcluso.
+
+   Aqui se monta la mitad importante: un paso con intention :pending y sin
+   veredicto (en cola), y un paso con intention YA ejecutada y sin veredicto
+   (perdido). Los dos tienen que PENDING, y tienen que DECIR POR QUE.
+
+   Hechos CRUDOS y tipos LITERALES por lo mismo de siempre: (fact-type ...) es
+   del DSL, y una intention real dispara las reglas de ejecucion de Rete, que
+   fabricarian veredictos de verdad y taparian lo que se quiere medir.
+
+   Y por eso el render se pide DIRECTO, con RENDER-PLAN-CARD, en vez de con
+   BUILD-CONTEXT: build-context empieza con (run), y (run) dispara
+   EXECUTE-INTENTION-READ contra la intention :pending de aqui, que ejecuta la
+   lectura de verdad, le pone veredicto y se retrae. El paso 01 pasaria a
+   APPLIED y este test no midiria nada. Es la misma trampa que el test de la
+   poda, pero por la otra puerta: alla era ASSERT-BATCH-INTENTION, aqui es el
+   (run) que lleva dentro build-context."
+  (with-test-config (("max_facts_per_type" 20))
+    (with-temp-dir (dir)
+      (let ((cl-harness::*base-dir* dir) (cl-harness:*session-id* "s"))
+        (with-turn-engine
+          (reset-turn-engine)
+          (let ((t0 (get-universal-time)))
+            ;; Paso 1: intention :pending, SIN veredicto. En la cola de Rete.
+            (h::assert
+             (h::harness-fact (h::fact-type "batch-plan")
+                              (h::timestamp (incf t0))
+                              (h::data (list :step 1 :turn-id 1 :round 1
+                                             :action :read-file :target "a.txt"))))
+            (h::assert
+             (h::harness-fact (h::fact-type "intention")
+                              (h::timestamp (incf t0))
+                              (h::data (list :step 1 :turn-id 1 :round 1
+                                             :action :read-file :path "a.txt"
+                                             :status :pending))))
+            ;; Paso 2: intention YA ejecutada (:status :done) y sin veredicto.
+            ;; Se ejecuto y su veredicto no esta: esto es lo que hay que rehacer.
+            (h::assert
+             (h::harness-fact (h::fact-type "batch-plan")
+                              (h::timestamp (incf t0))
+                              (h::data (list :step 2 :turn-id 1 :round 1
+                                             :action :write-file :target "b.txt"))))
+            (h::assert
+             (h::harness-fact (h::fact-type "intention")
+                              (h::timestamp (incf t0))
+                              (h::data (list :step 2 :turn-id 1 :round 1
+                                             :action :write-file :path "b.txt"
+                                             :status :done))))
+            ;; Paso 3: con veredicto. No es PENDING y no lleva REASON de PENDING.
+            (h::assert
+             (h::harness-fact (h::fact-type "batch-plan")
+                              (h::timestamp (incf t0))
+                              (h::data (list :step 3 :turn-id 1 :round 1
+                                             :action :exec-command :target "ls"))))
+            (h::assert
+             (h::harness-fact (h::fact-type "verdict")
+                              (h::timestamp (incf t0))
+                              (h::data (list :step 3 :turn-id 1 :round 1
+                                             :action :exec-command :target "ls"
+                                             :verdict :applied)))))
+          (let* ((proc (procedure-section
+                        (h::render-plan-card (h::collect-active-facts))))
+                 (lines (uiop:split-string proc :separator '(#\Newline))))
+            (ok (= 2 (count-if (lambda (l) (search "STATE = PENDING" l)) lines))
+                "los pasos 01 y 02 estan PENDING: no tienen veredicto")
+            (ok (search "ANOTADO, SIN EJECUTAR" (or (card-reason lines "01.") ""))
+                "el paso 01 dice que esta en cola: la intention sigue :pending")
+            (ok (search "SIN VEREDICTO REGISTRADO" (or (card-reason lines "02.") ""))
+                "el paso 02 no esta en cola: se dice, sin inventar la causa")
+            (ok (not (search "PENDING" (or (card-reason lines "03.") "")))
+                "el paso 03 tiene veredicto y no lleva el REASON de un PENDING")
+            ;; La etiqueta y su STATE van en lineas DISTINTAS, asi que no
+            ;; puede pedir las dos en la misma: mira que la tarjeta 03 exista y
+            ;; que el unico APPLIED de la tarjeta sea el suyo.
+            (ok (and (some (lambda (l) (search "03." l)) lines)
+                     (= 1 (count-if (lambda (l) (search "STATE = APPLIED" l))
+                                   lines)))
+                "el paso 03 sale APPLIED, no PENDING")))))))
 
 (deftest metrics/los-intentos-fallidos-se-cuentan
   "API calls son PETICIONES, no aciertos.

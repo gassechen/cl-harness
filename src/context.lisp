@@ -490,13 +490,14 @@
    Tolera hechos basura, como el renderer anterior: un batch-plan sin :step, o
    con un :step que no es entero, se SALTA (ver PLAN-STEPS-OF)."
   (let* ((steps (plan-steps-of facts))
-         (verdicts (collect-facts-of-type facts "verdict")))
+         (verdicts (collect-facts-of-type facts "verdict"))
+         (intentions (collect-facts-of-type facts "intention")))
     (when steps
       (let ((order (sort steps #'< :key (lambda (d) (data-get d :step)))))
         (with-output-to-string (s)
           (format s "~&IDENTIFICATION DIVISION.~%")
           (format s "PROGRAM-ID. ~A.~%" (or *session-id* "SESSION"))
-          (render-plan-procedure s order verdicts)
+          (render-plan-procedure s order verdicts intentions)
           (format s "~%DATA DIVISION.~%")
           (let ((open (open-goal-tasks)))
             (format s "~%GOAL ABIERTO. ~D~%"
@@ -506,7 +507,46 @@
           (format s "~%GOBACK.~%"))))))
 
 
-(defun render-plan-procedure (s order verdicts)
+(defun pending-intention-identities (intentions)
+  "Las identidades de los pasos que estan ANOTADOS pero sin ejecutar.
+
+   Devuelve un hash de identidades (misma clave que PLAN-STEP-IDENTITY) a T
+   para los intentions que siguen con :status :pending.
+
+   Sirve para que una tarjeta sin veredicto diga POR QUE no lo tiene. Sin esto,
+   'anotado y sin ejecutar' y 'el veredicto se perdio' salen los dos como
+   STATE = PENDING a secas, y el modelo no puede decidir si reintenta."
+  (let ((live (make-hash-table :test #'equal)))
+    (dolist (d intentions)
+      (when (eql (data-get d :status) :pending)
+        (setf (gethash (plan-step-identity d) live) t)))
+    live))
+
+(defun pending-reason (identity pending)
+  "El porque de un PENDING sin veredicto, o NIL si no hay nada que decir.
+
+   Tres estados que antes se renderizaban IGUALES, y que no son lo mismo:
+
+     - ANOTADO, SIN EJECUTAR: la intencion sigue :pending. El paso esta en la
+       cola de Rete; todavia no ha ocurrido. Es lo mas comun en una ronda en
+       vuelo, y el modelo no tiene que hacer nada: ya esta en marcha.
+
+     - SIN VEREDICTO REGISTRADO: no hay intencion pendiente ni veredicto. O la
+       intencion ya se ejecuto y su veredicto se perdio por la poda, o el plan
+       se aserto a mano sin intention. NO se afirma cual de los dos: no hay
+       forma de saberlo desde aqui, y un PENDING sin motivo es exactamente el
+       estado que hace que el modelo no sepa si reintentar.
+
+   La distincion es de RENDER, no de poda. La poda ya protege los veredictos de
+   las tarjetas vivas (ver BUILD-CONTEXT); lo que faltaba era que cuando aun
+   asi no hay veredicto, la tarjeta lo dijera."
+  (cond
+    ((gethash identity pending)
+     "ANOTADO, SIN EJECUTAR: la intencion sigue pendiente; este paso esta en cola")
+    (t
+     "SIN VEREDICTO REGISTRADO: no hay intencion pendiente ni veredicto; puede haberse podado")))
+
+(defun render-plan-procedure (s order verdicts intentions)
   "La PROCEDURE DIVISION de la tarjeta: los pasos y su veredicto.
 
    Vive suelto para que el programa COMPLETO del contexto la reutilice. La
@@ -516,67 +556,78 @@
 
    Por eso no lleva PROGRAM-ID ni GOBACK: los pone quien envuelve.
 
-   Los VERDICTS se pasan como argumento, no se vuelven a leer de la base de
-   hechos. Recolectarlos aqui otra vez haria que la tarjeta leyera el estado
-   global por su cuenta, y si el contexto se esta construyendo con una lista
-   filtrada, la tarjeta se saltaria el filtro."
+   Los VERDICTS y las INTENTIONS se pasan como argumento, no se vuelven a leer
+   de la base de hechos. Recolectarlos aqui otra vez haria que la tarjeta leyera
+   el estado global por su cuenta, y si el contexto se esta construyendo con
+   una lista filtrada --GROUPED-CONTEXT-STRING construye con SELECTED-- la
+   tarjeta se saltaria el filtro y su PENDING daria un motivo de un paso que
+   quizas ni esta en este programa.
+
+   PENDING lleva siempre su REASON. Ver PENDING-REASON: un PENDING a secas
+   mezcla 'en cola' con 'veredicto perdido', y el modelo no puede decidir."
   (format s "~%PROCEDURE DIVISION.~%")
-  (dolist (d order)
-    (let* ((n (data-get d :step))
-           (turn (data-get d :turn-id))
-           ;; La ronda del plan. Normalizada a 1: un plan sin :round (hecho a
-           ;; mano, o de una version anterior) es la ronda 1, no "otra".
-           (round (or (data-get d :round) 1))
-           ;; EMPAREJAR POR (turn-id, round, step), NO POR step SOLO.
-           ;;
-           ;; El numero de paso se reinicia cada TURNO y cada RONDA. Dos casos
-           ;; reales, no teoricos:
-           ;;
-           ;;  - Turnos: 02. del turno 1 y 02. del turno 2 son el mismo numero
-           ;;    y turnos distintos. Emparejando solo por :step, el paso 2 del
-           ;;    turno 2 se llevaba el veredicto del turno 1.
-           ;;
-           ;;  - Rondas: un turno tiene varias respuestas del LLM y cada una
-           ;;    renumera desde 1. Ese mismo turno puede tener un 01. WRITE, un
-           ;;    01. EXEC y un 01. READ, y con solo (turn-id, step) los tres
-           ;;    cogian el PRIMER veredicto step 1 -- el del write -- y el EXEC
-           ;;    salia APPLIED aunque hubiera fallado.
-           ;;
-           ;; :turn-id o :round a NIL solo emparejan entre si (via la
-           ;; normalizacion), para no cruzarlos con los que si los tienen.
-           (v (find-if (lambda (vd)
-                         (and (eql (data-get vd :step) n)
-                              (eql (data-get vd :turn-id) turn)
-                              (eql (or (data-get vd :round) 1) round)))
-                       verdicts))
-           (verdict (data-get v :verdict))
-           ;; OJO: :APPLIED y :FAILED son keywords y los dos son truthy. Hay
-           ;; que COMPARAR para decidir cual es cual; con un test de verdad,
-           ;; todo saldria 'applied'.
-           (state (if v
-                      (string-downcase
-                        (symbol-name (if (keywordp verdict) verdict :failed)))
-                      "pending")))
-      ;; El turno va en la etiqueta, porque la numeracion de COBOL se REINICIA
-      ;; por turno y sola no distingue 02. del turno 1 de 02. del turno 2. La
-      ;; RONDA se anade solo cuando es >1 -- en el caso comun de una sola
-      ;; respuesta por turno no hay nada que desambiguar y la etiqueta no se
-      ;; ensucia.
-      (format s "    ~A  T~A~@[ R~A~] ~A  ~A~%"
-              (cobol-step-label n)
-              (or turn "-")
-              (when (> round 1) round)
-              (cobol-verb (or (data-get d :action) "?"))
-              (or (data-get d :target) "-"))
-      ;; PENDING cuando no hay veredicto: lo que el modelo pidio y todavia no
-      ;; ha ocurrido. NO se omite la linea. Omitirla hacia que 'no ejecutado'
-      ;; fuera indistinguible de 'no me lo dijeron', y el modelo no puede
-      ;; reintentar lo que cree que no existe.
-      (format s "        STATE = ~A~%"
-              (string-upcase state))
-      (let ((why (data-get v :reason)))
-        (when why
-          (format s "        REASON = ~A~%" why))))))
+  (let ((pending (pending-intention-identities intentions)))
+    (dolist (d order)
+      (let* ((n (data-get d :step))
+             (turn (data-get d :turn-id))
+             ;; La ronda del plan. Normalizada a 1: un plan sin :round (hecho a
+             ;; mano, o de una version anterior) es la ronda 1, no "otra".
+             (round (or (data-get d :round) 1))
+             ;; EMPAREJAR POR (turn-id, round, step), NO POR step SOLO.
+             ;;
+             ;; El numero de paso se reinicia cada TURNO y cada RONDA. Dos casos
+             ;; reales, no teoricos:
+             ;;
+             ;;  - Turnos: 02. del turno 1 y 02. del turno 2 son el mismo numero
+             ;;    y turnos distintos. Emparejando solo por :step, el paso 2 del
+             ;;    turno 2 se llevaba el veredicto del turno 1.
+             ;;
+             ;;  - Rondas: un turno tiene varias respuestas del LLM y cada una
+             ;;    renumera desde 1. Ese mismo turno puede tener un 01. WRITE, un
+             ;;    01. EXEC y un 01. READ, y con solo (turn-id, step) los tres
+             ;;    cogian el PRIMER veredicto step 1 -- el del write -- y el EXEC
+             ;;    salia APPLIED aunque hubiera fallado.
+             ;;
+             ;; :turn-id o :round a NIL solo emparejan entre si (via la
+             ;; normalizacion), para no cruzarlos con los que si los tienen.
+             (v (find-if (lambda (vd)
+                           (and (eql (data-get vd :step) n)
+                                (eql (data-get vd :turn-id) turn)
+                                (eql (or (data-get vd :round) 1) round)))
+                         verdicts))
+             (verdict (data-get v :verdict))
+             ;; OJO: :APPLIED y :FAILED son keywords y los dos son truthy. Hay
+             ;; que COMPARAR para decidir cual es cual; con un test de verdad,
+             ;; todo saldria 'applied'.
+             (state (if v
+                        (string-downcase
+                          (symbol-name (if (keywordp verdict) verdict :failed)))
+                        "pending"))
+             (identity (plan-step-identity d)))
+        ;; El turno va en la etiqueta, porque la numeracion de COBOL se REINICIA
+        ;; por turno y sola no distingue 02. del turno 1 de 02. del turno 2. La
+        ;; RONDA se anade solo cuando es >1 -- en el caso comun de una sola
+        ;; respuesta por turno no hay nada que desambiguar y la etiqueta no se
+        ;; ensucia.
+        (format s "    ~A  T~A~@[ R~A~] ~A  ~A~%"
+                (cobol-step-label n)
+                (or turn "-")
+                (when (> round 1) round)
+                (cobol-verb (or (data-get d :action) "?"))
+                (or (data-get d :target) "-"))
+        ;; PENDING cuando no hay veredicto: lo que el modelo pidio y todavia no
+        ;; ha ocurrido. NO se omite la linea. Omitirla hacia que 'no ejecutado'
+        ;; fuera indistinguible de 'no me lo dijeron', y el modelo no puede
+        ;; reintentar lo que cree que no existe.
+        (format s "        STATE = ~A~%"
+                (string-upcase state))
+        ;; El REASON sale del veredicto si lo hay, y si no, de PENDING-REASON.
+        ;; Sin esto ultimo, los PENDING serian todos iguales y el modelo no
+        ;; podria distinguir un paso en cola de uno cuyo veredicto se perdio.
+        (let ((why (or (data-get v :reason)
+                       (unless v (pending-reason identity pending)))))
+          (when why
+            (format s "        REASON = ~A~%" why)))))))
 
 
 
@@ -801,8 +852,9 @@
       ;; MAL FORMADO, y el modelo que lee 'no hay PROCEDURE' aprende que el
       ;; formato cambia de forma. Una seccion vacia se lee: no me pidio nada.
       (let* ((ordered (sort (plan-steps-of facts) #'plan-card-before-p))
-             (verdicts (collect-facts-of-type facts "verdict")))
-        (render-plan-procedure s ordered verdicts))
+             (verdicts (collect-facts-of-type facts "verdict"))
+             (intentions (collect-facts-of-type facts "intention")))
+        (render-plan-procedure s ordered verdicts intentions))
 
       ;; DATA DIVISION con los goals abiertos. La tarjeta suelta lleva
       ;; 'GOAL ABIERTO. N' con las tareas peladas; el programa completo lleva

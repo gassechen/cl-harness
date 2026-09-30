@@ -148,8 +148,33 @@ orden de peso:
    que evitar.
 
 3. **El vocabulario cerrado ya no necesita justificarse en prosa.** `STATE` es
-   `APPLIED | FAILED | PENDING`. `REASON` es el único texto libre, y viene del
-   stderr del SO o del rechazo de la acción.
+   `APPLIED | FAILED | PENDING`. `REASON` es el único texto libre: viene del
+   stderr del SO, del rechazo de la acción, o del propio harness cuando el paso
+   quedó `PENDING` sin veredicto (punto 4).
+
+4. **Un `PENDING` siempre dice por qué lo es.** Es el punto que más se leía mal,
+   porque `PENDING` a secas mezclaba dos cosas que piden acciones opuestas:
+
+   ```cobol
+       01.  T1 READ-FILE  a.txt
+           STATE = PENDING
+           REASON = ANOTADO, SIN EJECUTAR: la intencion sigue pendiente; este paso esta en cola
+       02.  T1 WRITE-FILE  b.txt
+           STATE = PENDING
+           REASON = SIN VEREDICTO REGISTRADO: no hay intencion pendiente ni veredicto; puede haberse podado
+   ```
+
+   El primero está **en marcha**: la intención sigue viva y el motor lo ejecutará,
+   así que el modelo no debe reintentarlo. El segundo no tiene veredicto **y no hay
+   intención viva**, o sea que o se perdió uno al podar o se afiannó a mano: no hay
+   forma de saberlo desde la tarjeta, y por eso el texto **no afirma** cuál de los
+   dos es. Ese es el estado en el que el modelo sí tiene que decidir.
+
+   Los dos `PENDING` que antes salían idénticos —`ANOTADO` y `veredicto perdido`—
+   ahora se leen distinto. La distinción es de
+   **render**, no de poda: la poda ya protege los veredictos de los pasos vivos
+   (§2.3), y lo que faltaba era que, cuando aun así no hay veredicto, la tarjeta
+   lo dijera en vez de dejar al modelo adivinarlo.
 
 `GOAL ABIERTO. N` no es decoración: pone las bananas pendientes del LLM en el mismo
 sitio donde ve su plan, que es donde tiene sentido que las mire. Cierra cuando `N`
@@ -168,7 +193,7 @@ espacios.
 |---|---|---|
 | `IDENTIFICATION DIVISION.` | siempre | `PROGRAM-ID. <id de sesión>.` |
 | `EPOCH.` / `BASELINE-TURN.` / `SUMMARY.` | si se consolidó un epoch | Va **dentro** de la identificación: es la identidad del programa, no una sección más |
-| `PROCEDURE DIVISION.` | **siempre**, aunque no haya plan | Un bloque por paso del `batch-plan`: `01.  T3 WRITE-FILE  math_utils.py`, su `STATE = …` y su `REASON` si lo hay |
+| `PROCEDURE DIVISION.` | **siempre**, aunque no haya plan | Un bloque por paso del `batch-plan`: `01.  T3 WRITE-FILE  math_utils.py`, su `STATE = …` y su `REASON` — siempre en `PENDING`, y en `APPLIED`/`FAILED` si el veredicto trae motivo |
 | `DATA DIVISION.` | siempre | `GOAL ABIERTO. N` y las bananas, con `STATUS`, `PRIORITY` y `PARENT` |
 | `WARNING DIVISION.` | solo si `collect-tool-loops` detecta reintentos | `LOOP.` y qué dejar de hacer |
 | `TURN n.` | uno por turno, del más viejo al actual | `USER.` con su `TEXT`, los hechos de resultado y los veredictos sin tarjeta |
@@ -443,7 +468,7 @@ No es deuda de formato, es deuda de mensaje:
 
 ## 5. Tests que fijan el protocolo
 
-Sin red, sin LLM, sobre el harness. La suite entera son **91 tests / 305 checks** y se
+Sin red, sin LLM, sobre el harness. La suite entera son **92 tests / 310 checks** y se
 corre con `./run-tests.sh` (código 0 si pasa, 1 si falla, 2 si el sistema no carga). De
 esos, los que **fijan un invariante del protocolo** son los de abajo; los demás cubren
 parseo, acciones, goals, métricas y configuración.
