@@ -79,6 +79,50 @@
        (let ((exit (getf result :exit-code)))
          (if exit (zerop exit) t))))
 
+(defun assert-step-cancelled (data why)
+  "Un paso que NO se ejecuta porque otro paso ya lo cubrio, dicho como
+   veredicto.
+
+   Hermanastro de ASSERT-STEP-VERDICT, con la misma identidad de paso, y por el
+   mismo motivo: el estado de la maquina es un JOIN entre el plan y el
+   veredicto.
+
+   Existia un cuarto caso que no cabia en los tres estados. Cuando una lectura
+   o un edit se piden por segunda vez en el mismo turno,
+   PREVENT-DUPLICATE-READ y PREVENT-DUPLICATE-EDIT retractan la intencion y no
+   escribian NADA. El paso se quedaba sin veredicto, y RENDER-PLAN-PROCEDURE
+   caia al fallback 'PENDING': la tarjeta decia que el trabajo seguia pendiente
+   cuando ya estaba hecho, y el REASON culpaba a la poda ('puede haberse
+   podado') cuando lo que hubo fue una cancelacion deliberada. Tres renders
+   seguidos de la misma sesion quedaron con un GOAL ABIERTO sobre una tarea ya
+   terminada.
+
+   Con :CANCELLED el paso llega a un estado terminal y PENDING vuelve a
+   significar una sola cosa: la intencion sigue viva, en la cola, va a
+   ocurrir. El render NO hubo que cambiar: RENDER-PLAN-PROCEDURE ya traducía
+   cualquier keyword de :verdict con (symbol-name ...), y :CANCELLED sale solo.
+   Lo que faltaba era el hecho."
+  (assert (harness-fact
+           (fact-type "verdict")
+           (timestamp (get-universal-time))
+           (data (list :step (data-get data :step)
+                       :action (data-get data :action)
+                       :target (or (data-get data :path)
+                                   (data-get data :command))
+                       :verdict :cancelled
+                       ;; El turno y la ronda son los de la INTENCION, no los
+                       ;; del reloj: la regla dispara en cuanto entra la
+                       ;; intencion, asi que un intention del turno 1 que se
+                       ;; cancela en el turno 2 se sellaria con el turno
+                       ;; equivocado y su tarjeta se emparejaria con el paso
+                       ;; equivocado de otro turno. Mismo criterio que en
+                       ;; ASSERT-STEP-VERDICT.
+                       :turn-id (or (data-get data :turn-id)
+                                    (current-turn-id))
+                       :round (or (data-get data :round)
+                                  (current-batch-round))
+                       :reason why)))))
+
 (defun assert-step-verdict (data result)
   "PROTOCOLO §2.3. DATA es la data de la intencion (trae :step del PLAN);
    RESULT es lo que devolvio la accion. El veredicto lleva la identidad del

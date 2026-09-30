@@ -217,7 +217,7 @@ máximos, streaming, modelo, endpoint y clave.
 
 ### 4.1 Verificación y calidad
 
-- **Ya hay suite automatizada (92 casos, 310 checks, toda en verde).** Vive en
+- **Ya hay suite automatizada (94 casos, 321 checks, toda en verde).** Vive en
   `tests/harness.lisp`, expuesta como el sistema `"cl-harness/tests"` en
   `cl-harness.asd` y ejecutable con `./run-tests.sh` (o `./run-tests.sh metrics`
   para filtrar por nombre). Los casos se registran a mano en `*test-cases*`
@@ -362,7 +362,7 @@ máximos, streaming, modelo, endpoint y clave.
 **P1 — verificación y observabilidad (cerrado)**
 
 4. ~~Sistema de tests~~ → `tests/harness.lisp` + sistema `"cl-harness/tests"` +
-   `./run-tests.sh`, 92 casos / 310 checks en verde y guardián offline.
+   `./run-tests.sh`, 94 casos / 321 checks en verde y guardián offline.
 5. ~~Persistir `response.model`~~ → `*llm-response-model*` y
    `*llm-call-log*` por llamada, incluidos en `metrics-to-json`.
 6. ~~Separar `prompt-tokens` por iteración~~ → `*llm-call-log*` acumula el uso

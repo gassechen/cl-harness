@@ -134,9 +134,9 @@ orden de peso:
 
    Lo que el formato sí compra, y es lo que sostiene el cambio: un solo dialecto en
    vez de dos anidados, `STATE` como vocabulario cerrado
-   (`APPLIED | FAILED | PENDING`), y el veredicto **pegado al paso** que juzga. En
-   YAML plano y en logfmt el estado y la acción caían en la misma clave y el paso
-   no se distinguía de un turno a otro; en la tarjeta, `01.` con su `STATE` al lado
+   (`APPLIED | FAILED | CANCELLED | PENDING`), y el veredicto **pegado al paso** que
+   juzga. En YAML plano y en logfmt el estado y la acción caían en la misma clave y el
+   paso no se distinguía de un turno a otro; en la tarjeta, `01.` con su `STATE` al lado
    se lee como lo que es, un paso y su resultado.
 
 2. **Números de paso en columna fija, con el turno al lado.** `01.`, `02.`, ...
@@ -148,9 +148,41 @@ orden de peso:
    que evitar.
 
 3. **El vocabulario cerrado ya no necesita justificarse en prosa.** `STATE` es
-   `APPLIED | FAILED | PENDING`. `REASON` es el único texto libre: viene del
+   `APPLIED | FAILED | CANCELLED | PENDING`. `REASON` es el único texto libre: viene del
    stderr del SO, del rechazo de la acción, o del propio harness cuando el paso
    quedó `PENDING` sin veredicto (punto 4).
+
+   `CANCELLED` es el cuarto estado, y no es un lujo: es lo que hace que `PENDING`
+   significa **una sola cosa**. Existió un cuarto caso que no cabía en los tres, y
+   forzarlo produjo tarjetas que mentían sobre trabajo ya hecho:
+
+   ```cobol
+       02.  T4 R2 READ-FILE  math_utils.py
+           STATE = PENDING
+           REASON = SIN VEREDICTO REGISTRADO: no hay intencion pendiente ni veredicto; puede haberse podado
+   ```
+
+   El paso **nunca se iba a ejecutar**: el modelo lo había pedido por segunda vez en el
+   mismo turno, `prevent-duplicate-read` lo canceló, y al cancelar no escribió nada.
+   Sin veredicto, el render caía al `PENDING` por defecto y adjudicaba una causa —
+   la poda — que no había pasado. `CANCELLED` lo dice, y `PENDING` vuelve a ser
+   exactamente "la intención sigue viva":
+
+   ```cobol
+       02.  T4 R2 READ-FILE  math_utils.py
+           STATE = CANCELLED
+           REASON = CANCELADO: el archivo ya se leyó en este turno, repetir la lectura no aportaria nada
+   ```
+
+   El render **no hubo que cambiar** para esto: `render-plan-procedure` ya traducía
+   cualquier `:verdict` con `(symbol-name …)`, así que `CANCELLED` salió solo. Lo que
+   faltaba era el hecho, y lo escriben `prevent-duplicate-read` y
+   `prevent-duplicate-edit` a través de `assert-step-cancelled`, antes de retractar
+   la intención.
+
+   La lección es la del punto 4 aplicada a las reglas: **retractar en silencio es
+   perder el estado**. Una regla que borra su propio input tiene que dejar un
+   veredicto detrás, o el paso queda sin juicio y el render tiene que inventarse uno.
 
 4. **Un `PENDING` siempre dice por qué lo es.** Es el punto que más se leía mal,
    porque `PENDING` a secas mezclaba dos cosas que piden acciones opuestas:
@@ -193,7 +225,7 @@ espacios.
 |---|---|---|
 | `IDENTIFICATION DIVISION.` | siempre | `PROGRAM-ID. <id de sesión>.` |
 | `EPOCH.` / `BASELINE-TURN.` / `SUMMARY.` | si se consolidó un epoch | Va **dentro** de la identificación: es la identidad del programa, no una sección más |
-| `PROCEDURE DIVISION.` | **siempre**, aunque no haya plan | Un bloque por paso del `batch-plan`: `01.  T3 WRITE-FILE  math_utils.py`, su `STATE = …` y su `REASON` — siempre en `PENDING`, y en `APPLIED`/`FAILED` si el veredicto trae motivo |
+| `PROCEDURE DIVISION.` | **siempre**, aunque no haya plan | Un bloque por paso del `batch-plan`: `01.  T3 WRITE-FILE  math_utils.py`, su `STATE = …` y su `REASON` — siempre en `PENDING`, y en `APPLIED`/`FAILED`/`CANCELLED` si el veredicto trae motivo |
 | `DATA DIVISION.` | siempre | `GOAL ABIERTO. N` y las bananas, con `STATUS`, `PRIORITY` y `PARENT` |
 | `WARNING DIVISION.` | solo si `collect-tool-loops` detecta reintentos | `LOOP.` y qué dejar de hacer |
 | `TURN n.` | uno por turno, del más viejo al actual | `USER.` con su `TEXT`, los hechos de resultado y los veredictos sin tarjeta |
@@ -366,6 +398,21 @@ No es deuda de formato, es deuda de mensaje:
    hay tests que fijan las tres legs (el rechazo no cierra, el rechazo no
    desaparece, el acierto sí cierra).
 
+   Y hay una segunda excepción, en la otra dirección. `todo-satisfied-p` exige
+   evidencia **igual o más nueva** que el goal, para que un resultado de un turno
+   anterior no cierre en silencio un goal recién levantado. Ese corte por tiempo
+   solo defiende contra lo viejo, y una lectura repetida dentro de un mismo turno
+   se cancelaba: la única `file-read` capaz de cerrar el goal era la anterior, y
+   quedaba por debajo del corte. El goal se abría y no se cerraba nunca, y el
+   `GOAL ABIERTO` de tres renders seguidos de una sesión de 4 turnos apuntaba a
+   trabajo ya hecho.
+
+   Era además **dependiente del reloj**: con la lectura y el goal en el mismo
+   segundo el corte pasaba por accidente y el goal se cerraba, así que el defecto
+   aparecía y desaparecía según la velocidad del turno. Por eso la evidencia
+   **del mismo turno** que el goal se acepta sin mirar el reloj: un hecho del
+   turno del goal no es un sobrante.
+
 6. **Restaurar una sesión nunca funcionó, y se rompía en silencio.** Tres capas, y
    ninguna daba un error visible:
    - `persist.lisp` tenía **dos** `defun restore-facts`. El que usa `restore-session`
@@ -468,7 +515,7 @@ No es deuda de formato, es deuda de mensaje:
 
 ## 5. Tests que fijan el protocolo
 
-Sin red, sin LLM, sobre el harness. La suite entera son **92 tests / 310 checks** y se
+Sin red, sin LLM, sobre el harness. La suite entera son **94 tests / 321 checks** y se
 corre con `./run-tests.sh` (código 0 si pasa, 1 si falla, 2 si el sistema no carga). De
 esos, los que **fijan un invariante del protocolo** son los de abajo; los demás cubren
 parseo, acciones, goals, métricas y configuración.
@@ -523,6 +570,19 @@ parseo, acciones, goals, métricas y configuración.
 
 - `protocol/plan-done-y-nada-mas` — `DONE` sin goals abiertos se acepta, y nadie emite
   ya el nombre viejo.
+
+- `protocol/lectura-duplicada-se-cancela-no-es-pending` — la lectura repetida en el mismo
+  turno sale `CANCELLED` y no deja meta abierta. Es la reproducción de los 9 renders de la
+  sesión de 4 turnos: el paso caía en `PENDING` con el motivo de una poda que no pasó, y
+  el `GOAL ABIERTO` señalaba trabajo ya hecho. El `file-read` de la ronda 1 va con
+  timestamp 5 segundos atrás **a propósito**: con la lectura y el goal en el mismo segundo
+  el corte por tiempo pasaba por accidente y el bug no se veía. (§2.3, §3)
+
+- `protocol/edit-duplicado-se-cancela-y-uno-distinto-no` — el mismo edit dos veces sale
+  `CANCELLED`, y un edit **distinto** se ejecuta normal (`APPLIED`, `CANCELLED`, `APPLIED`).
+  `prevent-duplicate-edit` estaba sin **un solo test**: se podía tocar entera y la suite
+  seguía verde. La segunda mitad del test es la que importa, porque una regla que
+  cancelara todo la pasaría igual.
 
 ## 5b. Una nota sobre cómo se cazan estos fallos
 

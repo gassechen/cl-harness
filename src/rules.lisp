@@ -363,7 +363,13 @@
 
 
 (defrule prevent-duplicate-read (:salience 15)
-  "Si el LLM pide leer un archivo que ya leyó en este turno, cancela la intención."
+  "Si el LLM pide leer un archivo que ya leyó en este turno, cancela la intención.
+
+   Se aserta el CANCELADO antes de retractar. Antes retractaba y no escribía
+   nada: el paso se quedaba sin veredicto, la tarjeta caía al fallback
+   PENDING y el REASON culpaba a una poda que no había pasado. El paso
+   tenía que llegar a un estado terminal para que PENDING significara una sola
+   cosa."
   (?intent (harness-fact (fact-type "intention") (data ?d)))
   (test (eql (data-get ?d :action) :read-file))
   (harness-fact (fact-type "file-read") (data ?fr-data))
@@ -371,6 +377,7 @@
              (string= (path-basename (data-get ?fr-data :path))
                       (path-basename (data-get ?d :path)))))
   =>
+  (assert-step-cancelled ?d "CANCELADO: el archivo ya se leyó en este turno, repetir la lectura no aportaria nada")
   (retract ?intent))
 
 
@@ -746,4 +753,5 @@
              (string= (data-get ?fe-data :new-string)
                       (data-get ?d :new-string))))
   =>
+  (assert-step-cancelled ?d "CANCELADO: el mismo edit ya se aplico en este turno, repetirlo no cambiaria el archivo")
   (retract ?intent))

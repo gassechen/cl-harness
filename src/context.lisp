@@ -391,15 +391,31 @@
      their fact with :applied nil, precisely so the rejection is visible. With
      the check still on :edit only, ADDING that visibility would have made
      every rejection close the very goal it failed to do. Hence one rule for
-     every verb: the evidence has to say it was applied."
+     every verb: the evidence has to say it was applied.
+
+     Evidence from the SAME turn as the goal is accepted whatever its
+     timestamp. The cut by time exists so a result left over from an earlier
+     turn cannot silently close a goal that was just raised, and that is the
+     only thing it defends against: a fact from the goal's own turn is not a
+     leftover. Without this exception a repeated read inside one turn is
+     cancelled by PREVENT-DUPLICATE-READ, which never runs, and the goal it
+     raised can never be discharged -- the only file-read that could close it
+     is the earlier one. The card then shows GOAL ABIERTO over work that is
+     already done, and it re-raised the goal on every later render, which is
+     what three consecutive renders of one session did. It was also clock
+     dependent: with the read and the goal inside the same second the
+     timestamp check passed by accident and the goal closed, so the defect
+     appeared and disappeared with how fast the turn ran."
   (let* ((task (or (get-slot-value todo 'task) ""))
          (verb (todo-verb task))
          (arg (and verb (todo-argument task verb)))
          (types (and verb (todo-evidence-types verb)))
-         (since (or (get-slot-value todo 'timestamp) 0)))
+         (since (or (get-slot-value todo 'timestamp) 0))
+         (turn (get-slot-value todo 'turn-id)))
     (and arg types
          (some (lambda (f)
-                 (and (>= (fact-timestamp-of f) since)
+                 (and (or (>= (fact-timestamp-of f) since)
+                          (eql (data-get (fact-data-of f) :turn-id) turn))
                       (member (fact-type-of f) types :test #'string=)
                       (if (eql verb :run)
                           (goal-command-match-p arg (data-get (fact-data-of f) :command))

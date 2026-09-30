@@ -2494,6 +2494,214 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                                    lines)))
                 "el paso 03 sale APPLIED, no PENDING")))))))
 
+(deftest protocol/lectura-duplicada-se-cancela-no-es-pending
+  "Una lectura duplicada se CANCELA: no sale PENDING y no deja un goal abierto.
+
+   El caso real: una sesion de 4 turnos que en su ronda final volvio a pedir
+   math_utils.py, que ya habia leido en ese mismo turno. Tres reglas en cadena
+   producen el mentira:
+
+     - AUTO-CREATE-TODO-ON-ACTION (salience 20) ve la intention y anota la
+       meta 'Read math_utils.py';
+     - PREVENT-DUPLICATE-READ (salience 15) la cancela y RETRACTA LA INTENTION
+       SIN ASERTAR NADA;
+     - EXECUTE-INTENTION-READ (salience 5) ya no llega a disparar, asi que no
+       hay file-read.
+
+   Quedan tres huecos, y los tres salen en la tarjeta:
+
+     - el paso del plan se queda sin intention y sin veredicto, y STATE cae al
+       fallback 'PENDING' de RENDER-PLAN-PROCEDURE;
+     - el REASON de PENDING dice 'puede haberse podado', cuando lo que paso es
+       que se CANCELO a proposito;
+     - la meta queda abierta para siempre: TODO-SATISFIED-P exige evidencia MAS
+       NUEVA que la meta, y la unica lectura que hay es de la ronda anterior.
+
+   El resultado era 'GOAL ABIERTO' sobre una tarea ya terminada, que manda al
+   modelo a seguir trabajando en algo que ya esta hecho.
+
+   Aqui la intention se aserta CRUDA y con :status :pending, para que la monten
+   las reglas de verdad (PREVENT-DUPLICATE-READ tiene salience 15 contra 5 de
+   EXECUTE-INTENTION-READ, asi que gana la cancelacion, igual que en
+   produccion). Se pide el render con BUILD-CONTEXT y no con RENDER-PLAN-CARD
+   porque el goal se cuenta en la DATA DIVISION, y BUILD-CEXT es ademas el
+   camino real: su (run) dispara la cadena."
+  (with-test-config (("max_facts_per_type" 20))
+    (with-temp-dir (dir)
+      (let ((cl-harness::*base-dir* dir) (cl-harness:*session-id* "s"))
+        (with-turn-engine
+          (reset-turn-engine)
+          (let ((base-ts (get-universal-time))
+                (path (namestring (merge-pathnames "math_utils.py" dir))))
+            (with-open-file (s path :direction :output :if-exists :supersede)
+              (write-line "def factorial(n): return n" s))
+            ;; Ronda 1: la lectura se ejecuto y quedo registrada.
+            ;;
+            ;; El timestamp va 5 segundos ATRAS a proposito. TODO-SATISFIED-P
+            ;; cierra un goal con evidencia '>=' al timestamp del goal, asi que
+            ;; si la lectura y el goal caen en el mismo segundo el goal se
+            ;; cierra SOLO y el bug no aparece. Es lo que pasa en las pruebas
+            ;; rapidas. En la corrida real la lectura fue de la ronda 1 y la
+            ;; duplicada de la ronda 2, con segundos de harness en el medio, y
+            ;; por eso el goal quedo abierto. Que el cierre dependa de la
+            ;; resolucion del reloj es en si mismo parte del defecto.
+            (h::assert
+             (h::harness-fact (h::fact-type "batch-plan")
+                              (h::timestamp (identity base-ts))
+                              (h::data (list :step 1 :turn-id 1 :round 1
+                                             :action :read-file
+                                             :target "math_utils.py"))))
+            (h::assert
+             (h::harness-fact (h::fact-type "file-read")
+                              (h::timestamp (identity (- base-ts 5)))
+                              (h::data (list :path path :applied t :turn-id 1))))
+            ;; Y su veredicto, que es lo que produce la lectura de verdad.
+            (h::assert
+             (h::harness-fact (h::fact-type "verdict")
+                              (h::timestamp (identity (- base-ts 5)))
+                              (h::data (list :step 1 :turn-id 1 :round 1
+                                             :action :read-file
+                                             :target "math_utils.py"
+                                             :verdict :applied))))
+            ;; Ronda 2: el MISMO archivo otra vez. Es un paso 2 para que las
+            ;; tarjetas 01. y 02. no se pisen al buscar el REASON.
+            (h::assert
+             (h::harness-fact (h::fact-type "batch-plan")
+                              (h::timestamp (incf base-ts))
+                              (h::data (list :step 2 :turn-id 1 :round 2
+                                             :action :read-file
+                                             :target "math_utils.py"))))
+            (h::assert
+             (h::harness-fact (h::fact-type "intention")
+                              (h::timestamp (incf base-ts))
+                              (h::data (list :step 2 :turn-id 1 :round 2
+                                             :action :read-file :path path
+                                             :status :pending))))
+            (let* ((ctx (build-context "sigue"))
+                   (proc (procedure-section ctx))
+                   (lines (uiop:split-string proc :separator '(#\Newline))))
+              (ok (not (search "STATE = PENDING" proc))
+                  (format nil
+                          "la lectura duplicada sale PENDING, tiene que salir CANCELLED:~%~A"
+                          proc))
+              (ok (search "CANCELLED" proc)
+                  "el paso duplicado se dice CANCELLED, no 'puede haberse podado'")
+              (ok (search "GOAL ABIERTO. 0" ctx)
+                  (format nil "la lectura duplicada dejo una meta abierta:~%~A"
+                          (subseq ctx (or (search "DATA DIVISION." ctx) 0))))
+              (ok (search "STATE = APPLIED" proc)
+                  "la lectura de la ronda 1 sigue APPLIED, no se toca"
+                  )
+              (ok (not (search "puede haberse podado" (or (card-reason lines "02.") "")))
+                  "el REASON no culpa a la poda de una cancelacion deliberada")
+              ;; Y la intencion duplicada se fue: no quedo viva.
+              (ok (not (find "intention"
+                             (mapcar #'h::fact-type-of
+                                     (h::collect-active-facts))
+                             :test #'string=))
+                  "la intention cancelada no quedo viva"))))))))
+
+
+
+(deftest protocol/edit-duplicado-se-cancela-y-uno-distinto-no
+  "El mismo edit dos veces se CANCELA; un edit DISTINTO se ejecuta normal.
+
+   PREVENT-DUPLICATE-EDIT estaba sin un solo test. Es la misma clase de
+   mentira que el dedup de lectura -- retracta la intencion sin escribir nada,
+   el paso cae al fallback PENDING y el REASON culpa a una poda que no
+   ocurrio -- pero sin nadie que lo comprobara. Por eso se puede tocar una
+   regla entera y que la suite siga en verde.
+
+   Ahi van las dos mitades. La que se cancela, con el MISMO old-string y el
+   MISMO new-string, tiene que salir CANCELLED. Y la que se deja, que edita
+   otra cosa, tiene que llegar a ejecutarse de verdad: si el test solo mirara
+   la primera mitad, una regla que cancelara TODO lo pasaria.
+  "
+  (with-test-config (("max_facts_per_type" 20))
+    (with-temp-dir (dir)
+      (let ((cl-harness::*base-dir* dir) (cl-harness:*session-id* "s"))
+        (with-turn-engine
+          (reset-turn-engine)
+          (let ((base-ts (get-universal-time))
+                (path (namestring (merge-pathnames "app.py" dir))))
+            (with-open-file (s path :direction :output :if-exists :supersede)
+              (write-line "x = 1" s))
+            ;; Un edit YA aplicado en este turno, con su veredicto.
+            (h::assert
+             (h::harness-fact (h::fact-type "batch-plan")
+                              (h::timestamp (identity (- base-ts 5)))
+                              (h::data (list :step 1 :turn-id 1 :round 1
+                                             :action :edit-file
+                                             :target "app.py"))))
+            (h::assert
+             (h::harness-fact (h::fact-type "file-edit")
+                              (h::timestamp (identity (- base-ts 5)))
+                              (h::data (list :path path :applied t :turn-id 1
+                                             :old-string "x = 1"
+                                             :new-string "x = 2"))))
+            (h::assert
+             (h::harness-fact (h::fact-type "verdict")
+                              (h::timestamp (identity (- base-ts 5)))
+                              (h::data (list :step 1 :turn-id 1 :round 1
+                                             :action :edit-file
+                                             :target "app.py"
+                                             :verdict :applied))))
+            ;; Paso 2: el MISMO edit otra vez. Se cancela.
+            (h::assert
+             (h::harness-fact (h::fact-type "batch-plan")
+                              (h::timestamp (identity base-ts))
+                              (h::data (list :step 2 :turn-id 1 :round 2
+                                             :action :edit-file
+                                             :target "app.py"))))
+            (h::assert
+             (h::harness-fact (h::fact-type "intention")
+                              (h::timestamp (identity base-ts))
+                              (h::data (list :step 2 :turn-id 1 :round 2
+                                             :action :edit-file :path path
+                                             :status :pending
+                                             :old-string "x = 1"
+                                             :new-string "x = 2"))))
+            ;; Paso 3: un edit DISTINTO (mismo archivo, otro texto). Este se
+            ;; ejecuta, y su veredicto lo tiene que decir.
+            (h::assert
+             (h::harness-fact (h::fact-type "batch-plan")
+                              (h::timestamp (identity base-ts))
+                              (h::data (list :step 3 :turn-id 1 :round 2
+                                             :action :edit-file
+                                             :target "app.py"))))
+            (h::assert
+             (h::harness-fact (h::fact-type "intention")
+                              (h::timestamp (identity base-ts))
+                              (h::data (list :step 3 :turn-id 1 :round 2
+                                             :action :edit-file :path path
+                                             :status :pending
+                                             :old-string "x = 1"
+                                             :new-string "x = 99"))))
+            (let* ((ctx (build-context "sigue"))
+                   (proc (procedure-section ctx))
+                   (lines (uiop:split-string proc :separator '(#\Newline))))
+              ;; El repetido se cancela y lo dice.
+              (ok (search "CANCELLED" proc)
+                  "el edit repetido sale CANCELLED")
+              (ok (search "ya se aplico" (or (card-reason lines "02.") ""))
+                  (format nil "el REASON del repetido:~%  ~A"
+                          (or (card-reason lines "02.") "(nada)")))
+              ;; Y el distinto se ejecuto de verdad: dos APPLIED, no uno.
+              (ok (= 2 (count-if (lambda (l) (search "STATE = APPLIED" l))
+                                lines))
+                  (format nil "hubo ~D APPLIED, tiene que haber 2:~%~A"
+                          (count-if (lambda (l) (search "STATE = APPLIED" l))
+                                    lines)
+                          proc))
+              (ok (not (search "CANCELLED" (or (card-reason lines "03.") "")))
+                  "el edit distinto no se cancelo")
+              ;; Y la meta del edit repetido no queda abierta: la evidencia que
+              ;; la cierra es del mismo turno.
+              (ok (search "GOAL ABIERTO. 0" ctx)
+                  (format nil "el edit repetido dejo una meta abierta:~%~A"
+                          (subseq ctx (or (search "DATA DIVISION." ctx) 0)))))))))))
+
+
 (deftest metrics/los-intentos-fallidos-se-cuentan
   "API calls son PETICIONES, no aciertos.
 
