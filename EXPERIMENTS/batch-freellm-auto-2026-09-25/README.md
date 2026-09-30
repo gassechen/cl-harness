@@ -114,7 +114,7 @@ los hechos supera al baseline.
 | Corrida | `context-tokens` (Rete) | `naive-tokens` | `reduction_pct` | Lectura |
 |---|---:|---:|---:|---|
 | [`session-3999154036`](../batch-freellm-2026-09-23/metrics/session-3999154036-metrics.json) | 29 | 41 | **+29,27%** | YAML más compacto |
-| [`session-3999080576`](../../metrics/session-3999080576-metrics.json) | 39 | 50 | **+22,00%** | YAML más compacto |
+| [`session-3999080576`](./metrics/session-3999080576-metrics.json) | 39 | 50 | **+22,00%** | YAML más compacto |
 | [`session-3999334880`](./metrics/session-3999334880-metrics.json) | 265 | 195 | **-35,90%** | YAML más grande |
 
 La corrida larga de este experimento no muestra ahorro: el prompt y los hechos

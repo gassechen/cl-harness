@@ -1,7 +1,0 @@
-context:
-  session: session-3999355039
-  prior_turns:
-  current_turn:
-    number: 1
-    events:
-      user: Escribe el archivo a.txt con el texto hola.

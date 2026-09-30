@@ -1,3 +1,28 @@
 config.json
 dumps/
 sessions/
+
+# El ejecutable se compila con ./build.sh. Versionarlo son 65 MiB que cambian
+# en cada build: el repo crece sin que nadie cambie una linea de codigo. (GitHub
+# los aceptaria, hasta 100 MiB; el motivo para ignorarlo es el delta, no el limite.)
+bin/
+
+# Credencial caducada que quedo versionada por accidente. No se borra del
+# historial -- haria falta un filter-repo -- pero deja de propagarse.
+z.ia
+
+# Telemetría de corridas. Anclado a la raiz con /: sin ahi, el patron encaja
+# con metrics/ en CUALQUIER nivel, y se tragaria la evidencia de EXPERIMENTS/,
+# que si se versiona a proposito.
+/metrics/
+
+# Contexto volcado con *debug-mode*: ahora son .cob, uno por llamada.
+/debug/
+
+# Autoguardados de Emacs y friends: nunca son código fuente.
+*#*
+\#*#
+
+# Bytecode de Python (los proyectos de ejemplo de EXPERIMENTS/).
+__pycache__/
+*.pyc
