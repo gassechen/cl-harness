@@ -16,7 +16,15 @@
 
 (defun harness-base-dir ()
   "Directory for the harness artifacts. Priority:
-   CL_HARNESS_DIR env var > *base-dir* > process current working directory."
+   *base-dir* > CL_HARNESS_DIR env var > process current working directory.
+
+   OJO: el docstring de esta funcion decia antes lo contrario (env por delante
+   de *base-dir*), y el codigo haria lo que dice ESTE texto. La consecuencia no
+   era cosmetics: un test que ata solo *base-dir* NO vence a CL_HARNESS_DIR del
+   entorno de quien lanza, asi que los directorios se pueden atar por los dos
+   caminos a la vez. Ver PROTOCOLO.md §5 (el caso de EL-PLAN-SE-LEE-COMO-UN-
+   PROGRAMA-COBOL, que ataba la variable del paquete equivocado y por eso
+   escribia sus ficheros en la raiz del repo)."
   (or *base-dir*
       (let ((env (uiop:getenv "CL_HARNESS_DIR")))
         (if (and env (plusp (length env)))

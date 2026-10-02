@@ -541,40 +541,53 @@
                   (subseq text (- (length text) tail-len))))
         text)))
 
+(defun tool-buf-in-index-order (tool-buf)
+  "TOOL-BUF as a list of (INDEX . ACC) sorted by INDEX, ascending.
+
+   MAPHASH itera una hash-table en orden NO ESPECIFICADO por el estandar, y el
+   orden de salida de SBCL depende del hashing de los indices. Con eso, un lote
+   de N tool-calls se ejecutaba en un orden distinto en cada corrida: un
+   read_file y un write_file del mismo lote salian en cualquiera de los dos
+   sentidos, y el resultado de la corrida no era reproducible. El modelo ordena
+   sus tool_calls por indice y ese es el orden que hay que respetarlos: es la
+   unica secuencia que el modelo mismo significo."
+  (sort (loop for index being the hash-keys of tool-buf
+                collect (cons index (gethash index tool-buf)))
+        #'< :key #'car))
+
 (defun stream-execute-tool-calls (messages tool-buf)
   "Execute all accumulated tool calls, print live banners, append assistant +
-   tool messages. Returns the appended MESSAGES list (unchanged when no tools)."
+   tool messages. Returns the appended MESSAGES list (unchanged when no tools).
+
+   Recorre TOOL-BUF en orden de indice (TOOL-BUF-IN-INDEX-ORDER), no con
+   MAPHASH, para que el orden de ejecucion sea el que el modelo escribio."
   (if (zerop (hash-table-count tool-buf))
       messages
-      (progn
-        (let ((a-msg (make-hash-table :test 'equal))
-              (tcs '()))
-          (setf (gethash "role" a-msg) "assistant")
-          (setf (gethash "content" a-msg) 'null)
-          (maphash (lambda (index acc)
-                     (declare (ignore index))
-                     (push (stream-tool-call-to-json acc) tcs))
-                   tool-buf)
-          (setf (gethash "tool_calls" a-msg) tcs)
-          (setf messages (append messages (list a-msg))))
-        (maphash (lambda (index acc)
-                   (declare (ignore index))
-                   (let* ((name (or (getf acc :name) ""))
-                          (args-raw (getf acc :args)))
-                     (stream-tool-banner name args-raw)
-(let* ((args-obj (handler-case
-                     (com.inuoe.jzon:parse args-raw)
-                   (error () (make-hash-table :test 'equal))))
-       (raw-text (execute-tool name args-obj))
-       (result-text (truncate-tool-result raw-text))
-       (tool-msg (make-hash-table :test 'equal)))
-  (record-tool-call name raw-text result-text)
-  (stream-tool-result result-text)
-                       (setf (gethash "role" tool-msg) "tool")
-                       (setf (gethash "content" tool-msg) result-text)
-                       (setf (gethash "tool_call_id" tool-msg) (getf acc :id))
-                       (setf messages (append messages (list tool-msg))))))
-                 tool-buf)
+      (let ((a-msg (make-hash-table :test 'equal))
+            (tcs '()))
+        (setf (gethash "role" a-msg) "assistant")
+        (setf (gethash "content" a-msg) 'null)
+        (dolist (cell (tool-buf-in-index-order tool-buf))
+          (push (stream-tool-call-to-json (cdr cell)) tcs))
+        (setf (gethash "tool_calls" a-msg) (nreverse tcs))
+        (setf messages (append messages (list a-msg)))
+        (dolist (cell (tool-buf-in-index-order tool-buf))
+          (let* ((acc (cdr cell))
+                 (name (or (getf acc :name) ""))
+                 (args-raw (getf acc :args))
+                 (args-obj (handler-case
+                             (com.inuoe.jzon:parse args-raw)
+                           (error () (make-hash-table :test 'equal))))
+                 (raw-text (execute-tool name args-obj))
+                 (result-text (truncate-tool-result raw-text))
+                 (tool-msg (make-hash-table :test 'equal)))
+            (stream-tool-banner name args-raw)
+            (record-tool-call name raw-text result-text)
+            (stream-tool-result result-text)
+            (setf (gethash "role" tool-msg) "tool"
+                  (gethash "content" tool-msg) result-text
+                  (gethash "tool_call_id" tool-msg) (getf acc :id))
+            (setf messages (append messages (list tool-msg)))))
         messages)))
 
 (defun stream-llm-with-tools (system-prompt context user-message)
@@ -701,28 +714,63 @@
               (format nil "[LLM ERROR] reached ~A tool iterations without a final answer"
                       (llm-max-tool-iterations))))))))
 
-(defun build-openai-compat-messages-with-tools (context user-message prior-messages)
-  "Build OpenAI-compatible Chat Completions JSON body with tools."
+(defun build-openai-compat-messages-with-tools (system-prompt context user-message
+                                                      &optional (prior-messages nil))
+  "Build OpenAI-compatible Chat Completions JSON body with tools.
+
+   SYSTEM-PMPT se inserta como primer mensaje cuando PRIOR-MESSAGES no trae ya
+   uno. Antes el parametro no existia en la lambda list (la definia con tres y
+   los dos callers le pasaban cuatro) y el cuerpo nunca escribia el mensaje de
+   sistema: funcionaba solo porque ambos callers lo precargaban en
+   PRIOR-MESSAGES. Un tercer caller con lista vacia perdia el prompt del
+   sistema en silencio, y el arity break hacia caer la ruta entera -- la que
+   despacha CALL-LLM-BY-DELEGATE para todo proveedor openai-compatible."
   (let ((msg (make-hash-table :test 'equal)))
     (setf (gethash "model" msg) (llm-model))
     (setf (gethash "max_tokens" msg) (llm-max-tokens))
     (setf (gethash "tools" msg) (tool-definitions))
     (let ((messages (copy-list prior-messages)))
-      (when (or (null messages) (not (gethash "role" (car (last messages)))))
-        (push (make-hash-table :test 'equal) messages)
-        (setf (gethash "role" (car messages)) "user")
-        (setf (gethash "content" (car messages))
-              (format nil "~A~%~%~A~%~%~A"
-                      "=== CONTEXT (structured facts, Rete-pruned) ==="
-                      context
-                      user-message)))
+      ;; Sin mensaje de sistema, se pone el que nos pasan. Con uno ya, no se
+      ;; duplica: el caller que precarga el suyo (con el contexto ya pegado) es
+      ;; el que sabe de que iteracion va la conversacion.
+      (unless (some (lambda (m)
+                      (string= (gethash "role" m) "system"))
+                    messages)
+        (let ((sys (make-hash-table :test 'equal)))
+          (setf (gethash "role" sys) "system"
+                (gethash "content" sys) (or system-prompt ""))
+          (setf messages (cons sys messages)
+                added-system t)))
+      ;; El turno de usuario se anade cuando la lista venia VACIA. La condicion
+      ;; antigua --"el ultimo mensaje no tiene role"-- moria al añadir el system
+      ;; delante: el ultimo ya era el system recien insertado, con role, y el
+      ;; usuario se quedaba fuera. Comprobarla sobre messages ANTES de tocar
+      ;; nada no basta tampoco, porque con una lista ya construida por el caller
+      ;; la condicion es falsa por lo que se busca y se anade el turno otra vez
+      ;; en cada iteracion. Lo unico que distingue los dos casos es si la lista
+      ;; venia vacia: si venia vacia no hay contexto de nadie que insertar.
+      (when (null prior-messages)
+        (let ((user-msg (make-hash-table :test 'equal)))
+          (setf (gethash "role" user-msg) "user"
+                (gethash "content" user-msg)
+                (format nil "~A~%~%~A~%~%~A"
+                        "=== CONTEXT (structured facts, Rete-pruned) ==="
+                        context
+                        user-message))
+          (setf messages (append messages (list user-msg)))))
       (setf (gethash "messages" msg) messages))
     msg))
 
-(defun call-llm-with-tools/static (context user-message)
+(defun call-llm-with-tools/static (system-prompt context user-message)
   "Non-streaming OpenAI-compatible provider call with tool definitions. If the
    model requests tools, execute them and loop until we get a text response or
-   reach the max iterations."
+   reach the max iterations.
+
+   SYSTEM-PMPT estaba ausente de la lambda list y se usaba como variable libre
+   (linea 751). En Common Lisp eso no es un valor por defecto: es una variable
+   especial sin ligar, y el turno entero moria con \"Variable SYSTEM-PROMPT is
+   unbound\" al construir el primer mensaje. Los callers ya le pasaban el
+   prompt, asi que la firma era lo unico que faltaba."
   (let ((messages (list (make-hash-table :test 'equal)
                         (make-hash-table :test 'equal)))
         (tot-prompt 0)
@@ -735,7 +783,7 @@
                   "=== CONTEXT (structured facts, Rete-pruned) ==="
                   context
                   user-message))
-(setf *llm-streamed* nil)
+    (setf *llm-streamed* nil)
     (dotimes (iteration (llm-max-tool-iterations))
       (let* ((body (build-openai-compat-messages-with-tools system-prompt context user-message messages))
              (json-body (com.inuoe.jzon:stringify body))
@@ -1022,7 +1070,7 @@ batch_execution_mode:
     - Use the ToolUse-compatible shape: {\"tool_calls\":[{\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"file.py\"}}}],\"response\":\"\"}.
     - Allowed function names: read_file, write_file, edit_file, exec_command.
     - Arguments must be a JSON object with exactly the fields required by that function.
-    - For a final answer with no more actions, return {\"tool_calls\":[],\"response\":\"the final answer\"}.
+    - For a final answer with no more actions, return {\"tool_calls\":[],\"response\":\"<your answer to the user>\"}. Put the real answer there, written for the person who asked: never a placeholder, never the word "final", and never a copy of this instruction. An empty \"response\" is also valid when the actions speak for themselves.
   rules:
     - Emit actions, not descriptions. Order tool_calls from first action to last.
     - Do not repeat actions already present in the context.
@@ -1202,7 +1250,25 @@ batch_execution_mode:
            (timestamp (get-universal-time))
            (data (list :step step-id
                        :action (data-get data :action)
-                       :target (or (data-get data :path) (data-get data :command))
+                       ;; El objetivo se NORMALIZA como lo que se va a
+                       ;; ejecutar de verdad, no como el modelo lo escribio.
+                       ;; El modelo emite 'cd /abs/proyecto && python test.py'
+                       ;; a menudo, y STRIP-CD-PREFIX se lo quita al ejecutar
+                       ;; -- pero el plan guardaba el texto crudo, asi que la
+                       ;; tarjeta y el TURN mostraban dos cosas distintas para
+                       ;; el mismo paso: el plan con el cd, el hecho command-exec
+                       ;; sin el. El modelo leia su paso con un prefijo que
+                       ;; nunca llego a correr.
+                       ;;
+                       ;; Aqui solo se normaliza el :target que se RENDERIZA. La
+                       ;; intencion conserva el comando original, porque es la
+                       ;; accion la que se ejecuta y ya se normaliza ahi.
+                       :target (let ((tgt (or (data-get data :path)
+                                              (data-get data :command))))
+                                 (if (and (stringp tgt)
+                                          (eq (data-get data :action) :exec-command))
+                                     (strip-cd-prefix tgt)
+                                     tgt))
                        ;; La ronda: un turno puede tener varias respuestas del
                        ;; LLM y cada una renumera los pasos desde 1. Sin esto,
                        ;; `(turn-id, step)` no basta para el JOIN y el paso 2 de

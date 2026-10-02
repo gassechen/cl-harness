@@ -79,9 +79,44 @@
        (let ((exit (getf result :exit-code)))
          (if exit (zerop exit) t))))
 
-(defun assert-step-cancelled (data why)
+(defun round-verdict-counts (turn round)
+  "Cuantos pasos de este TURNO y esta RONDA quedaron APPLIED y cuantos CANCELLED.
+
+   Es la medida de si la ronda AVANZO. Sin ella, un turno que se pasa entero
+   proponiendo lo mismo que el harness ya veto no se distingue de uno que esta
+   trabajando: los dos llegan al tope de iteraciones y los dos se reportan como
+   'se agoto batch_max_iterations', que dice cuanto duro y no si sirvio."
+  (let ((applied 0)
+        (cancelled 0))
+    (dolist (d (collect-facts-of-type (collect-active-facts) "verdict"))
+      (when (and (eql (data-get d :turn-id) turn)
+                 (eql (data-get d :round) round))
+        (case (data-get d :verdict)
+          (:applied (incf applied))
+          (:cancelled (incf cancelled)))))
+    (values applied cancelled)))
+
+(defun assert-step-cancelled (data why &optional contents)
   "Un paso que NO se ejecuta porque otro paso ya lo cubrio, dicho como
    veredicto.
+
+   CONTENTS es lo que el paso anterior YA HABIA PRODUCIDO, y se adjunta al
+   veredicto cuando existe. No es un adorno: es la diferencia entre un no y
+   una respuesta.
+
+   El caso real que lo motivó: un turno que lee math_utils.py en la ronda
+   1, falla un test en la ronda 2, y en las rondas 4 a 7 vuelve a pedir esa
+   lectura. Cada vez PREVENT-DUPLICATE-READ la cancelo con 'el archivo ya se
+   leyo en este turno' y RETRACTO la intencion, sin escribir nada. Cinco
+   rondas muertas: el harness tenia el fichero entero en un hecho file-read y
+   le estaba diciendo que no en vez de enseñarselo. El modelo pedia la lectura
+   porque no la tenia delante; un no no lo convence, un no repetido cinco veces
+   solo gasta el turno.
+
+   El contenido entra recortado por MAX-TOOL-RESULT-CHARS, el mismo tope que
+   gobierna lo que un read_file normal devuelve al modelo: la cancelacion no
+   puede ser mas generosa que la lectura que sustituye, o el 'atajo' seria la
+   via de meter contexto sin presupuesto.
 
    Hermanastro de ASSERT-STEP-VERDICT, con la misma identidad de paso, y por el
    mismo motivo: el estado de la maquina es un JOIN entre el plan y el
@@ -121,14 +156,111 @@
                                     (current-turn-id))
                        :round (or (data-get data :round)
                                   (current-batch-round))
-                       :reason why)))))
+                       :reason why
+                       ;; El contenido que el paso cancelado pretendia
+                       ;; conseguir, cuando ya lo tenemos. Es lo que convierte
+                       ;; 'no repetition' en 'aqui tienes, no hace falta
+                       ;; pedirlo otra vez'. Recortado con el mismo tope que
+                       ;; aplica a un read_file de verdad.
+                       :contents (when (and (stringp contents)
+                                             (plusp (length contents)))
+                                    (truncate-tool-result contents))))))
+  ;; Y CIERRA LA META, porque un veto tambien es una RESPUESTA.
+  ;;
+  ;; AUTO-CREATE-TODO-ON-ACTION tiene salience 20 y los vetos tienen 15, asi que
+  ;; la meta se abre ANTES de que el veto decida. La intencion sigue viva cuando
+  ;; la mira la regla de veto, y por eso crea su meta igual. Y como el veto no es
+  ;; una ejecucion --no hay :applied-- esa meta no la cerraba nadie nunca.
+  ;;
+  ;; En una corrida real: el turno 6 ejecuto `python3 -m unittest test_all.py`
+  ;; (APPLIED, y esa meta se cerro), y en las rondas 2 y 3 propuso lo mismo otra
+  ;; vez. Las dos se vetaron como duplicado, las dos abrieron meta, y el .cob
+  ;; final cerro con GOAL ABIERTO. 1 -- con la tarea HECHA y los tests en verde.
+  ;; Como N en cero es lo que habilita DONE, esa meta era una sesion que no
+  ;; podia terminar.
+  ;;
+  ;; NO es cerrar las metas por la fuerza: el paso CANCELLED tiene veredicto, es
+  ;; terminal, y la meta existia para recordar que habia algo que hacer. Lo que
+  ;; ya no esta pendiente es RECORDARLO: la razon del veto esta en la tarjeta,
+  ;; con su texto, y lo que se ha losto es solo el contador.
+  (close-todos-for-vetoed-step
+   (data-get data :action)
+   (or (data-get data :path) (data-get data :command))))
+
+(defun todo-verb-of-action (action)
+  "El verbo de meta que corresponde a la ACCION de una intencion."
+  (case action
+    (:read-file :read)
+    (:write-file :write)
+    (:edit-file :edit)
+    ((:exec-command :command) :run)
+    (t nil)))
+
+(defun close-todos-for-applied-step (action target)
+  "Cierra las metas in-progress que ACCION sobre TARGET acaba de dischargear.
+
+   Solo APPLIED. Un paso FALLIDO deja la meta abierta a proposito: el usuario
+   pidio una cosa, no se hizo, y GOAL ABIERTO tiene que seguir diciendo eso.
+   Cerrar tambien las fallidas seria cambiar el significado del contador para
+   que pareciera mejor, que es justo lo que no debe hacer un contador."
+  (let ((verb (todo-verb-of-action action)))
+    (when (and verb (stringp target) (plusp (length target)))
+      (dolist (todo (collect-active-todos))
+        (let ((task (or (get-slot-value todo 'task) "")))
+          (when (and (string= (or (get-slot-value todo 'status) "") "in-progress")
+                     (eql verb (todo-verb task))
+                     (let ((arg (todo-argument task verb)))
+                       (if (eql verb :run)
+                           (goal-command-match-p arg target)
+                           (goal-path-match-p arg target)))))
+            (complete-todo (get-slot-value todo 'id)))))))
+
+(defun close-todos-for-vetoed-step (action target)
+  "Cierra la meta in-progress que ACCION sobre TARGET abrio y nadie cerro.
+
+   Solo si la meta nombra lo mismo que el paso. Un veto puede venir de una
+   regla que ni siquiera ha mirado el target --una lectura rancia, por ejemplo,
+   que se cancela por el estado del fichero y no por lo que se pidio--, y en
+   ese caso la meta sigue siendo real: el modelo todavia no tiene lo que
+   pedia, y cerrar su meta seria mentir sobre lo que falta."
+  (let ((verb (todo-verb-of-action action)))
+    (when (and verb (stringp target) (plusp (length target)))
+      (dolist (todo (collect-active-todos))
+        (let* ((task (or (get-slot-value todo 'task) ""))
+               (todo-verb-now (todo-verb task))
+               (arg (and todo-verb-now (todo-argument task todo-verb-now))))
+          (when (and (string= (or (get-slot-value todo 'status) "")
+                                "in-progress")
+                     (eql todo-verb-now verb)
+                     (if (eql verb :run)
+                         (goal-command-match-p arg target)
+                         (goal-path-match-p arg target)))
+            (complete-todo (get-slot-value todo 'id))))))))
 
 (defun assert-step-verdict (data result)
   "PROTOCOLO §2.3. DATA es la data de la intencion (trae :step del PLAN);
    RESULT es lo que devolvio la accion. El veredicto lleva la identidad del
    paso para que el estado de la maquina sea un JOIN entre el plan y esto."
   (let* ((applied (step-applied-p result))
-         (target (or (data-get data :path) (data-get data :command)))
+         ;; El objetivo se NORMALIZA igual que en ASSERT-BATCH-PLAN, y por el
+         ;; mismo motivo: si el plan dice una cosa y el veredicto otra, la
+         ;; tarjeta muestra DOS comandos para el mismo paso y el modelo no sabe
+         ;; cual se ejecuto. En una corrida real el paso 3 aparecia como
+         ;;
+         ;;     EXEC-COMMAND.  COMMAND = python -m unittest test_math_utils
+         ;;     STEP 03.  EXEC-COMMAND  cd /home/mtk/... && python -m unittest
+         ;;
+         ;; El plan ya lo normalizaba; el veredicto se habia quedado con el
+         ;; texto crudo, o sea la mitad del arreglo.
+         ;;
+         ;; Solo para :exec-command: una RUTA con espacios o con un 'cd' en el
+         ;; nombre no se toca. Mismo criterio que el plan.
+         (target (let ((raw (or (data-get data :path)
+                                (data-get data :command))))
+                   (if (and (stringp raw)
+                            (eq (data-get data :action) :exec-command))
+                       (strip-cd-prefix raw)
+                       raw)))
          (why (or (getf result :reason)
                   ;; :refused llega como T, no como texto; convertirlo a texto
                   ;; evita que el YAML muestre un T desnudo como si fuera el
@@ -170,7 +302,34 @@
                                              (current-turn-id))
                                 :round (or (data-get data :round)
                                            (current-batch-round)))
-                           (when why (list :reason why))))))))
+                           (when why (list :reason why))))))
+  ;; Y CIERRA LA META EN EL MOMENTO, no cuando alguien la busque mas tarde.
+  ;;
+  ;; Reconciliar metas es buscar la EVIDENCIA de que se hicieron, y esa
+  ;; búsqueda tiene dos relojes encima que la pueden borrar antes de que
+  ;; llegue: PRUNE-EXPIRED (fact_ttl_seconds = 120 en la configuracion de
+  ;; produccion) y el cap por tipo. En una corrida real quedaron ABIERTAS
+  ;; cuatro metas que ya estaban hechas:
+  ;;
+  ;;   todo-9  Run: ls -la ...        (se ejecuto en el turno 3, exit 0)
+  ;;   todo-25 Run: ls -la ...        (otra vez, el turno 4)
+  ;;   todo-30 Run: python3 -m unittest ...
+  ;;
+  ;; Las tres son metas de COMANDO, y no por casualidad: un comando que sale
+  ;; bien no es durable --el harness lo decided asi, y con acierto, porque no
+  ;; cambia nada que el modelo no vea-- asi que su unico registro durable es
+  ;; el veredicto, y el veredicto tambien se capa. La meta se quedaba esperando
+  ;; una prueba que el harness habia tirado.
+  ;;
+  ;; Como GOAL ABIERTO. N en cero es lo que habilita DONE, cuatro metas
+  ;; filtradas son una sesion que no puede terminar: por mucho que este todo
+  ;; hecho, el modelo ve un contador que no baja y la sesion no cierra nunca.
+  ;;
+  ;; Aqui no hay carrera: el veredicto se aserta en el mismo instante en que la
+  ;; accion ocurre, con el codigo de salida delante. Si se aplico, se aplico.
+  (when applied
+    (close-todos-for-applied-step (data-get data :action) target))))
+
 
 ;;; ============================================
 ;;; Goal & Todo Templates (Backward Chaining / Planning)

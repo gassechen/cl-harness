@@ -228,6 +228,7 @@ espacios.
 | `PROCEDURE DIVISION.` | **siempre**, aunque no haya plan | Un bloque por paso del `batch-plan`: `01.  T3 WRITE-FILE  math_utils.py`, su `STATE = …` y su `REASON` — siempre en `PENDING`, y en `APPLIED`/`FAILED`/`CANCELLED` si el veredicto trae motivo |
 | `DATA DIVISION.` | siempre | `GOAL ABIERTO. N` y las bananas, con `STATUS`, `PRIORITY` y `PARENT` |
 | `WARNING DIVISION.` | solo si `collect-tool-loops` detecta reintentos | `LOOP.` y qué dejar de hacer |
+| `batch-abort :path` | `:tool-loop`, `:estancado` o `:iterations` | por qué se cortó el turno, en el `REASON` de la tarjeta |
 | `TURN n.` | uno por turno, del más viejo al actual | `USER.` con su `TEXT`, los hechos de resultado y los veredictos sin tarjeta |
 | `MEMORY DIVISION.` | si hay memoria durable | Lo consolidado; va **dentro** del programa, antes del `GOBACK` |
 | `GOBACK.` | siempre | Cierre |
@@ -246,25 +247,120 @@ Cinco detalles que el ejemplo de arriba no enseña:
   falló. El que **sí** tiene paso no se repite, o diríamos la misma verdad dos veces.
 - **`GOAL ABIERTO. N` cuenta los goals sin completar**, no los que existen. `N` en cero
   es lo que habilita `DONE`.
+- **Una meta se cierra en el momento en que su paso se aplica, no cuando alguien la busque
+  después.** Reconciliar metas es buscar la evidencia de que se hicieron, y esa búsqueda
+  tiene dos relojes encima que pueden borrar la respuesta antes de que llegue:
+  `prune-expired` (`fact_ttl_seconds = 120` en producción) y el cap por tipo. Las metas de
+  **comando** son las que más lo sufren, porque un comando que sale bien *no* es durable —con
+  acierto, porque no cambia nada que el modelo no vea—, así que su único registro durable es
+  el veredicto, y el veredicto también se capa. En una corrida real quedaron abiertas tres
+  metas de comando ya ejecutadas (`Run: ls -la` en los turnos 3 y 4, `Run: python3 -m unittest`
+  en el 5), más una `Write` a una ruta corrupta. Como `N` en cero es lo que habilita `DONE`,
+  cuatro metas filtradas son una sesión que no puede terminar. Una meta **fallida** sí queda
+  abierta a propósito: el usuario pidió algo, no se hizo, y `GOAL ABIERTO` tiene que seguir
+  diciendo eso.
+
+- **Un paso vetado también cierra su meta, porque un veto es una respuesta.** Aquí el
+  orden de Rete es el que manda: `auto-create-todo-on-action` tiene salience 20 y los vetos
+  tienen 15, así que la meta se abre **antes** de que el veto decida —la intención sigue
+  viva cuando la mira la regla de veto, y por eso crea su meta igual—. Y como el veto no es
+  una ejecución no hay `:applied` que la cerrara, así que se quedaba colgada para siempre.
+  En una corrida real: el turno 6 ejecutó `python3 -m unittest test_all.py` (`APPLIED`, y
+  esa meta se cerró), y en las rondas 2 y 3 propuso lo mismo otra vez. Las dos se vetaron
+  como duplicado, las dos abrieron meta, y el `.cob` final cerró con `GOAL ABIERTO. 1` —
+  con la tarea hecha y los tests en verde. Como `N` en cero es lo que habilita `DONE`, esa
+  meta era una sesión que no podía terminar. El cierre es **quirúrgico**: sólo cuando la
+  meta nombra lo mismo que el paso, porque un veto puede venir de una regla que ni ha mirado
+  el target, y en ese caso la meta sigue siendo real. La razón del veto queda en la tarjeta
+  del paso, con su texto: lo que se ha perdido es el contador, no el motivo.
+
+- **La reconciliación de metas lee la memoria de largo plazo, como el resto del programa.**
+  El `.cob` se genera desde la red de largo plazo; que las metas se cerraran contra el
+  motor de turno era una *segunda* fuente para la misma verdad, y las dos discrepaban. Con
+  `fact_ttl_seconds = 120`, la evidencia de una meta de dos minutos antes ya había sido
+  retractada por `prune-expired` y la meta no se cerraba nunca: en una corrida real,
+  `Write utils.py` se aplicó en el turno 2 y siguió `GOAL ABIERTO` en el turno 5. Como
+  `N` en cero es lo que habilita `DONE`, una meta que no se cierra nunca es una sesión
+  que no puede terminar. Ojo al orden: la promoción ocurre al **cerrar** el turno, con el
+  hecho todavía fresco; promover después no serviría, porque para entonces la única copia
+  ya habría caducado.
+- **El ejemplo del prompt no puede ser copiable.** La instrucción de respuesta final decía
+  `{"tool_calls":[],"response":"the final answer"}`, y un modelo que la copió literalmente
+  devolvió `"the final answer"` como respuesta al usuario. Un ejemplo con una cadena
+  real es un ejemplo que algún modelo va a devolver tal cual.
+- **Un veto es una respuesta, y hay dos formas de dejar de repetirlo.** Los pasos que una
+  regla de Rete impugna llegan a `CANCELLED` con su motivo, nunca se quedan sin veredicto:
+  un paso sin veredicto cae al fallback `PENDING` y culpa a una poda que no ocurrió. Pero
+  un veto, por sí solo, no cierra un bucle. Por eso hay dos cortes en el bucle de rondas,
+  y los dos son hechos `batch-abort` con motivo propio:
+
+  | `:path` | Cuándo | Qué le dice al modelo |
+  |---|---|---|
+  | `:tool-loop` | el detector ve la huella (el mismo fichero releyendo, la misma familia de comandos fallando) | qué fichero y cuántas veces |
+  | `:estancado` | dos rondas seguidas en las que **ningún** paso se aplicó | que los vetos no van a cambiar |
+
+  El tope de iteraciones sigue ahí, pero ya no es la única red: antes, un turno que se
+  quemaba repitiendo y uno que había hecho su trabajo cerraban con el mismo `:iterations`, y el
+  motivo no distinguía "no le daba tiempo" de "no hacía nada".
+- **`tool-loop-warning` responde en los dos caminos.** Estaba conectado solo a
+  `call-llm-with-tools` y `stream-llm-with-tools`, los del camino imperativo. El
+  proveedor `batch` —el de la configuración por defecto— no lo consultaba nunca, y
+  `detect-read-loop` no daba una sola vez con la configuración real. Un detector que solo
+  mira un camino no ve el bucle del otro, y el otro es el que se ejecuta.
+- **El veto de lectura rancia no pide que se repita.** Es el único de los tres que **no**
+  reentrega contenido, y por eso es el único que puede empujar al modelo a un bucle: si el
+  motivo dice «vuelve a pedir la lectura», lo que le ha dicho es que pedirla es lo que tiene
+  que hacer. En una corrida real el turno 2 propuso el mismo `READ-FILE` en las rondas R2 a
+  R8 —siete rondas, siete llamadas al proveedor— y las siete salió `CANCELLED` con el mismo
+  texto. El modelo estaba obedeciendo. Además, el veto no se puede satisfacer dentro del
+  turno: cualquier edit vuelve rancio para siempre cualquier lectura posterior de ese
+  fichero, así que la única salida es dejar de pedirlo.
+- **`file-edit` lleva `:old-string` y `:new-string`.** `prevent-duplicate-edit` los
+  compara para decir «este ya lo hiciste», y sin ellos comparaba `(string= nil "x = 1")`:
+  la regla no podía dispararse nunca. Su test pasaba porque fabricaba a mano un `file-edit`
+  que sí los tenía — datos que el sistema real no produce. Se comparan los **textos**, no
+  sus longitudes: dos edits del mismo archivo que sustituyen 189 caracteres por 262 y por
+  249 son edits distintos, y cancelar el segundo sería perder trabajo de verdad.
 - **`MEMORY DIVISION` va dentro del programa a propósito.** Fuera del `GOBACK` no sería
   parte de este turno, sería un anexo pegado detrás.
-- **`MEMORY DIVISION` va newest-first** (el `sort` es ascendente y luego hay un `nreverse`).
-  El dato más reciente va primero. Por eso un `EDITED` aparece **arriba** del `WROTE` que
-  modifica, y su `BYTES` se lee como el tamaño que el archivo tenía *antes* de ese edit.
-- **Lo que entra a la memoria durable tiene que haber pasado de verdad.** `durable-type-p`
-  exige `:applied` en `file-write` y en `file-edit`, y sólo admite `command-exec` que sean
-  errores reales. Los tres casos que se excluían contaban cosas que no ocurrieron:
+- **`MEMORY DIVISION` va en orden cronológico**, como la `DATA DIVISION`. Antes iba
+  newest-first (el `sort` es ascendente y luego había un `nreverse`), y sus entradas no
+  llevan etiqueta de turno: el modelo leía su propio historial del revés y se quedaba con
+  el dato más viejo como si fuera el actual. En una corrida real leía
+  `WROTE. math_utils.py BYTES = 294` sobre un archivo de 587 bytes.
+- **La memoria durable no es un registro de lo que importó: es la entrada de la ronda
+  siguiente.** El `.cob` se genera desde la red de largo plazo, así que lo que no se promueve
+  *no existe* para el modelo. La pregunta de `durable-type-p` no es «¿esto es
+  importante?», sino «¿sin esto puede el modelo seguir trabajando?», y hay tres cosas que
+  necesita: **qué es verdad ahora** (lecturas *con su contenido*, escrituras y edits),
+  **qué pasó con lo que pidió** (`batch-plan` y `verdict`, la pareja que cierra el bucle) y
+  **qué se le pidió y qué contestó** (`user-input` y `llm-response`). No entra el andamiaje
+  intraturno: `intention` —una intención que nunca se ejecutó es un borrador, no un hecho—,
+  `batch-abort`, `tool-loop`.
+- **Un rechazo es un hecho, y no se pinta como una escritura.** La puerta de `:applied`
+  que tenía la memoria sacaba de ella justamente los fallos, que es lo único que el modelo
+  debería acordarse de cambiar. Lo que no puede pasar es lo otro: un rechazo dicho como
+  `WROTE` es la mentira más cara de esta división. Distinguirlo es trabajo del **render**,
+  no de la promoción:
 
   ```cobol
-      WROTE. /tmp/proyecto/nope.py
-          BYTES =                      ; un write RECHAZADO, con el tamaño vacío
+      REFUSED. /tmp/proyecto/nope.py
+          REQUEST = WRITE-FILE
+          REASON = blind write refused
   ```
 
-  Un write rechazado afirmaba `:applied nil` y entraba igual. Decía que había escrito un
-  archivo que no escribió, y un archivo que no existe no se puede rechazar por no existir,
-  así que era el único hueco de los dos. Un `file-edit` que no se aplicó tampoco es un
-  cambio, y antes no entraba ninguno: la única traza durable de un archivo editado era la
-  de su escritura inicial, para siempre.
+  Sólo los `command-exec` que son **errores reales** pasan el filtro: un comando que fue
+  bien no cambió nada que el modelo no pueda ver por su cuenta, y uno que falló es un muro
+  que va a volver a encontrarse.
+- **Promover es idempotente, y no por una guarda nuestra sino por la identidad del hecho
+  de LISA**: dos hechos con el mismo tipo, timestamp y datos son el mismo hecho. Se
+  promueve una vez por ronda y el motor de turno no se vacía entre rondas —el `user-input`
+  del turno sigue ahí en la ronda 3—, así que sin esa propiedad cada ronda volvería a
+  copiar lo mismo y el modelo leería N veces la misma petición.
+- **Se promueve antes de construir el `.cob`, no al final del turno.** Promoviendo al final,
+  el modelo de la ronda 2 recibía un contexto hecho con la memoria del turno *anterior*:
+  dentro del propio turno estaba leyendo la verdad de antes de empezar. Por eso la
+  promoción vive al principio de `build-context` y no en el llamador.
 - **`EDITED` no lleva `BYTES`, a propósito.** El edit no mide el tamaño del archivo, y
   computarlo —leer el archivo, restar lo viejo, sumar lo nuevo— sería inventar un dato que
   el harness no midió. Lo que sí se sabe de verdad es cuánto salió y cuánto entró:
@@ -550,10 +646,10 @@ No es deuda de formato, es deuda de mensaje:
 
 ## 5. Tests que fijan el protocolo
 
-Sin red, sin LLM, sobre el harness. La suite entera son **96 tests / 335 checks** y se
-corre con `./run-tests.sh` (código 0 si pasa, 1 si falla, 2 si el sistema no carga). De
-esos, los que **fijan un invariante del protocolo** son los de abajo; los demás cubren
-parseo, acciones, goals, métricas y configuración.
+Sin red, sin LLM, sobre el harness. La suite entera son **108 tests** y se
+corre con `./run-tests.sh` (código 0 si pasa, 1 si falla, 2 si el sistema no
+carga). De esos, los que **fijan un invariante del protocolo** son los de abajo;
+los demás cubren parseo, acciones, goals, métricas y configuración.
 
 - `protocol/el-plan-sobrevive-a-la-ejecucion` — `PLAN` de 3 pasos → los 3 tienen veredicto. (I1)
 - `protocol/un-paso-rechazado-deja-veredicto` — `edit` con `old_string` vacío → aparece
@@ -608,16 +704,51 @@ parseo, acciones, goals, métricas y configuración.
 
 - `context/memoria-no-deja-una-escritura-rechazada-como-wrote` — un `file-edit` aplicado
   sale en la `MEMORY DIVISION` con `REPLACED` y `NEW`; un `file-write` **rechazado** no sale
-  como `WROTE`; y la división va newest-first, con el `EDITED` encima del `WROTE` que
-  modificó. También fija que el motivo del rechazo no se pierde: sigue en la `TURN`.
+  como `WROTE`; y la división va en orden cronológico, con el `WROTE` encima del `EDITED`
+  que lo modificó. También fija que el motivo del rechazo no se pierde: sigue en la `TURN`.
 
 - `rules/memoria-los-edits-estan-capeados` — el cap de `file-edit` en `promote-durable-facts`,
   en el motor de **memoria** y no en el de turno. Se prueba aparte porque el cap es
  fácil de olvidar: sin él la suite seguía en `OK` con siete edits y un tope de cinco.
 
-- `rules/durable-type-policy` — el fixture viejo fijaba `durable-type-p` con un `file-write`
-  **sin** `:applied`, que es una forma que `write-file` nunca produce. Fijaba el contrato
-  equivocado. Ahora pide `:applied` para `file-write` y `file-edit`, y niega el rechazo.
+- `rules/durable-type-policy` — fija qué cruza a la memoria durable: lecturas con su
+  contenido, el plan y su veredicto, la petición del usuario y su respuesta; y niega el
+  andamiaje intraturno, que es lo que no debe molestar al modelo.
+
+- `estancamiento/un-turno-que-no-avanza-no-se-quema-entero` — dos rondas seguidas sin
+  aplicar nada cortan el turno con `:estancado`, y antes de las ocho rondas. Sin el corte,
+  el turno llega a `:iterations` consumiendo el presupuesto entero.
+
+- `estancamiento/el-veto-de-lectura-rancia-no-invita-a-repetir` — el motivo del veto que
+  no entrega contenido no puede pedir que se repita, y dice explícitamente que no lo pida.
+
+- `estancamiento/el-detector-de-bucle-esta-conectado-al-camino-batch` — el detector de
+  bucle se consulta en el camino `batch`, que es el que corre por defecto. El umbral se
+  baja a 2 para que sea el detector el que hable y no el corte de seguridad.
+
+- `protocol/edit-duplicado-se-cancela-y-uno-distinto-no` — el `file-edit` del fixture se
+  produce con un `edit-file` de verdad, no a mano. Fabricarlo a mano era lo que ocultaba
+  que la regla llevaba muerta: el test le daba unos `:old-string` y `:new-string` que
+  `edit-file` nunca escribía.
+
+- `metas/un-comando-que-sale-bien-cierra-su-meta` — un comando con código 0 cierra su meta al
+  instante, aunque su evidencia no sea durable y aunque un comando fallido NO la cierre.
+
+- `memoria/una-meta-no-se-queda-abierta-porque-su-evidencia-expirara` — una meta cuya
+  evidencia caducó en el motor de turno se cierra igual, porque el `.cob` la ve en la
+  memoria larga. Es el caso que apareció en la corrida real.
+
+- `memoria/el-cob-se-construye-desde-la-memoria-y-no-desde-el-turno` — la integración
+  completa: se promueve, se **vacía el turno entero** y se construye el `.cob`. Si se armara
+  con los hechos del turno saldría vacío. Cubre a la vez las tres cosas que el modelo
+  necesita para no perder coherencia entre estados.
+
+- `memoria/promover-es-idempotente-y-el-cob-no-duplica` — cuatro promociones seguidas dan
+  el mismo `.cob`, byte a byte. No cuenta repeticiones: compara el programa entero, que es
+  la invariante que de verdad importa.
+
+- `memoria/un-rechazo-tambien-es-durable-pero-nunca-sale-como-WROTE` — lo que no ocurrió
+  llega al modelo, con su motivo, y nunca pintado como escritura.
 
 - `protocol/lectura-duplicada-se-cancela-no-es-pending` — la lectura repetida en el mismo
   turno sale `CANCELLED` y no deja meta abierta. Es la reproducción de los 9 renders de la
@@ -631,6 +762,14 @@ parseo, acciones, goals, métricas y configuración.
   `prevent-duplicate-edit` estaba sin **un solo test**: se podía tocar entera y la suite
   seguía verde. La segunda mitad del test es la que importa, porque una regla que
   cancelara todo la pasaría igual.
+
+- `metas/un-paso-veteado-no-deja-una-meta-que-nunca-cierra` — el mismo comando dos rondas:
+  la primera `APPLIED` y su meta cerrada, la segunda vetada como duplicado. Y aun así
+  `GOAL ABIERTO. 0`. Es la reproducción del `todo-14` de la corrida real, y salió de una
+  sonda que **no** reproducía el fallo: la sonda cerraba `GOAL ABIERTO. 0` con el comando
+  en APPLIED, que es el camino que ya funcionaba, así que parecía verde y no veía nada. El
+  bug no estaba en la ejecución sino en el **veto**, y hacía falta el comando repetido para
+  llegar a él. Un test que reproduce el síntoma sin reproducir la causa no sirve de nada.
 
 ## 5b. Una nota sobre cómo se cazan estos fallos
 
@@ -646,6 +785,52 @@ Las dos mutaciones que se hicieron:
 - Quitar la exigencia de `:applied t` en `todo-satisfied-p` → rojo en las dos legs
   de goal, y verde en la del acierto, que es justo lo que un test de una sola
   aserción no habría detectado.
+
+## 5c. El fallo que la suite entera no vio
+
+Todo lo de arriba son bugs de *mensaje*: un veredicto mal emparejado, un goal
+que se cierra de más, un estado renderizado que miente. Los cazaron tests
+escritos a mano, uno por invariante.
+
+El que no lo cazó ninguno es de otra clase, y conviene escribirlo porque es la
+lección que cuesta más:
+
+`build-openai-compat-messages-with-tools` estaba definida con **tres**
+parámetros (`context user-message prior-messages`) y sus **dos** callers le
+pasaban **cuatro** (`system-prompt context user-message messages`). Eso no es un
+detalle de estilo: en tiempo de ejecución es `Too many arguments`, y el turno
+muere. Lo mismo, una función por encima: `call-llm-with-tools/static` usaba
+`system-prompt` como **variable libre ausente de su lambda list**, y en Common
+Lisp una variable libre no es un valor por defecto sino una especial sin ligar —
+`Variable SYSTEM-PROMPT is unbound` al construir el primer mensaje.
+
+El alcance era todo el path por defecto: `call-llm-with-tools` es el `else` de
+`call-llm`, o sea **todo** proveedor openai-compatible (openrouter, groq, openai),
+en streaming y estático. Solo sobrevivía el modo `batch`, que es lo que tenía el
+`config.json` del repo.
+
+**Por qué 108 tests en verde no lo detectaron.** Porque el mock estaba un nivel
+demasiado arriba. `WITH-MOCKED-CALL-LLM` sustituye `h::call-llm` **entera**, y
+justo lo que está por debajo —el constructor del body HTTP— es lo que se rompe.
+La suite es buena: es exactamente la que este protocolo necesita para fijar
+mensajes. Lo que le faltaba era una regla de cobertura distinta, y la regla es
+estúpidamente simple:
+
+> **Si el mock sustituye una función, nada prueba lo que esa función llama.**
+> Hay que llamar a lo de abajo directamente al menos una vez.
+
+Eso son ocho tests (`transport/el-builder-*`, `transport/el-path-estatico-*`) y
+hubieran atrapado los dos bugs antes de que un proveedor real los encontrara.
+Más un CI que los corra, porque una suite verde que solo corre cuando alguien
+se acuerda es un hecho, no una garantía.
+
+El detalle que hace el caso más instructivo: el `INFORME-CAPACIDADES.md` sí
+mencionaba el punto — "recibe `system-prompt` y no lo usa" — pero lo clasificó
+como *style-warning* y lo archivó en "pendiente fuera del alcance". El
+diagnóstico era casi la respuesta correcta leída como la equivocada: sí
+recibe `system-prompt`, y el problema es que **la definición no lo declara**.
+Documentar un bug como deuda cosmetics es una forma silenciosa de no
+arreglarlo.
 
 ## 6. Decisiones pendientes
 

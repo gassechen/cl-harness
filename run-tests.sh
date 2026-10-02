@@ -11,17 +11,39 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 FILTER="${1:-}"
+
+# Quicklisp tiene que estar disponible, y en un runner de CI no lo está: el
+# setup de esta máquina vive en ~/quicklisp/setup.lisp, fuera del repo. Así que
+# si no existe, se instala en un directorio temporal. Los sistemas que faltan
+# (rove para los tests, lisa, dexador...) se resuelven por Quicklisp, y el
+# proyecto por local-projects/, que es como lo encuentra el loader.
+QL_SETUP="$HOME/quicklisp/setup.lisp"
+QL_TMP=""
+cleanup() { [ -n "$QL_TMP" ] && rm -rf "$QL_TMP"; }
+trap 'cleanup; rm -rf "$TMPDIR_RUN"' EXIT
+
+if [ ! -f "$QL_SETUP" ]; then
+  QL_TMP="$(mktemp -d)"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -o "$QL_TMP/quicklisp.lisp" https://beta.quicklisp.org/quicklisp.lisp || {
+      echo "no se pudo descargar Quicklisp" >&2; exit 2; }
+  else
+    echo "hace falta curl para instalar Quicklisp" >&2
+    exit 2
+  fi
+  QL_SETUP="$QL_TMP/quicklisp.lisp"
+fi
+
 TMPDIR_RUN="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR_RUN"' EXIT
 LOADER="$TMPDIR_RUN/load.lisp"
 RUNNER="$TMPDIR_RUN/run.lisp"
 
 # Etapa 1: cargar el sistema. Se lee antes de que exista el paquete de las
 # pruebas, así que aquí sólo se usan símbolos de CL y UIOP. No se llama a
 # sb-ext:exit al terminar bien: mataría el proceso antes de leer la etapa 2.
-cat > "$LOADER" <<'EOF'
+cat > "$LOADER" <<EOF
 (require :asdf)
-(load "~/quicklisp/setup.lisp")
+(load "$QL_SETUP")
 (handler-case
     (ql:quickload :cl-harness/tests :silent t)
   (error (e)

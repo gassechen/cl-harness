@@ -363,21 +363,78 @@
 
 
 (defrule prevent-duplicate-read (:salience 15)
-  "Si el LLM pide leer un archivo que ya leyó en este turno, cancela la intención.
+  "Si el LLM pide leer un archivo que ya leyó en este turno, se le devuelve el
+   contenido que YA TENEMOS en vez de un no.
 
    Se aserta el CANCELADO antes de retractar. Antes retractaba y no escribía
    nada: el paso se quedaba sin veredicto, la tarjeta caía al fallback
    PENDING y el REASON culpaba a una poda que no había pasado. El paso
    tenía que llegar a un estado terminal para que PENDING significara una sola
-   cosa."
+   cosa.
+
+   Y el CANCELADO lleva el :CONTENTS del file-read que lo motivo. Un no sin
+   contenido es un callejon sin salida: en una corrida real el modelo pidio
+   cinco veces el mismo fichero, recibio cinco veces 'ya se leyo en este turno',
+   y las cinco rondas se gastaron en un rechazo que no le advancingaba nada --
+   con el fichero entero en la memoria del harness. Elmotivo del veto esta a
+   la vista en el patron (?fr-data), asi que devolverlo es lo unico que
+   convierte el rechazo en respuesta."
   (?intent (harness-fact (fact-type "intention") (data ?d)))
   (test (eql (data-get ?d :action) :read-file))
-  (harness-fact (fact-type "file-read") (data ?fr-data))
+  (?fr-fact (harness-fact (fact-type "file-read") (data ?fr-data)))
   (test (and (eql (data-get ?fr-data :turn-id) (data-get ?d :turn-id))
              (string= (path-basename (data-get ?fr-data :path))
                       (path-basename (data-get ?d :path)))))
+  (test (not (stale-read-p ?fr-fact)))
   =>
-  (assert-step-cancelled ?d "CANCELADO: el archivo ya se leyó en este turno, repetir la lectura no aportaria nada")
+  (assert-step-cancelled
+   ?d
+   "CANCELADO y REENTREGADO: el archivo ya se leyó en este turno y su contenido está más abajo. No hace falta volver a pedirlo."
+   (data-get ?fr-data :contents))
+  (retract ?intent))
+
+(defrule prevent-duplicate-read-after-write (:salience 16)
+  "El mismo veto, pero cuando el fichero SE ESCRIBIO despues de la lectura.
+
+   Sale en la regla de al lado y no como un (TEST (NOT ...)) en esta porque el
+   veto tiene que ocurrir SIEMPRE: lo unico que cambia es si ademas entrega el
+   contenido. Con un solo patron mas un (TEST ...) se tendria que decidir el
+   motivo antes de firrar el paso, y Rete no puede.
+
+   Sin este caso, escribir un fichero y releerlo para comprobarlo daba un
+   'CANCELADO' con el texto ANTERIOR. El modelo se creia que tenia el fichero
+   actualizado cuando lo que tenia era la version a la que acababa de
+   sustituir -- el peor de los dos fallos, porque para que el modelo se entere
+   hay queDSMANTELAR algo que parece una entrega.
+
+   Y EL MOTIVO NO INVITA A REPETIR. Este es el unico veto de los tres que NO
+   reentrega contenido, y por eso es el unico que puede empujar al modelo a un
+   bucle: si le dices 'vuelve a pedirlo', lo que le has dicho es que pedirlo es
+   lo que tiene que hacer. En una corrida real el turno 2 propuso
+   READ-FILE math_utils.py en las rondas R2 a R8 -- siete rondas, siete
+   llamadas al proveedor -- y las siete salieron CANCELLED con este mismo
+   texto, byte a byte. El modelo estaba obedeciendo.
+
+   El veto no se puede satisfacer dentro del turno: cualquier edit vuelve
+   rancio para siempre cualquier lectura posterior de ese fichero, asi que la
+   unica salida es dejar de pedirlo. El motivo dice eso, y no lo contrario.
+
+   Y el bucle, ademas, ya no es la unica red de seguridad: DETECTAR-ESTANCAMIENTO
+   en el bucle de rondas corta el turno cuando dos rondas seguidas no aplican
+   nada. Aca se dice la verdad del paso; alla se paga el coste de no hacer
+   caso."
+  (?intent (harness-fact (fact-type "intention") (data ?d)))
+  (test (eql (data-get ?d :action) :read-file))
+  (?fr-fact (harness-fact (fact-type "file-read") (data ?fr-data)))
+  (test (and (eql (data-get ?fr-data :turn-id) (data-get ?d :turn-id))
+             (string= (path-basename (data-get ?fr-data :path))
+                      (path-basename (data-get ?d :path)))))
+  (test (stale-read-p ?fr-fact))
+  =>
+  (assert-step-cancelled
+   ?d
+   "CANCELADO, y el contenido NO se reentrega: el archivo se modificó en este turno después de leerlo, así que lo que se leyó ya está rancio. NO LO PIDAS OTRA VEZ en este turno: no hay forma de que se te entregue, porque la última modificación es la que lo vuelve rancio. Si necesitas el texto actual, termina el turno y dilo en el siguiente."
+   nil)
   (retract ?intent))
 
 
@@ -428,13 +485,59 @@
          (sep (position #\/ s :from-end t)))
     (if sep (subseq s (1+ sep)) s)))
 
+(defun stale-read-p (fr-fact)
+  "T si el fichero de FR-FACT se ha ESCRITO en este turno despues de leerlo.
+
+   FR-FACT es el hecho file-read, no su plist: el orden hace falta y el orden
+   vive en el hecho.
+
+   El veto de PREVENT-DUPLICATE-READ casa cualquier file-read del turno con
+   cualquier peticion del mismo basename. Sin este guardia, un modelo que
+   escribe un fichero y despues lo relee para verificar recibe un 'ya leido' con
+   el contenido ANTERIOR: el harness leeria en voz alta el texto que el acaba de
+   sustituir, con la seguridad de una entrega.
+
+   Y contenido rancio es peor que no entregar nada: el modelo deja de pedir la
+   lectura porque ya cree que la tiene, y sigue trabajando sobre una version
+   que no existe en disco. Por eso la cancelacion solo reentrega cuando la
+   lectura sigue siendo verdad.
+
+   El orden sale de FACT-ORDER-KEY, no del reloj: todos los hechos de una ronda
+   se asertan dentro del mismo segundo, asi que get-universal-time no ordena
+   nada, y asumir 'lo ultimo que toque el fichero manda' haria que un
+   'escribir, leer, releer' -- el orden mas normal que hay-- se tomara por
+   lectura rancia y no reentregara nada. El contador de insercion de Rete si
+   ordena, y es lo que se usa."
+  (let* ((base (path-basename (data-get (fact-data-of fr-fact) :path)))
+         (read-at (fact-order-key fr-fact))
+         (newer-writes
+           (loop for f in (mapcar #'first (retrieve (?f) (?f (harness-fact))))
+                 for d = (fact-data-of f)
+                 for type = (fact-type-of f)
+                 when (and (member type '("file-write" "file-edit") :test #'string=)
+                           (string= (path-basename (data-get d :path)) base)
+                           (fact-order-before-p read-at (fact-order-key f)))
+                   collect f)))
+    (if newer-writes
+        t
+        nil)))
+
 (defun detect-read-loop ()
   "Scan the CURRENT turn for repeated *reads/probes* of the SAME file:
-   - file-read facts (keyed by basename of the resolved path), and
-   - command-exec strings that mention the same file basename.
-   Returns (values PATH COUNT) when a file has been touched >= *loop-min-count*
+   - file-read facts (keyed by basename of the resolved path),
+   - command-exec strings that mention the same file basename, and
+   - lecturas CANCELADAS (verdicts :cancelled sobre :read-file).
+   Returns (values PATH COUNT) when a file has been touched >= *read-loop-min-count*
    times. Re-reading the same thing over and over signals the model is stuck
-   verifying instead of acting (the observed failure mode of weak models)."
+   verifying instead of acting (the observed failure mode of weak models).
+
+   Las CANCELADAS son el caso que hacia inutilizable al contador. Una lectura
+   cancelada nunca llega a READ-FILE, asi que no deja hecho file-read y este
+   contador --que antes solo miraba file-read-- no la veia nunca. En una
+   corrida real el modelo pidio el mismo fichero cinco veces, las cinco
+   canceladas, y el contador se quedo en 1 de 4: el bucle entero era invisible
+   para el detector que existe precisamente para verlo. Un contador de bucles
+   que no cuenta el bucle."
   (let* ((turn (current-turn-id))
          (counts (make-hash-table :test #'equal)))
     (dolist (f (mapcar #'first (retrieve (?f) (?f (harness-fact)))))
@@ -447,6 +550,15 @@
             ((and (string= type "file-read") path (stringp path)
                   (plusp (length path)))
              (incf (gethash (path-basename path) counts 0)))
+            ;; Una lectura CANCELADA tambien es una lectura pedida. Se cuenta
+            ;; por su :target, que es la ruta que el modelo pidio, no la que
+            ;; acabo resuelta el veto.
+            ((and (string= type "verdict")
+                  (eql (data-get d :action) :read-file)
+                  (eql (data-get d :verdict) :cancelled)
+                  (stringp (data-get d :target))
+                  (plusp (length (data-get d :target))))
+             (incf (gethash (path-basename (data-get d :target)) counts 0)))
             ((and (string= type "command-exec")
                   (let ((cmd (data-get d :command)))
                     (and (stringp cmd) (plusp (length cmd)))))
@@ -575,13 +687,60 @@
 ;;; los hechos "command-exec", "file-read", etc., sobre los cuales
 ;;; tus reglas de pruning y loop detection actúan automáticamente.
 
+(defun record-intention-tool-call (name result)
+  "Anota la ejecución de NAME (una cadena de tool) en las métricas por turno.
+
+   El hueco que tapa esto: RECORD-TOOL-CALL solo se llamaba desde
+   EXECUTE-TOOL, que es el camino de las tools NATIVAS. En modo batch las
+   herramientas las ejecutan estas reglas, que no pasaban por ahí — así que
+   *metrics-tool-calls* quedaba vacío y la tabla chars_raw / chars_sent /
+   saved% de :metrics salía en blanco. Justo en el modo donde el trabajo real
+   lo hace Rete, que era donde más hacía falta mirar.
+
+   El texto que se mide es el que el modelo leería de esa herramienta, montado
+   con la misma forma que EXECUTE-TOOL usa. No se recupera de los hechos a
+   propósito: el hecho guarda el CONTENIDO crudo, que es otra medida (cuánto
+   se retiene en memoria), no la que comparan las dos columnas de la tabla
+   (cuánto se reinyecta al modelo).
+
+   Un plist de acción sin los campos esperados no rompe nada: se registra lo
+   que haya. Perder una línea de métrica es mejor que perder la ejecución."
+  (when (listp result)
+    ;; LET* y no LET: TEXT se monta con PATH y CMD, asi que necesita verlos ya
+    ;; bindeados. En un LET paralelo se leerian como variables libres.
+    (let* ((path (or (getf result :path) "-"))
+          (cmd (or (getf result :command) "-"))
+          (text
+            (cond
+              ((getf result :applied)
+               (cond ((string= name "read-file")
+                      (format nil "File: ~A~%Contents:~%~A"
+                              path (getf result :contents)))
+                     ((string= name "write-file")
+                      (format nil "Wrote ~A bytes to ~A"
+                              (getf result :bytes) path))
+                     ((string= name "edit-file")
+                      (format nil "Edited ~A: replaced ~A chars with ~A chars (~A match(es) found)"
+                              path (getf result :replaced-chars)
+                              (getf result :new-chars) (getf result :matches)))
+                     (t (format nil "~A ok" name))))
+              ((getf result :reason)
+               (format nil "~A failed: ~A" (string-upcase name) (getf result :reason)))
+              ((getf result :exit-code)
+               (format nil "Command: ~A~%Exit code: ~A~%Output:~%~A"
+                       cmd (getf result :exit-code) (or (getf result :output) "")))
+              (t (format nil "~A" name)))))
+      (record-tool-call name text (truncate-tool-result text)))))
+
 (defrule execute-intention-read (:salience 5)
   (?f (harness-fact (fact-type "intention") (data ?d)))
   (test (eq (data-get ?d :action) :read-file))
   (test (eql (data-get ?d :status) :pending))
   =>
   ;; Llama a tu función original. Ella misma hará el (assert (harness-fact "file-read" ...))
-  (assert-step-verdict ?d (read-file (data-get ?d :path)))
+  (let ((res (read-file (data-get ?d :path))))
+    (record-intention-tool-call "read-file" res)
+    (assert-step-verdict ?d res))
   ;; Retraemos la intención para que no se ejecute de nuevo en el próximo (run)
   (retract ?f))
 
@@ -590,7 +749,9 @@
   (test (eq (data-get ?d :action) :write-file))
   (test (eql (data-get ?d :status) :pending))
   =>
-  (assert-step-verdict ?d (write-file (data-get ?d :path) (data-get ?d :content)))
+  (let ((res (write-file (data-get ?d :path) (data-get ?d :content))))
+    (record-intention-tool-call "write-file" res)
+    (assert-step-verdict ?d res))
   (retract ?f))
 
 (defrule execute-intention-edit (:salience 4)
@@ -604,10 +765,11 @@
   ;; modelo no veía ni que se intentó. Delegando en EDIT-FILE hay UN solo sitio
   ;; donde vive la regla, y todo edit rechazado queda igual de registrado:
   ;; (file-edit :applied nil :reason ...) más el VERDICT con su :step.
-  (assert-step-verdict
-   ?d (edit-file (data-get ?d :path)
-                 (or (data-get ?d :old-string) "")
-                 (or (data-get ?d :new-string) "")))
+  (let ((res (edit-file (data-get ?d :path)
+                        (or (data-get ?d :old-string) "")
+                        (or (data-get ?d :new-string) ""))))
+    (record-intention-tool-call "edit-file" res)
+    (assert-step-verdict ?d res))
   (retract ?f))
 
 
@@ -618,7 +780,9 @@
   (test (eql (data-get ?d :status) :pending))
   =>
   (format t "~&[DEBUG rule] Ejecutando comando en Rete...~%") ;; <--- ESTA LÍNEA
-  (assert-step-verdict ?d (exec-command (data-get ?d :command)))
+  (let ((res (exec-command (data-get ?d :command))))
+    (record-intention-tool-call "exec-command" res)
+    (assert-step-verdict ?d res))
   (retract ?f))
 
 
@@ -657,10 +821,32 @@
 
 
 
-;;; Si se detecta un aborto, cancelamos todas las intenciones restantes
+;;; Si se detecta un aborto, cancelamos las intenciones restantes DE ESE TURNO
+;;;
+;;; Y lo de "de ese turno" es TODO el contenido de la regla.
+;;;
+;;; Esta regla vivia dormida porque no habia hecho batch-abort que|matchear: el
+;;; aborto se devolvia como valor y no se asertaba. Al empezar a asertarse (para
+;;; que el .cob y las metricas pudieran saber por que se cancelo un paso) la regla
+;;; empezo a disparar, y como NO FILTRABA POR TURNO hacia esto:
+;;;
+;;;   - matchea CUALQUIER batch-abort, incluido el de un turno ya terminado;
+;;;   - retracta CUALQUIER intention, incluida la que el modelo acaba de proponer
+;;;     en el turno de ahora.
+;;;
+;;; Con la salencia 20 gana siempre a las reglas de ejecucion (3-5), asi que una
+;;; sola vez que un turno aborta, TODAS las intenciones de la sesion se borran en
+;;; el siguiente (run). Y como no se aserta veredicto al borrarlas, el paso se
+;;; queda en PENDING para siempre: el harness no ejecuta nada, no dice por que, y
+;;; el modelo solo puede volver a planificar. Medido: de 29 pasos propuestos en
+;;; una sesion de 5 turnos, se ejecutaron 5, todos en el turno 1 -- el unico turno
+;;; anterior al primer aborto. Del segundo en adelante, cero.
+;;;
+;;; Con el filtro por :turn-id, un aborto solo puede cancelar lo suyo.
 (defrule cancel-intentions-on-abort (:salience 20) ; Mayor que las de ejecución
-  (harness-fact (fact-type "batch-abort"))
-  (?f (harness-fact (fact-type "intention")))
+  (?abort (harness-fact (fact-type "batch-abort") (data ?ad)))
+  (?f (harness-fact (fact-type "intention") (data ?id)))
+  (test (eql (data-get ?id :turn-id) (data-get ?ad :turn-id)))
   =>
   (retract ?f))
 
@@ -740,11 +926,20 @@
 ;;   (set-todo-status (get-slot-value ?todo 'id) "completed"))
 
 (defrule prevent-duplicate-edit (:salience 15)
-  "Si el LLM pide hacer el MISMO edit exacto que ya hizo en este turno, cancela."
+  "Si el LLM pide hacer el MISMO edit exacto que ya hizo en este turno, cancela.
+
+   Compara los DOS TEXTOS, no sus longitudes: dos edits del mismo archivo que
+   sustituyen 189 caracteres por 262 y por 249 son edits distintos, y cancelar
+   el segundo seria perder trabajo de verdad.
+
+   Y solo se mira el edit que SE APLICO. Un edit rechazado --'old_string not
+   found'-- es justo el que hay que reintentar con otro enfoque; lo que se
+   impugna es el que ya salio bien repetido, que no aporta nada."
   (?intent (harness-fact (fact-type "intention") (data ?d)))
   (test (eql (data-get ?d :action) :edit-file))
   (harness-fact (fact-type "file-edit") (data ?fe-data))
-  (test (and (eql (data-get ?fe-data :turn-id) (data-get ?d :turn-id))
+  (test (and (data-get ?fe-data :applied)
+             (eql (data-get ?fe-data :turn-id) (data-get ?d :turn-id))
              (string= (path-basename (data-get ?fe-data :path))
                       (path-basename (data-get ?d :path)))
              ;; ACÁ CHEQUEAMOS QUE SEA EXACTAMENTE EL MISMO EDIT:
@@ -754,4 +949,55 @@
                       (data-get ?d :new-string))))
   =>
   (assert-step-cancelled ?d "CANCELADO: el mismo edit ya se aplico en este turno, repetirlo no cambiaria el archivo")
+  (retract ?intent))
+
+;;; Las dos que faltaban. Lectura y edicion tienen veto de duplicado desde hace
+;;; tiempo; escritura y comando NO. Un modelo que pide la misma escritura o el
+;;; mismo comando dos veces no encuentra ninguna regla que le conteste, y se
+;;; queda sin respuesta -- que es justo la situacion que la invariante I1
+;;; prohibe: toda targeta propuesta tiene que volver con veredicto.
+;;;
+;;; La respuesta es impugnar la INTENCION intraturno, no matar el turno. Un
+;;; compilador al que le pides dos veces la misma instruccion te dice que ya la
+;;; ejecuto; no te tira el programa.
+
+(defrule prevent-duplicate-write (:salience 15)
+  "Si el LLM pide escribir EXACTAMENTE lo mismo que ya escribio en este turno,
+   se lo dice y no lo repite.
+
+   Se comparan ruta Y contenido. Dos escrituras del mismo fichero con
+   contenido distinto son trabajo de verdad y van por su cuenta; solo el
+   identico se impugna."
+  (?intent (harness-fact (fact-type "intention") (data ?d)))
+  (test (eql (data-get ?d :action) :write-file))
+  (harness-fact (fact-type "file-write") (data ?fw-data))
+  (test (and (eql (data-get ?fw-data :turn-id) (data-get ?d :turn-id))
+             (string= (data-get ?fw-data :path) (data-get ?d :path))
+             (string= (or (data-get ?fw-data :content) "")
+                      (or (data-get ?d :content) ""))
+             (data-get ?fw-data :applied)))
+  =>
+  (assert-step-cancelled
+   ?d
+   "CANCELADO: ese fichero ya tiene EXACTAMENTE este contenido en este turno, asi que reescribirlo no cambiaria nada. Si lo que querias era otra cosa, cambia el contenido.")
+  (retract ?intent))
+
+(defrule prevent-duplicate-command (:salience 15)
+  "Si el LLM pide ejecutar EXACTAMENTE el mismo comando que ya ejecuto con
+   exito en este turno, se lo dice y no lo repite.
+
+   Solo el que SALIO BIEN. Un comando que fallo es justo el que hay que
+   reintentar con otro enfoque: lo que se impugna es el que ya salio bien repetido, que no
+   aporta nada nuevo y solo gasta una ronda."
+  (?intent (harness-fact (fact-type "intention") (data ?d)))
+  (test (eql (data-get ?d :action) :exec-command))
+  (harness-fact (fact-type "command-exec") (data ?cx-data))
+  (test (and (eql (data-get ?cx-data :turn-id) (data-get ?d :turn-id))
+             (string= (or (data-get ?cx-data :command) "")
+                      (or (data-get ?d :command) ""))
+             (zerop (or (data-get ?cx-data :exit-code) -1))))
+  =>
+  (assert-step-cancelled
+   ?d
+   "CANCELADO: ese comando ya se ejecuto con EXITO en este turno (codigo 0), asi que repetirlo daria el mismo resultado. Para cambiar algo hay que cambiar el comando.")
   (retract ?intent))

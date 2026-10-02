@@ -523,25 +523,115 @@
           (format s "~%GOBACK.~%"))))))
 
 
-(defun pending-intention-identities (intentions)
-  "Las identidades de los pasos que estan ANOTADOS pero sin ejecutar.
+(defun intention-statuses (intentions)
+  "Identidad de cada paso (PLAN-STEP-IDENTITY) -> el :status de su intencion.
 
-   Devuelve un hash de identidades (misma clave que PLAN-STEP-IDENTITY) a T
-   para los intentions que siguen con :status :pending.
+   Antes devolvia un hash de identidades PENDIENTES a T, y eso no reachaba para
+   distinguir las dos formas de no tener veredicto: una intencion que sigue
+   :pending (el paso esta en cola, no hay que tocarlo) y una intencion ya
+   :done (el paso se lanzo y su veredicto no esta, no se puede repetir a
+   ciegas). Son opuestas para el modelo y con un hash de booleanos salian como
+   la misma cosa.
 
-   Sirve para que una tarjeta sin veredicto diga POR QUE no lo tiene. Sin esto,
-   'anotado y sin ejecutar' y 'el veredicto se perdio' salen los dos como
-   STATE = PENDING a secas, y el modelo no puede decidir si reintenta."
+   Se guarda el STATUS, no un T, justamente para poder decir las dos."
   (let ((live (make-hash-table :test #'equal)))
     (dolist (d intentions)
-      (when (eql (data-get d :status) :pending)
-        (setf (gethash (plan-step-identity d) live) t)))
+      (setf (gethash (plan-step-identity d) live) (data-get d :status)))
     live))
+
+(defun abort-reason-for-step (identity)
+  "Why this step never ran: the batch-abort that killed its turn/round, or NIL.
+
+   Un paso sin veredicto tiene dos causas que para el modelo son opuestas: se
+   podo, o el turno ABORTO. Lo segundo no es una perdida, es una decision del
+   harness, y se comporta distinto: lo podado se puede repetir, lo abortado hay
+   que replantearlo. Decirle 'puede haberse podado' de un turno que el propio
+   harness mato deja al modelo sin manera de decidir, que es justo lo que un
+   motivo de PENDING tiene que evitar.
+
+   Se empareja por la IDENTIDAD COMPLETA (step round turn), no por el numero de
+   paso: el paso se renumera cada ronda, asi que el 02. de la ronda 2 y el 02.
+   de la ronda 5 del mismo turno son pasos distintos. Y no basta con el turno:
+   un turno abortado en su ultima ronda no invalida los pasos de las rondas
+   anteriores, que si se ejecutaron y ya tienen su veredicto."
+  (let ((reason nil))
+    (dolist (f (mapcar #'first (retrieve (?f) (?f (harness-fact)))))
+      (let ((d (fact-data-of f)))
+        (when (and (string= (fact-type-of f) "batch-abort")
+                   (member identity (data-get d :steps) :test #'equal))
+          (setf reason (data-get d :reason)))))
+    reason))
+
+
+(defun cap-batch-plans ()
+  "Tope de batch-plan, y los veredictos de los planes que se van SE VAN con el.
+
+   La proteccion de RETRACT-OLDEST-OF-TYPE va en un solo sentido: un veredicto
+   cuya tarjeta sigue viva no se capa. Lo que no existia era el otro. Cuando la
+   TARJETA se va por su propio tope, sus veredictos se quedan, y entonces el
+   veredicto huerfano se renderiza en el flujo igual que uno con tarjeta: la
+   misma accion sale dos veces, como linea suelta y como 'STEP nn.', con la
+   misma razon y en distinto orden. El modelo no puede saber si le contaron un
+   hecho o dos, y planifica en torno a un historial que no se deja leer.
+
+   Se hace AQUI, en el momento de retirar la tarjeta, y no despues buscando
+   huerfanos: un veredicto sin batch-plan puede ser un veredicto de un plan que
+   NUNCA se aserto -- una tarjeta hecha a mano, un test -- y a ese no hay que
+   tocarlo. Retirar 'los que no tienen tarjeta' confunde los dos casos y se
+   come respuestas que el modelo si necesita. Solo se va el veredicto CUANDO se
+   va SU tarjeta, y se emparejan por PLAN-STEP-IDENTITY, la misma clave que usa
+   el render, para que no se separen por un criterio distinto."
+  (let* ((type "batch-plan")
+         (keep (max-facts-per-type))
+         (all (sort (remove-if-not (lambda (f)
+                                     (string= (get-slot-value f 'fact-type) type))
+                                   (mapcar #'first (retrieve (?f) (?f (harness-fact)))))
+                    #'fact-order-before-p :key #'fact-order-key))
+         ;; Se quedan los KEEP MAS NUEVOS: victimas son los de delante del
+         ;; último, o sea (BUTLAST all KEEP). Con (NTHCDR KEEP all) seria al
+         ;; revés -- se.capaba lo reciente y se guardaba lo viejo, que es justo
+         ;; lo contrario de lo que hace RETRACT-OLDEST-OF-TYPE y lo que hace
+         ;; inservible el tope: la tarjeta que se queda era la de un plan que el
+         ;; modelo ya no puede repetir.
+         (victims (when (> (length all) keep)
+                    (butlast all keep))))
+    (dolist (f victims)
+      (let ((gone (plan-step-identity (fact-data-of f))))
+        (retract f)
+        (dolist (v (mapcar #'first (retrieve (?f) (?f (harness-fact)))))
+          (when (and (string= (fact-type-of v) "verdict")
+                     (equal gone (plan-step-identity (fact-data-of v))))
+            (retract v)))))))
+
+(defun superseded-round (turn round order)
+  "La ronda que SUSTITUYO a la de este paso, o NIL si el plan sigue vigente.
+
+   Cuarto estado, y el que mas dañaba: un plan que el PROPIO MODELO cambio por
+   otro en una ronda posterior. No se podo nada, no aborto nada, y no se ejecuto:
+   el modelo RESPONDIO OTRO LOTE. Antes caia en el 'puede haberse podado', que es mentira en las tres partes, y el modelo lo leia como 'perdi mi
+   plan' -- con lo que su unica salida era volver a planificar. Asi se cerraba
+   el bucle: cada ronda de mas dejaba un plan muerto en pantalla, y el modelo
+   los veia a todos como pendientes por lo que replanificaba el mismo trabajo.
+
+   Se deduce de los propios batch-plan del turno: si hay un paso de una ronda
+   MAYOR, el plan de esta ya no es el vigente. No hace falta ningun hecho nuevo,
+   y no puede quedar desfasado del estado, que es lo que le pasaria a un campo
+   que se escribiera al planificar y no se limpiara al re-planificar.
+
+   Devuelve la ronda INMEDIATAMENTE POSTERIOR, no la mayor: entre la 2 y la 4 no
+   fue la 4 la que cambio el lote de la 2, sino la 3. Decir 'lo cambio por otro en
+   la ronda 4' manda al modelo a mirar un lote que tampoco es el suyo."
+  (let (newer)
+    (dolist (d order)
+      (let ((r (or (data-get d :round) 1)))
+        (when (and (eql (data-get d :turn-id) turn) (> r round))
+          (setf newer (if (null newer) r (min newer r))))))
+    newer))
 
 (defun pending-reason (identity pending)
   "El porque de un PENDING sin veredicto, o NIL si no hay nada que decir.
 
-   Tres estados que antes se renderizaban IGUALES, y que no son lo mismo:
+   Estos estados se renderizaban IGUALES, y no son lo mismo:
 
      - ANOTADO, SIN EJECUTAR: la intencion sigue :pending. El paso esta en la
        cola de Rete; todavia no ha ocurrido. Es lo mas comun en una ronda en
@@ -555,13 +645,22 @@
 
    La distincion es de RENDER, no de poda. La poda ya protege los veredictos de
    las tarjetas vivas (ver BUILD-CONTEXT); lo que faltaba era que cuando aun
-   asi no hay veredicto, la tarjeta lo dijera."
-  (cond
-    ((gethash identity pending)
-     "ANOTADO, SIN EJECUTAR: la intencion sigue pendiente; este paso esta en cola")
-    (t
-     "SIN VEREDICTO REGISTRADO: no hay intencion pendiente ni veredicto; puede haberse podado")))
+   asi no hay veredicto, la tarjeta lo dijera.
 
+   Y hay un TERCER caso, que va PRIMERO porque es el unico del trio del que no
+   se debe reintentar igual: el turno ABORTO. No se podo nada -- el harness
+   dejo de preguntar a proposito (ver ABORT-REASON-FOR-STEP). Decirle 'puede
+   haberse podado' de un turno que el propio harness mato deja al modelo sin
+   manera de decidir, que es justo lo que un motivo de PENDING evita."
+  (let ((aborted (abort-reason-for-step identity)))
+    (cond
+      (aborted
+       (format nil "EL TURNO ABORTO ANTES DE EJECUTAR ESTE PASO: ~A. No se perdio ni se podo; no lo reintentes igual, replantearlo."
+               aborted))
+      ((gethash identity pending)
+       "ANOTADO, SIN EJECUTAR: la intencion sigue pendiente; este paso esta en cola")
+      (t
+       "SIN VEREDICTO REGISTRADO: no hay intencion pendiente ni veredicto; puede haberse podado"))))
 (defun render-plan-procedure (s order verdicts intentions)
   "La PROCEDURE DIVISION de la tarjeta: los pasos y su veredicto.
 
@@ -582,7 +681,7 @@
    PENDING lleva siempre su REASON. Ver PENDING-REASON: un PENDING a secas
    mezcla 'en cola' con 'veredicto perdido', y el modelo no puede decidir."
   (format s "~%PROCEDURE DIVISION.~%")
-  (let ((pending (pending-intention-identities intentions)))
+  (let ((statuses (intention-statuses intentions)))
     (dolist (d order)
       (let* ((n (data-get d :step))
              (turn (data-get d :turn-id))
@@ -641,9 +740,36 @@
         ;; Sin esto ultimo, los PENDING serian todos iguales y el modelo no
         ;; podria distinguir un paso en cola de uno cuyo veredicto se perdio.
         (let ((why (or (data-get v :reason)
-                       (unless v (pending-reason identity pending)))))
+                       (unless v
+                         ;; ORDEN: aborted > sustituido > en cola > podado.
+                         ;; PENDING-REASON resuelve los tres ultimos, pero su
+                         ;; ultima rama es un 'puede haberse podado' que SIEMPRE
+                         ;; devuelve algo: consultarlo antes dejaria al estado
+                         ;; SUSTITUIDO sin poder aparecer nunca.
+                         (let ((aborted (abort-reason-for-step identity))
+                               (newer (superseded-round turn round order)))
+                           (cond
+                             (aborted
+                              (format nil "EL TURNO ABORTO ANTES DE EJECUTAR ESTE PASO: ~A. No se perdio ni se podo; no lo reintentes igual, replantearlo."
+                                      aborted))
+                             (newer
+                              (format nil "SUSTITUIDO, NO PENDIENTE: pediste este lote en la ronda ~D y tu siguiente respuesta lo cambio por otro en la ronda ~D. No se ejecuto, pero tampoco se perdio: no lo reintentes, el trabajo vigente es el del lote de la ronda ~D."
+                                      round newer newer))
+                             ((eql (gethash identity statuses) :pending)
+                              "ANOTADO, SIN EJECUTAR: la intencion sigue pendiente; este paso esta en cola")
+                             ((gethash identity statuses)
+                              "EJECUTADO SIN VEREDICTO: la intencion se marco hecha pero no hay veredicto, asi que no se puede saber si ocurrio. No lo repitas igual: verificalo o replantealo")
+                             (t
+                              "LOTE VIGENTE, SIN EJECUTAR: este paso es de tu ultima respuesta y todavia no se ha ejecutado; no hace falta repetirlo")))))))
           (when why
-            (format s "        REASON = ~A~%" why)))))))
+            (format s "        REASON = ~A~%" why)))
+        ;; El contenido que un paso cancelado YA TENIA. Sin esto el veredicto
+        ;; dice 'no lo repitas' y el modelo, al no ver el fichero, lo repite:
+        ;; el veto sin el contenido es un callejon sin salida que el modelo no
+        ;; puede resolver solo. Con el, la cancelacion se lee como una entrega.
+        (let ((contents (data-get v :contents)))
+          (when (and (stringp contents) (plusp (length contents)))
+            (format s "        CONTENTS =~%~A~%" contents)))))))
 
 
 
@@ -790,14 +916,48 @@
                  (and (= (second ka) (second kb))
                       (< (third ka) (third kb))))))))
 
-(defun live-plan-step-identities ()
+(defun live-plan-step-identities (&optional (facts (collect-active-facts)))
   "Las identidades de las tarjetas batch-plan que siguen en pantalla.
    COLLECT-FACTS-OF-TYPE devuelve datos, no hechos: no hay que volver a
    developed el 'data' encima."
   (let ((live (make-hash-table :test #'equal)))
-    (dolist (d (collect-facts-of-type (collect-active-facts) "batch-plan"))
+    (dolist (d (collect-facts-of-type facts "batch-plan"))
       (setf (gethash (plan-step-identity d) live) t))
     live))
+
+(defun prune-long-term-memory ()
+  "Los topes de la memoria de largo plazo, aplicados al motor de memoria.
+
+   Va aqui, y no en BUILD-CONTENT, porque la memoria de largo plazo ya no se
+   poda como efecto secundario de construir el .cob: se poda porque se poda.
+   Y va aqui, y no repartido, porque la tarjeta y su veredicto tienen que caer
+   por la MISMA ventana y en ese orden, y eso solo se puede garantizar si los
+   dos topes se aplican juntos y sobre el mismo conjunto. Con un tope en cada
+   sitio, cada uno recorta por su cuenta y se desalinean solos -- que es como
+   una tarjeta se queda sin veredicto y sale con STATE = PENDING."
+  (retract-oldest-of-type "user-input" (max-facts-per-type))
+  (retract-oldest-of-type "llm-response" (max-facts-per-type))
+  (retract-oldest-of-type "command-exec" (max-facts-per-type))
+  (retract-oldest-of-type "file-read" (max-facts-per-type))
+  (retract-oldest-of-type "file-write" (max-facts-per-type))
+  (retract-oldest-of-type "file-edit" (max-facts-per-type))
+  ;; El protocolo tambien crece: un batch-plan y un verdict POR PASO.
+  (cap-batch-plans)
+  ;; Y al reves: un veredicto CUYA TARJETA SE FUE no puede quedarse. La proteccion
+  ;; de abajo solo va en un sentido -- protege al veredicto cuya tarjeta sigue
+  ;; viva -- y por eso un veredicto sin tarjeta sobrevivia a la poda de la tarjeta.
+  ;;
+  ;; Un veredicto huerfano se renderiza en el flujo como 'STEP nn.', o sea como
+  ;; si fuera un paso que el modelo llego a pedir, cuando su plan hace rato que no
+  ;; esta en pantalla. Y se duplica: la linea suelta del hecho (READ-FILE, FAILED,
+  ;; REASON = ...) y la tarjeta (STEP 01. READ-FILE, FAILED, REASON = ...) salen
+  ;; las dos, con la misma razon y en distinto orden. El modelo no puede saber si
+  ;; le contaron dos veces el mismo hecho o dos hechos, y planifica en torno a un
+  ;; historial que no se deja leer.
+  (let ((live (live-plan-step-identities (collect-harness-facts))))
+    (retract-oldest-of-type "verdict" (max-facts-per-type)
+                            (lambda (f)
+                              (gethash (plan-step-identity (fact-data-of f)) live)))))
 
 (defun grouped-context-string (facts now-turn &optional memory)
   "Los hechos del turno, agrupados por :turn-id, como PROGRAMA COBOL.
@@ -929,13 +1089,38 @@
    mezcladito que este cambio viene a quitar.
 
    Es independiente de la memoria de turno y de su TTL/dedup/cap: eso lo hace
-   la mem-engine antes de llegar aqui."
+   la mem-engine antes de llegar aqui.
+
+   RECOGE EL TURNO EN CURSO TAMBIEN, y no solo los anteriores. La memoria es
+   la proyeccion durable, y promover antes de construir es lo que hace que
+   tenga lo que acaba de pasar; si esperase al final del turno, el modelo
+   estaria leyendo el .cob del turno anterior mientras este ocurre.
+
+   Que un hecho salga tambien en el bloque de su turno no es una copia por
+   descuido: son dos preguntas distintas. El bloque de turno dice QUE PASO EN
+   ESE TURNO --con STATE, REASON y REFUSED--, y la memoria dice COMO ESTA EL
+   MUNDO --con BYTES, REPLACED y NEW, que son cosas que el bloque de turno no
+   lleva--. Lo que no puede pasar es que las dos digan cosas DISTINTAS del
+   mismo hecho, y no pueden: las dos leen la misma red."
   (let ((facts (mem-engine-facts)))
     (when facts
       (with-output-to-string (s)
         (format s "~%MEMORY DIVISION.~%")
-        (dolist (f (nreverse
-                     (sort facts #'fact-order-before-p :key #'fact-order-key)))
+        ;; EN ORDEN CRONOLOGICO, como la DATA DIVISION de arriba.
+        ;;
+        ;; Antes era (SORT ... fact-order-before-p :key fact-order-key) seguido
+        ;; de un NREVERSE, o sea descendente: la memoria durable se leia al
+        ;; reves que los turnos. Y sus entradas no llevan etiqueta de turno, asi
+        ;; que el modelo no tenia forma de saber cual era la vigente. En una
+        ;; corrida real la ultima linea que se leia era
+        ;;
+        ;;     WROTE. math_utils.py
+        ;;         BYTES = 294
+        ;;
+        ;; sobre un fichero de 587 bytes: el RESUMEN MAS ANTIGUO presented como
+        ;; si fuera el estado actual. Sin orden ni turno, tres afirmaciones
+        ;; paralelas se leen como la misma, y la que gana es la que esta ultima.
+        (dolist (f (sort facts #'fact-order-before-p :key #'fact-order-key))
           (let* ((type (fact-type-of f))
                  (data (fact-data-of f)))
             (cond ((string= type "command-exec")
@@ -949,26 +1134,44 @@
                    (format s "        EVIDENCE = ~A~%"
                            (cobol-block (truncate-payload
                                          (or (data-get data :output) "")))))
-                  ((string= type "file-write")
-                   (format s "    WROTE. ~A~%" (cobol-value (or (data-get data :path) "")))
-                   (format s "        BYTES = ~A~%" (or (data-get data :bytes) "")))
-                  ((string= type "file-edit")
-                   (format s "    EDITED. ~A~%" (cobol-value (or (data-get data :path) "")))
-                   ;; SIN BYTES, A PROPOSITO. El edit no lleva tamano, y la
-                   ;; tentacion de computarlo --leer el archivo, restar lo
-                   ;; viejo, sumar lo nuevo-- seria inventar un dato que el
-                   ;; harness no midio. Lo que se sabe de verdad es cuanto
-                   ;; salio y cuanto entro, y con eso el modelo puede
-                   ;; reconstruir la diferencia. La escritura que este edit
-                   ;; modifies sigue en la division con SU tamano, y como va
-                   ;; newest-first (SORT ascendente y NREVERSE) el modelo ve
-                   ;; primero el cambio y despues el estado anterior: la
-                   ;; linea de BYTES se lee como lo que es, el tamano que
-                   ;; tenia el archivo ANTES de los edits de arriba.
-                   (format s "        REPLACED = ~A~%"
-                           (or (data-get data :replaced-chars) ""))
-                   (format s "        NEW = ~A~%"
-                           (or (data-get data :new-chars) "")))
+                 ((string= type "file-write")
+                  (if (data-get data :applied)
+                      (progn
+                        (format s "    WROTE. ~A~%" (cobol-value (or (data-get data :path) "")))
+                        (format s "        BYTES = ~A~%" (or (data-get data :bytes) "")))
+                      ;; Un rechazo que sale como WROTE es la MENTIRA mas
+                      ;; caro que puede decir esta division: dice que el archivo
+                      ;; existe con un tamano que no tiene. El motivo sale con
+                      ;; el, porque un rechazo sin motivo es un rechazo que el
+                      ;; modelo no puede evitar repetir.
+                      (progn
+                        (format s "    REFUSED. ~A~%" (cobol-value (or (data-get data :path) "")))
+                        (format s "        REQUEST = WRITE-FILE~%")
+                        (when (data-get data :reason)
+                          (format s "        REASON = ~A~%" (data-get data :reason))))))
+                 ((string= type "file-edit")
+                  (if (data-get data :applied)
+                      (progn
+                        (format s "    EDITED. ~A~%" (cobol-value (or (data-get data :path) "")))
+                        ;; SIN BYTES, A PROPOSITO. El edit no lleva tamano, y la
+                        ;; tentacion de computarlo --leer el archivo, restar lo
+                        ;; viejo, sumar lo nuevo-- seria inventar un dato que el
+                        ;; harness no midio. Lo que se sabe de verdad es cuanto
+                        ;; salio y cuanto entro, y con eso el modelo puede
+                        ;; reconstruir la diferencia. La escritura que este edit
+                        ;; modifica sigue en la division con SU tamano.
+                        (format s "        REPLACED = ~A~%"
+                                (or (data-get data :replaced-chars) ""))
+                        (format s "        NEW = ~A~%"
+                                (or (data-get data :new-chars) "")))
+                      ;; El mismo motivo que en la escritura: un edit que no se
+                      ;; aplico no cambio el archivo, y decirlo como EDITED es
+                      ;; inventarse un cambio.
+                      (progn
+                        (format s "    REFUSED. ~A~%" (cobol-value (or (data-get data :path) "")))
+                        (format s "        REQUEST = EDIT-FILE~%")
+                        (when (data-get data :reason)
+                          (format s "        REASON = ~A~%" (data-get data :reason))))))
                   (t nil))))))))
 
 
@@ -976,6 +1179,15 @@
   "El contexto completo como programa COBOL: poda, selecciona y renderiza
    los hechos mas relevantes estructural y semanticamente."
   (run)
+  ;; PROMUEVE Y LUEGO LEE. El .cob se genera desde la red de largo plazo, y una
+  ;; red de largo plazo que no tiene lo que acaba de pasar no sabe lo que
+  ;; acaba de pasar. Mientras la promocion vivia en el llamador, este funcion
+  ;; podia leer una memoria vacia y devolver un programa en blanco: no habia
+  ;; forma de distinguir "no se ha promovido" de "no hay nada".
+  ;;
+  ;; Y es idempotente, porque promover dos veces el mismo hecho no lo duplica,
+  ;; asi que el llamador puede promover antes de Construiry no pasa nada.
+  (promote-durable-facts)
   (retract-oldest-of-type "user-input" (max-facts-per-type))
   (retract-oldest-of-type "llm-response" (max-facts-per-type))
   (retract-oldest-of-type "command-exec" (max-facts-per-type))
@@ -991,7 +1203,18 @@
   ;; los de las tarjetas que siguen en pantalla. Si no, los dos topes van por
   ;; separado sobre conjuntos distintos y se desalinean solos, que es como una
   ;; tarjeta se queda sin veredicto y sale con STATE = PENDING.
-  (retract-oldest-of-type "batch-plan" (max-facts-per-type))
+  (cap-batch-plans)
+  ;; Y al reves: un veredicto CUYA TARJETA SE FUE no puede quedarse. La proteccion
+  ;; de abajo solo va en un sentido -- protege al veredicto cuya tarjeta sigue
+  ;; viva -- y por eso un veredicto sin tarjeta sobrevivia a la poda de la tarjeta.
+  ;;
+  ;; Un veredicto huerfano se renderiza en el flujo como 'STEP nn.', o sea como
+  ;; si fuera un paso que el modelo llego a pedir, cuando su plan hace rato que no
+  ;; esta en pantalla. Y se duplica: la linea suelta del hecho (READ-FILE, FAILED,
+  ;; REASON = ...) y la tarjeta (STEP 01. READ-FILE, FAILED, REASON = ...) salen
+  ;; las dos, con la misma razon y en distinto orden. El modelo no puede saber si
+  ;; le contours dos veces el mismo hecho o dos hechos, y planifica en torno a un
+  ;; historial que no se deja leer.
   (let ((live (live-plan-step-identities)))
     (retract-oldest-of-type "verdict" (max-facts-per-type)
                             (lambda (f)
@@ -1000,16 +1223,32 @@
   ;; Order matters. Reconciling first means the cap evicts finished goals
   ;; instead of unfinished ones, so the goals the model still has to act on
   ;; are the ones that survive.
-  (reconcile-todos (collect-active-facts))
+  ;;
+  ;; DE LA MEMORIA DE LARGO PLAZO, y no del motor de turno. El .cob se genera
+  ;; desde alli, y una meta se cierra con la EVIDENCIA de que se hizo -- esa
+  ;; evidencia tiene que salir del mismo sitio del que sale el resto del
+  ;; programa, o las dos mitades pueden discrepar.
+  ;;
+  ;; Y discreparon. En una corrida real: la meta 'Write utils.py' se abrio en
+  ;; el turno 2, la escritura se aplico y quedo durable, y en el turno 5 la
+  ;; meta seguia ABIERTA. La razon es el TTL: fact_ttl_seconds = 120, y entre
+  ;; el turno 2 y el 5 habian pasado doce minutos, asi que PRUNE-EXPIRED ya
+  ;; habia retractado el file-write del motor de turno. Reconciliando contra
+  ;; el motor de turno, la evidencia de una meta de hace dos minutos ya no
+  ;; existia y la meta no se cerraba nunca.
+  ;;
+  ;; No era un detalle cosmético: GOAL ABIERTO. N en cero es lo que habilita
+  ;; DONE. Una meta que no se cierra nunca es una sesion que no puede terminar.
+  (reconcile-todos (mem-engine-facts))
   (prune-finished-todos)
 
-  (let* ((all-facts (collect-active-facts))
+  (let* ((all-facts (mem-engine-facts))
          (now-turn (if all-facts
                        (or (data-get (fact-data-of (car (last all-facts))) :turn-id)
                            0)
                        0)))
     (when *debug-mode*
-      (format t "~&[DEBUG build-context] active-facts=~A now-turn=~A~%" (length all-facts) now-turn))
+      (format t "~&[DEBUG build-context] mem-facts=~A now-turn=~A~%" (length all-facts) now-turn))
     (let ((selected (select-relevant-facts all-facts now-turn :query user-message)))
       ;; La memoria se calcula ANTES de renderizar, porque ahora es una
       ;; division del programa y no una cola que se le pega por detras.

@@ -65,48 +65,100 @@
 ;;; ============================================
 
 (defun durable-type-p (type data)
-  "TRUE when a fact is worth keeping in long-term memory:
-   - command-exec facts that are REAL active errors (non-zero exit WITH
-     evidence, not timed out, when conserve_errors is on);
-   - file-write facts that were APPLIED (actions actually taken on the project);
-   - file-edit facts that were APPLIED (the file changed after its write).
+  "TRUE when a fact crosses from the intraturn network to the long-term one.
 
-   Both file types ask for :applied, and that is the whole difference con la
-   version anterior, que aceptaba CUALQUIER file-write. Ahi hay dos cosas:
+   THE MEMORY DIVISION is not a log of what mattered; it is the whole input of
+   the next round. Everything the model needs in order to stay coherent
+   between states has to cross, and nothing else has to.
 
-   - Un EDIT que no se aplico no cambio ningun archivo, asi que no es durable.
-     Sin esta puerta el unico rastro durable de un edit era... ninguno: el
-     archivo se congelo en el tamano de su escritura inicial. El caso real de
-     una sesion de 4 turnos: WROTE. math_utils.py BYTES = 252 con un archivo
-     de 560 en disco, y los dos edits que lo llevaron ahi -- con sus chars
-     replacement y anadidos -- guardados en un hecho que la memoria nunca
-     miraba. La verdad ESTABA en los facts.
+   So the test is NOT 'is this important'. It is: 'without this, can the model
+   keep working'. And there are exactly three things it needs.
 
-   - Un WRITE RECHAZado no es una escritura. WRITE-FILE con :refused t afirma
-     :applied nil, y sin mirar ese campo salia en la memoria como
-     'WROTE. nope.py / BYTES = ' con el tamano VACIO: la memoria decia que
-     habia escrito un archivo que no escribio, y un archivo que no existe no
-     se puede rechazar por no existir, asi que era el unico hueco. Falla en los
-     dos pasos, no en uno."
+   ONE. WHAT IS TRUE NOW. The files: what was written, what was edited, and --
+   the one that gets forgotten -- WHAT WAS READ, with its contents. Drop the
+   CONTENTS of a read and the model cannot plan its next step; it has to guess
+   what is in the file, and it guessed wrong four times in a row in a real run.
+   A read is not durable in the sense of 'matters forever'; it is durable in the
+   sense of 'this is how the model finds out what the world looks like'.
+
+   TWO. WHAT HAPPENED TO WHAT IT ASKED FOR. batch-plan and verdict. The plan is
+   what the model proposed and the verdict is what the machine answered. That
+   pair is the loop closing: without it the next target has nothing to compare
+   against, and the model reinvents the session from scratch every round.
+
+   THREE. WHAT IS STILL MISSING. Not the goals themselves -- those live in
+   their own slots -- but user-input, so the model knows what it was asked, and
+   llm-response, so it knows what it answered.
+
+   THE FILES CROSS WHETHER THEY WERE APPLIED OR NOT, and this reverses an older
+   decision. A refusal is a fact about the world: THIS DID NOT HAPPEN, AND HERE
+   IS WHY. Gating on :applied kept exactly the failures out of memory, and a
+   failure is the one thing the model must not forget -- it is the whole point
+   of what it is supposed to do differently next round. What it must never see
+   is a refused write painted as a done one, and that is the RENDERER's job
+   and not the promotion's: STATE = FAILED with REASON and REFUSED = TRUE, and
+   never WROTE.
+
+   Same for commands, and here the gate stays: only the real errors cross. A
+   command that worked changed nothing the model cannot see for itself, and one
+   that failed is a wall it is going to hit again.
+
+   NOT promoted, because they are intraturn scaffolding and would be noise in
+   every future context: intention (an intention that never ran is a draft, not
+   a fact), batch-abort, tool-loop, and the derived loop warnings."
   (or (and (string= type "command-exec")
            (real-error-p type data))
-      (and (string= type "file-write")
-           (data-get data :applied))
-      (and (string= type "file-edit")
-           (data-get data :applied))))
+      (member type '("file-write" "file-edit" "file-read" "batch-plan"
+                     "verdict" "user-input" "llm-response")
+              :test #'string=)))
 
 (defun mem-engine-facts ()
-  "All harness-facts currently living in the long-term memory engine."
+  "The long-term memory as the .cob needs it: durable facts, in causal order.
+
+   This is the whole input of the next round, so the order is not cosmetic.
+   COLLECT-HARNESS-FACTS returns whatever RETRIEVE handed back; sorted by
+   FACT-ORDER-BEFORE-P it is the order in which things happened, which is the
+   order in which they have to be read."
   (with-mem-engine
-    (remove-if-not (lambda (f)
-                     (durable-type-p (fact-type-of f) (fact-data-of f)))
-                   (collect-harness-facts))))
+    (sort (remove-if-not (lambda (f)
+                           (durable-type-p (fact-type-of f) (fact-data-of f)))
+                         (collect-harness-facts))
+          #'fact-order-before-p :key #'fact-order-key)))
 
 (defun promote-durable-facts ()
   "Project durable turn-engine facts into long-term memory, run the mem
    engine's rules, then re-apply per-type caps so memory stays bounded."
+  ;; EN ORDEN CAUSAL, y no en el orden de recuperacion de Rete.
+  ;;
+  ;; COLLECT-HARNESS-FACTS devuelve lo que RETRIEVE entregue, que no es un orden:
+  ;; el motor de turno lo usa tal cual y por eso la DATA DIVISION, que si pasa
+  ;; por COLLECT-ACTIVE-FACTS, si sale bien. Aqui no habia nadie que pusiera las
+  ;; cosas en su sitio.
+  ;;
+  ;; Y no es cosmetico: FACT-ORDER-KEY desempata por LISA-FACT-ID, y el id de un
+  ;; hecho de la MEMORIA es el que le dio el motor de memoria al insertarlo, o
+  ;; sea EL ORDEN DE PROMOCION. Promoviendo en orden arbitrario, el id deja de
+  ;; medir causalidad y pasa a medir azar, y con el la MEMORY DIVISION entero:
+  ;; dos escrituras del mismo segundo salian al reves, con la mas antigua al
+  ;; final leyendose como el estado actual. En la prueba, 'WROTE. p2.py' caia
+  ;; antes que 'WROTE. p1.py'.
+  ;;
+  ;; PROMOVER ES IDEMPOTENTE, y no por una guarda nuestra sino por la IDENTIDAD
+  ;; DEL HECHO de LISA: dos hechos con el mismo tipo, timestamp y datos son el
+  ;; mismo hecho, y la red no los guarda dos veces. Se llama una vez por RONDA y
+  ;; el motor de turno no se vacia entre rondas --el user-input del turno sigue
+  ;; ahi en la ronda 3, y el batch-plan y el verdict de la ronda 1 tambien--, asi
+  ;; que sin esa propiedad la ronda 2 los volveria a copiar y el .cob los
+  ;; renderizaria DOS VECES.
+  ;;
+  ;; Se apoya en el timestamp DEL HECHO para que la identidad sea la correcta: dos
+  ;; escrituras del mismo fichero dentro del mismo segundo comparten reloj y se
+  ;; distinguen por los datos, y dos rondas copie la misma escritura
+  ;; coinciden en los tres campos y son la misma.
   (dolist (f (unless (null *mem-engine*)
-               (with-turn-engine (collect-harness-facts))))
+               (with-turn-engine
+                 (sort (copy-list (collect-harness-facts))
+                       #'fact-order-before-p :key #'fact-order-key))))
     (let ((type (fact-type-of f))
           (data (fact-data-of f)))
       (when (and (durable-type-p type data) *mem-engine*)
@@ -130,13 +182,12 @@
   (unless (null *mem-engine*)
     (with-mem-engine
       (run)
-      (retract-oldest-of-type "command-exec" (max-facts-per-type))
-      (retract-oldest-of-type "file-write" (max-facts-per-type))
-      ;; El cap de FILE-EDIT va con los otros dos, y por la misma razon: si
-      ;; DURABLE-TYPE-P lo deja pasar y no se capa, la memoria de largo plazo
-      ;; crece sin tope. Ahi esta el archivo, la escritura y cada edit, y un
-      ;; turno que edita 20 veces deja 20 hechos mas para siempre.
-      (retract-oldest-of-type "file-edit" (max-facts-per-type)))))
+      ;; Los topes de la memoria de largo plazo, aqui y no en BUILD-CONTEXT:
+      ;; ya no es BUILD-CONTENT quien la poda, y dejar los topes ahi los
+      ;; aplicaba al motor equivocado. PRUNE-LONG-TERM-MEMORY es el unico sitio
+      ;; que decide que se queda, para que las dos redes no puedan discordar
+      ;; sobre el mismo conjunto.
+      (prune-long-term-memory))))
 
 (defun boot-memory ()
   "Fresh-process boot: reset both engines, load persisted long-term memory

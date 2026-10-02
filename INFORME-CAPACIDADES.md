@@ -22,7 +22,8 @@ Lo que **no** es:
   reintenta tareas por su cuenta;
 - no tiene sandbox: ejecuta comandos y escribe archivos con los permisos del
   usuario que lo lanza;
-- tiene 52 tests automatizados y offline (`./run-tests.sh`), pero no hay CI;
+- tiene una suite automatizada y offline (`./run-tests.sh`, 108 casos) que CI corre
+  en cada push y PR (`.github/workflows/tests.yml`);
 - su memoria es un **working set podado**, no un historial: lo viejo se olvida a
   propósito y hay que volver a leerlo.
 
@@ -51,9 +52,12 @@ Lo que **no** es:
 - Dos motores Rete aislados: `*turn-engine*` (working memory del turno) y
   `*mem-engine*` (conocimiento durable). Los hechos de uno son invisibles al otro
   (`src/engines.lisp:28`).
-- Al final de cada turno se **promueven** solo los hechos durables: errores reales
-  de comandos y escrituras de archivos (`src/engines.lisp:83`,
-  `src/engines.lisp:67`).
+- El `.cob` se genera desde la red de largo plazo, así que los hechos se **promueven**
+  al principio de cada ronda y no al final del turno. Cruzan tres cosas: qué es verdad
+  ahora (lecturas con su contenido, escrituras y edits, aplicados o no), qué pasó con lo
+  que pidió (plan y veredicto) y qué se le pidió y qué contestó; más los `command-exec`
+  que son errores reales. El andamiaje intraturno (`intention`, `batch-abort`,
+  `tool-loop`) no cruza (`src/engines.lisp:67`).
 - La memoria durable se persiste en `dumps/longterm-mem.lisp` y se recarga
   sola al arrancar (`src/engines.lisp:101`, `src/persist.lisp:19`).
 - Deduplicación durable last-write-wins en el motor de memoria
@@ -217,23 +221,23 @@ máximos, streaming, modelo, endpoint y clave.
 
 ### 4.1 Verificación y calidad
 
-- **Ya hay suite automatizada (96 casos, 335 checks, toda en verde).** Vive en
+- **Ya hay suite automatizada (108 casos, toda en verde), y CI.** Vive en
   `tests/harness.lisp`, expuesta como el sistema `"cl-harness/tests"` en
   `cl-harness.asd` y ejecutable con `./run-tests.sh` (o `./run-tests.sh metrics`
   para filtrar por nombre). Los casos se registran a mano en `*test-cases*`
   porque el registro interno de Rove no sobrevive a la carga desde FASL.
   Cubre ambos motores, reglas por engine, detección de loops, promoción
   durable, render de contexto, parser batch y normalización ToolUse, dedup/TTL,
-  topes por tipo, guardas de escritura, métricas, y —nuevo— comportamiento:
-  topes del bucle batch y política de reintentos HTTP.
+  topes por tipo, guardas de escritura, métricas, comportamiento de los topes
+  del bucle batch, política de reintentos HTTP, **el path de transporte**
+  (constructores de mensajes y orden de tools) y **escritura atómica**.
 - **El suite es offline por contrato:** durante la corrida `dexador:post` se
   sustituye por una señal, así que una fuga de red falla ruidosa en vez de
   gastar una llamada real (esto ya pasó: un `flet` sobre `call-llm` no intercepta
   la llamada global de `process-turn` y el test se-wasaba a la API de verdad).
-- **No hay CI**, ni lint, ni typecheck. La compilación sigue emitiendo
-  style-warnings, todos del tipo "variable definida pero no usada" (gensyms que
-  genera la macro `lisa:retrieve`, más `*pids*` y el parámetro `facts` de
-  `relevance-score`). Ver §7.
+- **El CI no necesita ninguna clave de API** por lo anterior. `run-tests.sh`
+  instala Quicklisp en un temporal si no encuentra `~/quicklisp/setup.lisp`, de
+  modo que el runner es autocontenido.
 - **No verifica que el modelo haya hecho lo que pidió.** El harness ejecuta y
   registra; no comprueba el resultado de la tarea.
 
@@ -370,17 +374,66 @@ máximos, streaming, modelo, endpoint y clave.
 
 **Pendiente que sigue abierto (fuera del alcance de este lote)**
 
-7. `build-openai-compat-messages-with-tools` recibe `system-prompt` y no lo usa:
-   hoy los dos callers (``stream-llm-with-tools`` y `call-llm-with-tools/static``)
-   precargan el mensaje de sistema, así que el prompt llega, pero si alguien
-   llama al builder con `prior-messages` vacío lo pierde. Compila con
-   style-warning por eso.
-8. `restore-facts` / `restore-mem-facts` están llamadas desde `persist.lisp` pero
-   no existen: `:restore` no restaura nada en runtime (style-warning
-   "undefined function").
-9. Style-warnings por variables no usadas: `*pids*` (`src/background.lisp`) y el
-   parámetro `facts` de `relevance-score` (`src/context.lisp`). El resto son
-   gensyms que genera `lisa:retrieve`.
+7. ~~`build-openai-compat-messages-with-tools` recibe `system-prompt` y no lo
+   usa~~ → **Arreglado, y era un P0.** El diagnóstico de este informe era
+   incorrecto: no era un parámetro sin usar sino un **error de aridad en tiempo
+   de ejecución**. La función estaba definida con **3** parámetros
+   (`context user-message prior-messages`) y sus **dos** callers le pasaban
+   **4** (`system-prompt context user-message messages`) — `src/llm.lisp:598` y
+   `:740`. Verificado ejecutando la llamada: `Too many arguments`.
+
+   El alcance era toda la ruta por defecto: `build-openai-compat-messages-with-tools`
+   es lo que despacha `call-llm-with-tools`, el `else` de `call-llm`, o sea
+   **todo** proveedor openai-compatible (openrouter, groq, openai) tanto en
+   streaming como estática. Solo sobrevivía el modo `batch`, que es lo que
+   tenía el `config.json` del repo — por eso 96 tests en verde no lo detectaron.
+
+   Ni los 96 tests ni este informe lo cazaron porque **el mock estaba un nivel
+   demasiado arriba**: `with-mocked-call-llm` sustituye `call-llm` *entera*, así
+   que el builder nunca se ejecutaba. Ahora hay 8 tests nuevos
+   (`transport/el-builder-*`, `transport/el-path-estatico-*`) que lo llaman
+   directamente, y un CI.
+
+8. ~~`restore-facts` / `restore-mem-facts` no existen~~ → **Falsa alarma de este
+   informe.** Ambas son `defun` emitidos *dentro* del propio dump
+   (`src/persist.lisp:54` y `:74`) y `restore-session` las invoca con `fboundp`
+   guardado (`src/persist.lisp:248`, `:91`). La restauración funciona: es
+   exactamente el fix de PROTOCOLO §4.6. Este informe describía el bug
+   *antes* de arreglarlo.
+9. ~~Style-warnings por variables no usadas~~ → El de `*pids*`
+   (`src/background.lisp`) y el parámetro `facts` de `relevance-score`
+   (`src/context.lisp`) siguen, y son inocuos. El que **no** era inocuo era
+   `system-prompt` en `call-llm-with-tools/static`: una variable libre ausente de
+   la lambda list, que en Common Lisp no es un valor por defecto sino una
+   variable especial sin ligar — el turno moría con
+   `Variable SYSTEM-PROMPT is unbound` al construir el primer mensaje. Arreglado
+   en el mismo lote que el punto 7.
+
+**Correcciones posteriores (2026-10-01)**
+
+- **Escrituras atómicas.** `write-file` y `edit-file` escribían con
+  `:if-exists :supersede` directo sobre el destino: una muerte a mitad del
+  `write-string` dejaba el fichero del usuario **truncado a cero**. Ahora van por
+  `write-file-atomically` (temporal hermano + `rename(2)`), que es lo que hace
+  el write atómico real. Cubierto por 3 tests.
+- **Orden de tools determinista.** `stream-execute-tool-calls` iteraba
+  `tool-buf` con `maphash`, cuyo orden no está especificado por el estándar:
+  un lote de N tool-calls se ejecutaba en un orden distinto en cada corrida, y
+  un `read_file` seguido de un `write_file` podían invertirse. Ahora ordena por
+  índice, que es el único orden que el modelo significado.
+- **`promote-durable-facts` antes de `save-session`.** El orden inverso dejaba
+  `dumps/longterm-mem.lisp` un turno por detrás de los hechos del turno que
+  acababa de cerrar; con `run-one-shot` (un turno) se perdía la promoción
+  entera. Ahora se promueve y luego se vuelca.
+- **Guarda de tipo en `write-file`.** La validación de que `content` es string
+  vivía solo en el normalizador batch, así que la ruta de tools nativas podía
+  pasar un `hash-table` y `regex-replace-all` señalaba a mitad de la acción. La
+  guarda vive ahora en la acción, igual que la del `old_string` vacío.
+- **CI.** `.github/workflows/tests.yml` corre `./run-tests.sh` en cada push y PR.
+  El suite es offline por contrato, así que **no necesita ninguna clave de API**.
+  `run-tests.sh` instala Quicklisp en un temporal si no encuentra
+  `~/quicklisp/setup.lisp`, de modo que es autocontenido.
+- **El punto 25 (52 tests) está obsoleto**: son 108.
 
 **P2 — functionality**
 

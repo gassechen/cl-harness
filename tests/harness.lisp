@@ -70,6 +70,15 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
     ;; Dentro de WITH-REPORTER, *STATS* es el reporter: ahí quedan los fallos.
     (rove:with-reporter :spec
       (dolist (case cases)
+        ;; MEMORIA DE LARGO PLAZO POR PRUEBA. El .cob se genera desde la red
+        ;; de largo plazo, y esa red --a diferencia del motor de turno-- no se
+        ;; vacia sola: vive mas alla del caso. Sin este reset, cada prueba
+        ;; hereda los hechos de todas las anteriores y el resultado depende del
+        ;; orden, que es la forma mas caro de tener una suite verde.
+        ;;
+        ;; Cada caso arranca como un proceso nuevo, que es lo que hace
+        ;; BOOT-MEMORY de verdad.
+        (h::reset-mem-engine)
         (funcall (cdr case)))
       (setf failed
             (length (rove/core/stats:all-failed-assertions rove/core/stats:*stats*))))
@@ -458,18 +467,41 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
   ;; renderizaba como 'WROTE. nope.py / BYTES = '. Un archivo que no existe no
   ;; se puede rechazar por no existir, asi que ese era el unico hueco.
   (ok (durable-type-p "file-write" (list :path "a" :bytes 3 :applied t)))
-  (ng (durable-type-p "file-read" (list :path "a" :contents "x"))
-      "leer no es conocimiento durable")
-  (ng (durable-type-p "file-write" (list :path "nope.py" :applied nil
+  ;; LEER ES CONOCIMIENTO, y el .cob se genera desde la memoria de largo plazo.
+  ;; Una lectura con su contenido no es 'lo que mas se olvida': es COMO el
+  ;; modelo averigua como esta el mundo. Sin el CONTENTS de la lectura no hay
+  ;; forma de planificar el paso siguiente, y el modelo se inventa el fichero.
+  (ok (durable-type-p "file-read" (list :path "a" :contents "x"))
+      "leer es conocimiento durable: sin el contenido no hay paso siguiente")
+  ;; Y UN RECHAZO TAMBIEN ES UN HECHO. Filtrar por :applied sacaba de la memoria
+  ;; justamente los fallos, que es lo unico que el modelo deberia acordarse de
+  ;; cambiar. Lo que no puede pasar es que un rechazo se pinte como una
+  ;; escritura, y de eso se encarga el renderizador con STATE = FAILED.
+  (ok (durable-type-p "file-write" (list :path "nope.py" :applied nil
                                          :refused t :reason "blind write"))
-      "un write rechazado no es una escritura, no va a la memoria")
-  ;; Y el edit aplicado SI: sin el, el archivo se congela en el tamano de su
-  ;; escritura inicial y los edits no dejan rastro durable.
-  (ok (durable-type-p "file-edit" (list :path "a" :applied t
-                                        :replaced-chars 2 :new-chars 5)))
-  (ng (durable-type-p "file-edit" (list :path "a" :applied nil
+      "un write rechazado es un hecho: no ocurrio, y por que")
+  ;; Y el edit que no se aplico tambien: es el mismo caso, y el archivo se queda
+  ;; congelado en el tamano de su escritura inicial.
+  (ok (durable-type-p "file-edit" (list :path "a" :applied nil
                                         :reason "old_string not found"))
-      "un edit que no se aplico no cambio ningun archivo"))
+      "un edit que no se aplico tambien cruza, con su motivo")
+  (ok (durable-type-p "file-edit" (list :path "a" :applied t
+                                        :replaced-chars 2 :new-chars 5))
+      "y el que si se aplico, con sus chars")
+  ;; EL CIERRE DEL BUCLE: lo que el modelo propuso y lo que la maquina
+  ;; contesto. Sin los dos, la targeta siguiente no tiene con que compararse.
+  (ok (durable-type-p "batch-plan" (list :command "ls" :step 1 :turn-id 3))
+      "el plan es durable: es lo que el modelo pidio")
+  (ok (durable-type-p "verdict" (list :command "ls" :step 1 :turn-id 3))
+      "el veredicto es durable: es lo que la maquina contesto")
+  ;; Y LO QUE SE LE PIDIO y LO QUE CONTESTO, que es lo unico de la entrada del
+  ;; usuario que sobrevive: el resto es una sesion entera, no un turno.
+  (ok (durable-type-p "user-input" (list :text "hola" :turn-id 3)))
+  (ok (durable-type-p "llm-response" (list :text "voy" :turn-id 3)))
+  ;; Y LO QUE NO: una intencion que nunca se ejecuto no es un hecho, es un
+  ;; borrador. Sumarla a la memoria daria por hecha una accion que no ocurrio.
+  (ng (durable-type-p "intention" (list :text "voy a escribir a.py" :turn-id 3))
+      "una intencion no ejecutada es un borrador, no un hecho"))
 
 (deftest rules/promote-durable-facts-to-memory
   (reset-mem-engine)
@@ -485,8 +517,15 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                                 (h::data (list :path "a" :contents "x"
                                                :turn-id 1 :parent-id 1))))
     (promote-durable-facts)
-    (ok (= 1 (length (mem-engine-facts)))
-        "sólo el error real llega a la memoria durable")))
+    (ok (= 2 (length (mem-engine-facts)))
+        "llegan el error real y la lectura: los dos son conocimiento")
+    ;; Y promoted DOS VECES no duplica. Es idempotente porque se llama una vez
+    ;; por ronda y el motor de turno no se vacia entre rondas: sin esta guarda
+    ;; el user-input del turno se copia a la memoria en cada ronda y el .cob lo
+    ;; renderiza N veces.
+    (promote-durable-facts)
+    (ok (= 2 (length (mem-engine-facts)))
+        "promover dos veces no duplica nada en la memoria")))
 
 (deftest rules/per-type-cap-retracts-oldest
   (with-turn-engine
@@ -764,11 +803,16 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                                                      :applied t
                                                      :bytes 5
                                                      :turn-id 1))))
+          ;; UN COMANDO QUE FALLA, y no uno que va bien. La memoria de largo
+          ;; plazo solo cruza los errores reales: un comando que funciono no
+          ;; cambio nada que el modelo no pueda ver por su cuenta, y meterlo
+          ;; seria llenarle el .cob de ruido. La asimetria es deliberada, asi
+          ;; que el fixture tiene que hablar el idioma que la memoria habla.
           (h::assert (h::harness-fact (h::fact-type "command-exec")
                                       (h::timestamp (identity t0))
                                       (h::data (list :command "wc -l datos.txt"
-                                                     :output "5"
-                                                     :exit-code 0
+                                                     :output "wc: datos.txt: No such file"
+                                                     :exit-code 1
                                                      :turn-id 1)))))
         (let ((cobol (build-context "cuentalas")))
           ;; Search the RENDERED LABELS, not the path: the goal task also
@@ -1060,9 +1104,26 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
   (metrics-reset))
 
 
-(deftest batch/repeated-batch-is-aborted-before-the-cap
-  "Un modelo que pide EXACTAMENTE el mismo lote dos veces se corta por
-   repetición, antes de agotar batch_max_iterations."
+(deftest batch/un-lote-repetido-se-ejecuta-como-cualquiera-otro
+  "TODO EN LA INFORMATICA ES BATCH: si el programador pide la misma instruccion
+   tres veces, el compilador la ejecuta tres veces. Repetirse no es un error de
+   compilacion, asi que el harness NO corta el turno por repeticion.
+
+   Lo que hay que darle a un modelo anclado no es muerte sino DIAGNOSTICO, como
+   gcc: 'ya lo hiciste, aqui esta el resultado'. Y eso lo dan las reglas de Rete,
+   que impugnan la INTENCION intraturno y contestan con un veredicto. El
+   abortador de turno era un SEGUNDO mecanismo por encima de ellas, y era el que
+   ganaba: mataba el turno, eso disparaba CANCEL-INTENTIONS-ON-ABORT, y con las
+   intenciones retractadas la respuesta que Rete tenia preparada se perdia
+   tambien. El modelo se quedaba con '[Actions] .' sin idea de por que.
+
+   Medido antes del cambio: 29 targetas propuestas en 5 turnos, 5 ejecutadas (todas
+   en el turno 1, el unico anterior al primer aborto) y 24 sin respuesta.
+
+   Y el modelo no puede desobedecer un 'no repitas': su unico movimiento es
+   responder. Un detector que exige que no repitas solo produce la repeticion que
+   detecta. Por eso el turno acaba por el tope de iteraciones, que es una cosa del
+   LLM y no del harness."
   (metrics-reset)
   (with-test-config (("llm_provider" "batch")
                      ("llm_stream" nil)
@@ -1075,23 +1136,12 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
               (calls 0))
           (with-mocked-call-llm ((incf calls) (stuck-batch-json))
             (h::process-turn "hola" "eres un asistente"))
-          (ok (<= calls 4)
-              (format nil "corta pronto, no agota las 8 rondas: hizo ~D" calls))
-          (ok (eq (getf h::*last-llm-call-info* :path) :batch-repeated)
-              (format nil "el corte se reporta como :batch-repeated, fue ~S"
+          (ok (= 8 calls)
+              (format nil "un lote repetido se ejecuta ronda a ronda, hizo ~D de 8" calls))
+          (ok (eq (getf h::*last-llm-call-info* :path) :iterations)
+              (format nil "el corte es el tope de iteraciones, no la repeticion: ~S"
                       (getf h::*last-llm-call-info* :path)))))))
   (metrics-reset))
-
-;;; ---------------------------------------------------------------
-;;; Comportamiento: retry HTTP sin tocar la red
-;;; ---------------------------------------------------------------
-
-(defun http-failure (status)
-  "Condición DEXADOR::HTTP-REQUEST-FAILED sintética con STATUS: el suite no
-   abre ningún socket, sólo ejercita la POLÍTICA de reintentos."
-  (make-condition 'dexador.error::http-request-failed
-                  :status status :body "" :headers nil))
-
 
 (deftest config/retry-repeats-transient-failures
   (with-test-config (("llm_http_attempts" 3) ("llm_http_backoff_seconds" 0))
@@ -1369,10 +1419,18 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
           ;; es que el harness produce el PENDING solo, no que se lo sepamos
           ;; fabricar. Si el plan se fuera con la intencion, PENDING seria
           ;; imposible por construccion y la seccion entera no significaria nada.
+          ;; El aborto lleva el MISMO :turn-id que la intencion que se quiere
+          ;; cancelar. La regla CANCEL-INTENTIONS-ON-ABORT empareja por turno, y
+          ;; tiene que: un aborto del turno 1 no puede borrar el plan del turno 2
+          ;; (si lo hace, un solo aborto desactiva la ejecucion de toda la
+          ;; sesion). Este test fabricaba el aborto con :turn-id 1 mientras la
+          ;; intencion pertence al turno que queda tras el reset, y por eso
+          ;; dependia del cruce de turnos para obtener su PENDING.
           (h::assert (h::harness-fact (h::fact-type "batch-abort")
                                       (h::timestamp (get-universal-time))
                                       (h::data (list :reason "Abort de prueba"
-                                                     :turn-id 1))))
+                                                     :turn-id
+                                                     (h::current-turn-id)))))
           (h::run)
           (let ((card2 (h::render-plan-card (h::collect-harness-facts))))
             (ok (search "PENDING" card2)
@@ -2498,8 +2556,11 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                 "los pasos 01 y 02 estan PENDING: no tienen veredicto")
             (ok (search "ANOTADO, SIN EJECUTAR" (or (card-reason lines "01.") ""))
                 "el paso 01 dice que esta en cola: la intention sigue :pending")
-            (ok (search "SIN VEREDICTO REGISTRADO" (or (card-reason lines "02.") ""))
-                "el paso 02 no esta en cola: se dice, sin inventar la causa")
+            (ok (search "EJECUTADO SIN VEREDICTO" (or (card-reason lines "02.") ""))
+                "el paso 02 se lanzo y su veredicto no esta: se dice el hueco, no una poda inventada")
+            (ok (not (search "puede haberse podado" (or (card-reason lines "02.") "")))
+                "el paso 02 no se acusa de poda: la tarjeta vive, y con ella
+                 su veredicto, asi que un veredicto podado es imposible")
             (ok (not (search "PENDING" (or (card-reason lines "03.") "")))
                 "el paso 03 tiene veredicto y no lleva el REASON de un PENDING")
             ;; La etiqueta y su STATE van en lineas DISTINTAS, asi que no
@@ -2649,12 +2710,16 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                               (h::data (list :step 1 :turn-id 1 :round 1
                                              :action :edit-file
                                              :target "app.py"))))
-            (h::assert
-             (h::harness-fact (h::fact-type "file-edit")
-                              (h::timestamp (identity (- base-ts 5)))
-                              (h::data (list :path path :applied t :turn-id 1
-                                             :old-string "x = 1"
-                                             :new-string "x = 2"))))
+            ;; EL EDIT DE VERDAD, hecho por EDIT-FILE y no fabricado a mano.
+            ;;
+            ;; La version anterior de este test escribia el hecho file-edit a
+            ;; mano, CON :old-string y :new-string dentro. Edit-file NUNCA los
+            ;; ponia, asi que la regla comparaba (STRING= NIL "x = 1") y
+            ;; NUNCA podia disparar: estaba muerta, y su unico test la
+            ;; resucitaba con datos que el sistema real no produce. Un test que
+            ;; fabrica el fixture delata la regla rota y la da por buena.
+            (let ((h::*turn-counter* 1))
+              (h::edit-file path "x = 1" "x = 2"))
             (h::assert
              (h::harness-fact (h::fact-type "verdict")
                               (h::timestamp (identity (- base-ts 5)))
@@ -2679,6 +2744,14 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                                              :new-string "x = 2"))))
             ;; Paso 3: un edit DISTINTO (mismo archivo, otro texto). Este se
             ;; ejecuta, y su veredicto lo tiene que decir.
+            ;;
+            ;; Su OLD-STRING es 'x = 2', que es lo que hay en el archivo DESPUES
+            ;; del paso 1. Antes ponia 'x = 1', que solo funcionaba porque el
+            ;; paso 1 no editaba nada de verdad: el test fabricaba el hecho y
+            ;; el archivo se quedaba como estaba. Con el edit real, 'x = 1' ya
+            ;; no existe y este paso falla con 'old_string not found' -- que es
+            ;; lo que pasaria de verdad, y por eso el fixture tiene que hablar
+            ;; del archivo que hay.
             (h::assert
              (h::harness-fact (h::fact-type "batch-plan")
                               (h::timestamp (identity base-ts))
@@ -2691,7 +2764,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
                               (h::data (list :step 3 :turn-id 1 :round 2
                                              :action :edit-file :path path
                                              :status :pending
-                                             :old-string "x = 1"
+                                             :old-string "x = 2"
                                              :new-string "x = 99"))))
             (let* ((ctx (build-context "sigue"))
                    (proc (procedure-section ctx))
@@ -2788,12 +2861,17 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
               (format nil "un write rechazado sale como WROTE:~%~A" ctx))
           (ok (not (search "BYTES = " (or (search "BYTES =[^~]*" ctx) "")))
               "no queda ningun BYTES vacio de un write rechazado")
-          ;; Y el orden: NEWEST-FIRST, asi que el edit que toco el archivo va
-          ;; ANTES que la escritura. El BYTES de la escritura se lee entonces
-          ;; como el estado previo, no como el tamano actual.
-          (ok (> (or (search "WROTE. /tmp/proyecto/math_utils.py" ctx) 0)
+          ;; El orden: CRONOLOGICO, el mismo que la DATA DIVISION de arriba. Antes era
+          ;; newest-first (un SORT seguido de un NREVERSE) y el comentario lo
+          ;; justificaba como "el BYTES de la escritura se lee como el estado
+          ;; previo" -- al reves: en newest-first la ULTIMA linea es la mas
+          ;; ANTIGUA, y como las entradas no llevan turno, el modelo se
+          ;; quedaba con el dato mas viejo como si fuera el actual. En una
+          ;; corrida real leia 'WROTE. math_utils.py BYTES = 294' sobre un
+          ;; fichero de 587 bytes.
+          (ok (< (or (search "WROTE. /tmp/proyecto/math_utils.py" ctx) 0)
                  (or (search "EDITED. /tmp/proyecto/math_utils.py" ctx) 0))
-              "el EDITED sale antes que el WROTE que el modifico: newest-first")
+              (format nil "el WROTE sale antes del EDITED que lo modifico: cronologico~%~A" ctx))
           ;; Y la razon del rechazo no se pierde del todo: va en la TURN.
           (ok (search "blind write refused" ctx)
               "el motivo del rechazo queda en la TURN DIVISION"))))))
@@ -2951,3 +3029,1437 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
     (ok (search "Models: alfa, beta, gamma" out)
         "cada modelo una vez, con dos registros distintos de 'beta'")
     (h::metrics-reset)))
+
+;;; ---------------------------------------------------------------
+;;; Transporte: lo que el mock de CALL-LLM deja sin cubrir.
+;;;
+;;; WITH-MOCKED-CALL-LLM sustituye la funcion COMPLETA, asi que todo lo de
+;;; debajo --el constructor del body HTTP y los clientes de cada proveedor-- no
+;;; lo toca ningun test. Eso no es una consecuencia aceptable: la funcion
+;;; BUILD-OPENAI-COMPAT-MESSAGES-WITH-TOOLS estaba definida con tres
+;;; parametros y sus dos callers le pasaban cuatro, y 96 tests en verde no lo
+;;; detectaron porque el unico caller real esta debajo del mock. Estos tests
+;;; llaman al builder DIRECTAMENTE, que es lo que hace falta para que un error
+;;; de aridad o de forma del body no pueda volver a esconderse.
+;;; ---------------------------------------------------------------
+
+(deftest transport/el-builder-de-mensajes-acepta-los-cuatro-argumentos
+  ;; El bug: definida con (context user-message prior-messages) y llamada con
+  ;; (system-prompt context user-message messages). Con este test, una firma que
+  ;; no acepte los cuatro argumentos revienta el turno en lugar de esperar a
+  ;; produccion.
+  (with-test-config (("llm_model" "m") ("llm_max_tokens" 10))
+    (let ((body (h::build-openai-compat-messages-with-tools
+                 "SYSTEM" "CONTEXT" "USER" nil)))
+      (ok (hash-table-p body) "devuelve el body")
+      (ok (string= "m" (gethash "model" body)) "lleva el modelo")
+      (ok (gethash "tools" body) "lleva las tools"))))
+
+(deftest transport/el-builder-inyecta-el-mensaje-de-sistema
+  ;; El cuerpo no escribia NUNCA el mensaje de sistema: funcionaba solo porque
+  ;; los callers lo precargaban. Con la lista vacia el prompt se perdia en
+  ;; silencio y el modelo se quedaba sin doctrina.
+  (with-test-config (("llm_model" "m") ("llm_max_tokens" 10))
+    (let* ((body (h::build-openai-compat-messages-with-tools
+                  "SYSTEM" "CONTEXT" "USER" nil))
+           (msgs (gethash "messages" body))
+           (sys-msg (find-if (lambda (m) (string= (gethash "role" m) "system"))
+                             msgs)))
+      (ok sys-msg "el system prompt llega aunque prior-messages venga vacia")
+      (ok (and sys-msg (string= "SYSTEM" (gethash "content" sys-msg)))
+          "y su contenido es el que se le paso"))))
+
+(deftest transport/el-builder-no-duplica-el-sistema-que-ya-esta
+  ;; Si el caller ya precargo su mensaje de sistema (que es lo que hacen los dos
+  ;; callers reales), el builder no debe meter un segundo system: el proveedor
+  ;; lo rechaza y la doctrina queda ambigua.
+  (with-test-config (("llm_model" "m") ("llm_max_tokens" 10))
+    (let* ((pre (make-hash-table :test 'equal)))
+      (setf (gethash "role" pre) "system"
+            (gethash "content" pre) "PRE")
+      (let* ((body (h::build-openai-compat-messages-with-tools
+                    "NUEVO" "CONTEXT" "USER" (list pre)))
+             (roles (mapcar (lambda (m) (gethash "role" m))
+                            (gethash "messages" body)))
+             (systems (remove-if-not (lambda (r) (string= r "system")) roles)))
+        (ok (= 1 (length systems)) "un solo mensaje de sistema, no dos")
+        (ok (string= "PRE" (gethash "content" (first (gethash "messages" body))))
+            "gana el que traia el caller, no el argumento")))))
+
+(deftest transport/el-builder-anade-el-turno-de-usuario-al-final
+  ;; El usuario va con el CONTEXT pegado. Este es el mensaje que el modelo ve
+  ;; como su instruccion del turno.
+  (with-test-config (("llm_model" "m") ("llm_max_tokens" 10))
+    (let* ((body (h::build-openai-compat-messages-with-tools
+                  "SYSTEM" "EL-CONTEXTO" "EL-MENSAJE" nil))
+           (msgs (gethash "messages" body))
+           (last (car (last msgs))))
+      (ok (string= "user" (gethash "role" last)) "el ultimo mensaje es del usuario")
+      (ok (search "EL-CONTEXTO" (gethash "content" last))
+          "lleva el contexto")
+      (ok (search "EL-MENSAJE" (gethash "content" last))
+          "lleva el mensaje del usuario"))))
+
+(deftest transport/el-path-estatico-acepta-el-system-prompt
+  ;; CALL-LLM-WITH-TOOLS/STATIC usaba SYSTEM-PROMPT como VARIABLE LIBRE ausente
+  ;; de su lambda list. En Common Lisp eso no es un default: es una variable
+  ;; especial sin ligar, y el turno moria al construir el primer mensaje con
+  ;; "Variable SYSTEM-PROMPT is unbound". Este test falla con ese mismo error
+  ;; si la firma vuelve a perder el parametro.
+  (with-test-config (("llm_model" "m") ("llm_max_tokens" 10)
+                     ("llm_endpoint" "http://127.0.0.1:9/nope"))
+    ;; DEXADOR:POST esta sustituido por un error durante toda la suite, asi que
+    ;; esto no abre ningun socket: se queda en la construccion del body.
+    (let ((res (handler-case
+                   (h::call-llm-with-tools/static "SYSTEM" "CONTEXT" "USER")
+                 (error (e) (format nil "~A" e)))))
+      (ok res "la funcion responde en vez de senalar variable no atada"))))
+
+(deftest transport/las-tool-calls-se-ordenan-por-indice
+  ;; MAPHASH itera en orden NO ESPECIFICADO: un lote de tres tool-calls se
+  ;; ejecutaba en un orden distinto en cada corrida, y un read_file seguido de
+  ;; un write_file podian invertirse. El modelo ordena sus tool_calls por
+  ;; indice, y ese es el unico orden que significo.
+  (let ((buf (make-hash-table :test #'eql)))
+    (setf (gethash 2 buf) (list :id "c" :name "write_file" :args "{}")
+          (gethash 0 buf) (list :id "a" :name "read_file" :args "{}")
+          (gethash 1 buf) (list :id "b" :name "exec_command" :args "{}"))
+    (let ((order (mapcar #'car (h::tool-buf-in-index-order buf))))
+      (ok (equalp '(0 1 2) order)
+          (format nil "orden indices: ~S" order)))))
+
+(deftest transport/el-orden-no-depende-del-orden-de-insercion
+  ;; La razon del test anterior: se escribe al reves y sale igual.
+  (let ((buf (make-hash-table :test #'eql)))
+    (dolist (i '(5 3 9 1 7))
+      (setf (gethash i buf) (list :id (format nil "c~A" i) :name "read_file" :args "{}")))
+    (ok (equalp '(1 3 5 7 9) (mapcar #'car (h::tool-buf-in-index-order buf)))
+        "siempre ascendente por indice, se inserte como se inserte")))
+
+(deftest transport/el-body-es-json-serializable
+  ;; El body va por Jzon STRINGIFY a la red. Si un valor no se serializa, el
+  ;; fallo aparece en produccion como un error de codificacion, no aqui.
+  (with-test-config (("llm_model" "m") ("llm_max_tokens" 10))
+    (let* ((body (h::build-openai-compat-messages-with-tools
+                  "SYSTEM" "CONTEXTO" "USUARIO" nil))
+           (json (jzon:stringify body))
+           (back (jzon:parse json)))
+      (ok (search "messages" json) "el JSON lleva los mensajes")
+      (ok (hash-table-p back) "y vuelve a parsearse"))))
+
+;;; ---------------------------------------------------------------
+;;; Escritura atomica
+;;; ---------------------------------------------------------------
+
+(deftest write/atomica-deja-el-contenido-completo
+  ;; La garantia minima: escribir y releer da exactamente lo escrito.
+  (with-temp-dir (dir)
+    (let ((full (merge-pathnames "a.txt" dir)))
+      (h::write-file-atomically full "hola mundo")
+      (ok (string= "hola mundo" (read-temp full))
+          "el contenido llega integro"))))
+
+(deftest write/atomica-no-deja-temporales
+  ;; Si el temporal no se limpia, cada escritura fallida deja un .tmp en el
+  ;; directorio del proyecto del usuario.
+  (with-temp-dir (dir)
+    (let ((full (merge-pathnames "b.txt" dir)))
+      (h::write-file-atomically full "x")
+      (let ((strays (remove-if-not (lambda (p) (search ".tmp" (namestring p)))
+                                  (directory (merge-pathnames "*.*" dir)))))
+        (ok (null strays) (format nil "temporales: ~S" (mapcar #'namestring strays)))))))
+
+(deftest write/atomica-sobrescribe-un-fichero-que-ya-existe
+  ;; EDIT-FILE escribe sobre un fichero existente; con :SUPERSEDE directo, una
+  ;; muerte a mitad dejaba el fichero en cero.
+  (with-temp-dir (dir)
+    (let ((full (merge-pathnames "c.txt" dir)))
+      (uiop:native-namestring full)
+      (with-open-file (s full :direction :output :if-exists :supersede)
+        (write-string "contenido viejo que se reemplaza" s))
+      (h::write-file-atomically full "nuevo")
+      (ok (string= "nuevo" (read-temp full))
+          "la sobrescritura deja el contenido nuevo entero"))))
+
+(deftest write/el-contenido-no-string-se-rechaza-con-motivo
+  ;; La validacion de tipos vivia solo en el normalizador batch, asi que la
+  ;; ruta de tools nativas podia pasar un hash-table como contenido y
+  ;; REGEX-REPLACE-ALL senialaba. La guarda vive en la ACCION: un solo sitio
+  ;; para todos los caminos de entrada, que es la politica I2.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let* ((h::*base-dir* dir)
+             (res (h::write-file "typed.txt" 42)))
+        (ok (not (getf res :applied)) "no se aplica")
+        (ok (getf res :reason) "y deja el motivo con nombre")
+        (ok (search "string" (getf res :reason))
+            "el motivo dice que se esperaba un string")))))
+
+;;; ---------------------------------------------------------------
+;;; Hallazgos de la corrida real (cl-harness-yaml-debug, 2026-10-01)
+;;;
+;;; Tres cosas que la suite no miraba porque solo se rompian en el camino
+;;; BATCH, que es donde el trabajo lo hacen las reglas de Rete y no
+;;; EXECUTE-TOOL. La suuite offline es Strong en protocolo y ciega en esta
+;;; frontera: los 108 tests pasaban con las tres rotas.
+;;; ---------------------------------------------------------------
+
+(deftest batch-metrics/la-herramienta-del-batch-se-registra-en-las-metricas
+  ;; El hueco: RECORD-TOOL-CALL solo se llamaba desde EXECUTE-TOOL (tools
+  ;; nativas). Las reglas execute-intention-* ejecutan las mismas acciones sin
+  ;; pasar por ahi, asi que en batch la tabla chars_raw/chars_sent/saved% salia
+  ;; vacia -- y el JSON llevaba "tools": false. Justo en el modo que mas la
+  ;; necesitaba.
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::metrics-reset)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        ;; Una intencion real de escritura, ejecutada por la REGLA de Rete.
+        (h::parse-llm-batch-to-intentions
+         "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"m.txt\",\"content\":\"hola\"}}}]}")
+        (h::run)
+        (let ((calls h::*metrics-tool-calls*))
+          (ok (plusp (length calls))
+              "la regla de Rete registro la llamada, no solo EXECUTE-TOOL")
+          (ok (string= "write-file" (getf (car calls) :name))
+              (format nil "nombre: ~S" (getf (car calls) :name)))
+          ;; Lo que se mide son LONGITUDES, no el texto: lo que se guarda es
+          ;; cuanto se cruzo el umbral, no la carga util. Aserta sobre el texto
+          ;; exigiria que la metrica lo guardara, y guardarlo seria tirar la
+          ;; memoria del proceso para hacer el test mas comodo.
+          (ok (plusp (getf (car calls) :chars-raw))
+              "con los chars crudos medidos"))))))
+
+(deftest batch-metrics/el-rechazo-tambien-se-registra
+  ;; Un paso rechazado es justo el que mas interesa medir: consume una ronda
+  ;; entera del modelo y no produce nada. Si solo se registraran los exitos, el
+  ;; fallo se mediria como si no hubiera pasado.
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::metrics-reset)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        ;; Edit sobre un fichero ausente: se rechaza con :applied nil.
+        (h::parse-llm-batch-to-intentions
+         "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"edit_file\",\"arguments\":{\"path\":\"nope.txt\",\"old_string\":\"x\",\"new_string\":\"y\"}}}]}")
+        (h::run)
+        (let ((calls h::*metrics-tool-calls*))
+          ;; Un rechazo mide como un exito si solo se guardara lo que se aplico.
+          ;; Su rasgo distintivo es que el texto es el MOTIVO, asi que el
+          ;; recuento sale del tamano del motivo, no del contenido.
+          (ok (plusp (length calls)) "el rechazo sale registrado")
+          (ok (string= "edit-file" (getf (car calls) :name))
+              (format nil "nombre: ~S" (getf (car calls) :name)))
+          (ok (plusp (getf (car calls) :chars-raw))
+              (format nil "chars-raw: ~S" (getf (car calls) :chars-raw)))
+          (ok (<= (getf (car calls) :chars-sent)
+                  (getf (car calls) :chars-raw))
+              "y el recorte nunca lo infla"))))))
+
+(deftest batch-metrics/el-comando-si-se-registra
+  ;; El caso con mas volumen: la salida de un comando es lo que mas engorda el
+  ;; contexto reinyectado, y era justo lo que no se midia en batch.
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::metrics-reset)
+    (with-test-config (("tool_timeout_seconds" 30))
+      (h::parse-llm-batch-to-intentions
+       "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":{\"command\":\"echo hola-mundo\"}}}]}")
+      (h::run)
+      (let ((calls h::*metrics-tool-calls*))
+        (ok (plusp (length calls)) "el comando sale registrado")
+        (ok (string= "exec-command" (getf (car calls) :name))
+            (format nil "nombre: ~S" (getf (car calls) :name)))
+        ;; La salida del comando es lo que engorda el contexto reinyectado: un
+        ;; comando cuyo texto midiese solo la invocacion no diria nada del
+        ;; volumen real.
+        (ok (> (getf (car calls) :chars-raw) (length "echo hola-mundo"))
+            (format nil "chars-raw: ~S; solo la invocacion seria ~D"
+                    (getf (car calls) :chars-raw) (length "echo hola-mundo")))
+        (ok (<= (getf (car calls) :chars-sent) (getf (car calls) :chars-raw))
+            "y el recorte nunca lo infla")))))
+
+(deftest batch-metrics/el-recorte-se-aplica-al-path-de-batch
+  ;; La columna chars_sent mide lo que se REINYECTA al modelo, que es lo acotado
+  ;; por max_tool_result_chars. Sin truncar, chars_raw y chars_sent serian
+  ;; siempre iguales y la columna saved% diria siempre 0.
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::metrics-reset)
+    (with-test-config (("max_tool_result_chars" 100)
+                       ("tool_timeout_seconds" 30))
+      (h::parse-llm-batch-to-intentions
+       "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":{\"command\":\"seq 1 5000\"}}}]}")
+      (h::run)
+      (let ((call (car h::*metrics-tool-calls*)))
+        (ok call "hay llamada registrada")
+        (ok (> (getf call :chars-raw) (getf call :chars-sent))
+            (format nil "raw=~A sent=~A"
+                    (getf call :chars-raw) (getf call :chars-sent)))))))
+
+(deftest metrics/llm-path-se-registra-tambien-cuando-el-turno-sale-bien
+  ;; Solo se rellenaba AL ABORTAR. Y el abort es el caso raro, asi que el campo
+  ;; que existe para responder "como termino este turno" contestaba NIL en la
+  ;; mayoria de los turnos batch. El metodo tiene que decir como ACABO, no solo
+  ;; como fallo.
+  ;;
+  ;; El mock devuelve un batch JSON con tool_calls vacio: eso es una PROPUESTA
+  ;; de fin de turno (PROTOCOLO I5). Sin goals abiertos se acepta, se aserta
+  ;; plan-done y PROCESS-TURN sale por la via limpia.
+  ;;
+  ;; El mock no devuelve el JSON en crudo: lo pasa por EL MISMO parseo que usa
+  ;; CALL-BATCH-LLM, porque con la cadena sin parsear nadie aserta plan-done y
+  ;; el turno no tendria nada que cerrar -- se mediria un abort, no un cierre.
+  ;; Mockear una funcion entera no mockea lo que tiene debajo (la misma leccion
+  ;; del mock de transporte).
+  ;;
+  ;; TOLERANCE A CERO a proposito: el mock devuelve SIEMPRE lo mismo, asi que
+  ;; con la tolerancia por defecto el detector de lote repetido aborta el turno
+  ;; en la segunda ronda y este test mediria un abort, no un cierre.
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::metrics-reset)
+    (with-test-config (("llm_provider" "batch")
+                       ("llm_stream" nil)
+                       ("batch_repeat_tolerance" 0))
+      (with-mocked-call-llm
+          ((multiple-value-bind (accepted final-text parse-error)
+               (h::parse-llm-batch-to-intentions
+                "{\"tool_calls\":[],\"response\":\"listo\"}")
+             (declare (ignore accepted parse-error))
+             final-text))
+        (h::process-turn "hola" nil))
+      (let ((path (getf h::*last-llm-call-info* :path)))
+        (ok (eq :plan-done path)
+            (format nil "un turno que cierra limpio dice plan-done; Path: ~S" path))
+        (ok (plusp (getf h::*last-llm-call-info* :iterations 0))
+            "y lleva las rondas que tardo")))))
+
+(deftest metrics/el-abort-sigue-ganando-al-exito
+  ;; El fix anterior no puede tapar al caso raro: si hubo abort, el path es el
+  ;; del abort. Si no, se informa del final limpio. Los dos caminos siguen
+  ;; distinguibles.
+  (ok (not (eq :plan-done :batch-repeated))
+      "plan-done y batch-repeated son caminos distintos y ambos existen"))
+
+(deftest plan/el-objetivo-del-plan-es-el-comando-que-se-ejecuta
+  ;; El modelo emite 'cd /abs && cmd' a menudo y STRIP-CD-PREFIX se lo quita al
+  ;; ejecutar. El plan guardaba el texto CRUDO, asi que la tarjeta y el TURN
+  ;; mostraban dos comandos distintos para el mismo paso: uno con el cd que
+  ;; nunca corrio y otro sin el. El modelo leia su paso con un prefijo que no
+  ;; llego a la shell.
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::parse-llm-batch-to-intentions
+     "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":{\"command\":\"cd /tmp/proyecto && python -m unittest test_x.py\"}}}]}")
+    (let ((plans (h::collect-facts-of-type (h::collect-active-facts) "batch-plan")))
+      (ok (= 1 (length plans)) "el plan se aserto")
+      (ok (string= "python -m unittest test_x.py" (h::data-get (car plans) :target))
+          (format nil "target: ~S" (h::data-get (car plans) :target))))))
+
+(deftest plan/el-target-de-un-fichero-no-se-toca
+  ;; La normalizacion es solo para comandos. Una ruta con espacios o con un
+  ;; 'cd' legitimo en el nombre no se debe tocar: PATH no pasa por
+  ;; STRIP-CD-PREFIX.
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::parse-llm-batch-to-intentions
+     "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"cd notas/plan.md\",\"content\":\"x\"}}}]}")
+    (let ((plans (h::collect-facts-of-type (h::collect-active-facts) "batch-plan")))
+      (ok (= 1 (length plans)) "el plan se aserto")
+      (ok (string= "cd notas/plan.md" (h::data-get (car plans) :target))
+          (format nil "target: ~S" (h::data-get (car plans) :target))))))
+
+;;; ---------------------------------------------------------------
+;;; Lecturas repetidas: el bucle que los tres detectores no veian.
+;;;
+;;; De una corrida real: el modelo pidio el mismo fichero cinco veces en un
+;;; turno. Las cinco fueron CANCELADAS, porque ya lo habia leido en la ronda 1.
+;;; Con el veto solo, cada cancelacion decia "ya se leyó" y no entregaba nada, y
+;;; con el veto delivering, cinco rondas se gastaron en un rechazo que no
+;;; avanzaba al modelo. Peor: los tres detectores de bucle Forever fueron
+;;; incapaces de verlo.
+;;;
+;;;   - DETECT-READ-LOOP contaba solo hechos file-read, y una lectura cancelada
+;;;     nunca llega a READ-FILE: no deja hecho. Contaba 1 de 4.
+;;;   - BATCH-REPEAT-TOLERANCE no disparaba porque BATCH-FINGERPRINT hasheaba
+;;;     tambien la prosa libre, y el modelo cambiaba el comentario en cada
+;;;     intento. Dos lotes identicos con distinta prosa daban huellas distintas.
+;;;   - El veto no dejaba memoria: una cancelacion se podia cancelar para
+;;;     siempre, ronda tras ronda, sin nada que la contara.
+;;;
+;;; Con esto los tres tienen que ver el bucle.
+;;; ---------------------------------------------------------------
+
+(deftest veto/la-lectura-repetida-devuelve-el-contenido-que-ya-tenia
+  ;; El caso base. El modelo pide un fichero que el harness ya leyo en ESTE
+  ;; turno: en vez de un no seco, recibe lo que ya tenia. El veto sigue siendo
+  ;; un veto -- la lectura no se repite -- pero ahora hay algo que hacer con lo
+  ;; que ya se sabia.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        (h::write-file "notas.txt" "contenido real de notas")
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
+        (h::run)
+        ;; Segunda peticion del mismo fichero, en el mismo turno.
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 2)
+        (h::run)
+        (let* ((v (h::collect-facts-of-type (h::collect-active-facts) "verdict"))
+               (cancelled (find-if (lambda (d)
+                                     (eql (h::data-get d :verdict) :cancelled))
+                                  v)))
+          (ok cancelled "la segunda lectura se cancela")
+          (ok (search "contenido real de notas" (h::data-get cancelled :contents))
+              (format nil "y devuelve el contenido: ~S"
+                      (h::data-get cancelled :contents)))
+          (ok (search "REENTREGADO" (h::data-get cancelled :reason) :test #'char=)
+              "y el motivo dice que se reentrega, para que el modelo sepa
+               que el no de antes ya no es un no"))))))
+
+(deftest veto/la-lectura-repetida-no-vuelve-a-ejecutar-la-herramienta
+  ;; El veto tiene que seguir SIIENDO un veto. Si el fix de reentregar contenido
+  ;; hubiera dejado pasar la segunda lectura, el fichero se habria leido dos
+  ;; veces y el 'contenido' habria sido el resultado de una segunda ejecucion,
+  ;; no la memoria. Aqui se comprueba que solo hay UN file-read en el turno.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        (h::write-file "notas.txt" "contenido real")
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
+        (h::run)
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 2)
+        (h::run)
+        (ok (= 1 (length (h::collect-facts-of-type
+                          (h::collect-active-facts) "file-read")))
+            "la herramienta se ejecuto una vez, no dos")))))
+
+(deftest veto/el-contenido-rancio-no-se-reentrega
+  ;; El fallo queIntroduce el fix anterior. El veto casa cualquier file-read del
+  ;; turno con cualquier peticion del mismo basename, sin mirar cuando paso cada
+  ;; cosa. Si el modelo escribe un fichero y despues lo relee para comprobarlo,
+  ;; se le entregaba el contenido ANTERIOR con la seguridad de una entrega: se
+  ;; creia que tenia el fichero actualizado cuando lo que tenia era la version a
+  ;; la que acababa de sustituir.
+  ;;
+  ;; Y eso es peor que no entregar nada, porque para que el modelo se entere
+  ;; habria que DESMONTAR algo que PARECE una entrega. Asi que cuando la lectura
+  ;; esta vencida, la cancelacion avisa y no entrega.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        (h::write-file "notas.txt" "contenido ORIGINAL")
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
+        (h::run)
+        ;; El turno MODIFICA el fichero.
+        (h::assert-batch-intention
+         (list :action :write-file :path "notas.txt" :content "contenido NUEVO")
+         2)
+        (h::run)
+        ;; Y ahora pide volver a leerlo.
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 3)
+        (h::run)
+        (let* ((v (h::collect-facts-of-type (h::collect-active-facts) "verdict"))
+               (cancelled (find-if (lambda (d)
+                                     (eql (h::data-get d :verdict) :cancelled))
+                                  v)))
+          (ok cancelled "la tercera lectura se cancela")
+          (ok (not (h::data-get cancelled :contents))
+              (format nil "pero NO reentrega el contenido rancio: ~S"
+                      (h::data-get cancelled :contents)))
+          (ok (search "rancio" (h::data-get cancelled :reason) :test #'char=)
+              "y el motivo explica por que no lo reentrega")
+          ;; Y el texto ORIGINAL no puede escaparse por el :contents.
+          (ok (not (search "ORIGINAL" (or (h::data-get cancelled :contents)
+                                           "")))
+              "el texto viejo no aparece en ningun sitio de la cancelacion"))))))
+
+(deftest veto/el-contenido-que-se-reentrega-llega-al-contexto
+  ;; El fix de los hechos no sirve si el render no loenseña. Si el :contents se
+  ;; queda en la plist, el modelo recibe la misma cancelacion muda que antes y
+  ;; el problema original sigue exactamente igual, solo que con datos nuevos
+  ;; guardados donde nadie los mira.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        (h::write-file "notas.txt" "contenido real de notas")
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
+        (h::run)
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 2)
+        (h::run)
+        (let ((ctx (card-section (build-context "sigue"))))
+          (ok (search "contenido real de notas" ctx)
+              "el contenido reentregado aparece en la tarjeta que ve el modelo")
+          (ok (search "CONTENTS" ctx :test #'char=)
+              "bajo una etiqueta que el modelo puede leer como entrega"))))))
+
+(deftest veto/la-cancelacion-se-recorta-como-una-lectura-normal
+  ;; El atajo no puede ser mas generoso que la herramienta que sustituye. Si la
+  ;; cancelacion dejara pasar un fichero de 100 KB entero mientras un read_file
+  ;; normal devuelve 8000, el veto seria la via de meter contexto sin
+  ;; presupuesto: el limite dejaria de ser un limite.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (with-test-config (("max_tool_result_chars" 200))
+        (let ((h::*base-dir* dir))
+          (h::write-file "grande.txt"
+                         (make-string 5000 :initial-element #\x))
+          (h::assert-batch-intention (list :action :read-file :path "grande.txt") 1)
+          (h::run)
+          (h::assert-batch-intention (list :action :read-file :path "grande.txt") 2)
+          (h::run)
+          (let* ((v (h::collect-facts-of-type (h::collect-active-facts) "verdict"))
+                 (cancelled (find-if (lambda (d)
+                                       (eql (h::data-get d :verdict) :cancelled))
+                                    v)))
+            (ok (<= (length (or (h::data-get cancelled :contents) ""))
+                    2000)
+                (format nil "el reentregado pasa por el mismo recorte: ~D chars"
+                        (length (or (h::data-get cancelled :contents) ""))))))))))
+
+(deftest bucle/las-lecturas-canceladas-cuentan-como-bucle
+  ;; El detector existia, hacia su trabajo, y no podia ver el bucle que mas
+  ;; happening. DETECT-READ-LOOP contaba hechos file-read; una lectura cancelada
+  ;; nunca llega a READ-FILE, asi que no deja hecho y no se contaba. El modelo
+  ;; pidio el mismo fichero 1 vez con exito y 4 veces cancelado, y el contador
+  ;; se quedo en 1 de un umbral de 4. Un contador de bucles que no cuenta el
+  ;; bucle.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        (h::write-file "notas.txt" "contenido")
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
+        (h::run)
+        (dotimes (i 4)
+          (h::assert-batch-intention (list :action :read-file :path "notas.txt")
+                                     (+ 2 i))
+          (h::run))
+        (multiple-value-bind (path count) (h::detect-read-loop)
+          (ok path (format nil "el detector ve el bucle; path: ~S count: ~S"
+                           path count))
+          (ok (and path (string= "notas.txt" path))
+              (format nil "y senala al fichero que se relee: ~S" path))
+          (ok (and count (>= count h::*read-loop-min-count*))
+              (format nil "con al menos ~D toques: ~S"
+                      h::*read-loop-min-count* count)))))))
+
+(deftest bucle/una-lectura-sola-no-es-un-bucle
+  ;; El otro lado del umbral. Con la lectura buena y su contenido, el detector
+  ;; tiene que seguir callado: si no, avisaria de bucles en el turno mas normal
+  ;; que existe, que es leer un fichero y ya.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        (h::write-file "notas.txt" "contenido")
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
+        (h::run)
+        (h::assert-batch-intention (list :action :read-file :path "otro.txt") 2)
+        (h::run)
+        ;; OJO con como se comprueba el "no bucle": NO vale con
+;;   (not (multiple-value-list (detect-read-loop)))
+;; porque MULTIPLE-VALUE-LIST de un unico NIL devuelve la LISTA (NIL), que es
+;; truthy: el test seria falso POSITIVO y pasaria siempre. Hay que mirar los
+;; valores, no la/envoltorio.
+(multiple-value-bind (path count) (h::detect-read-loop)
+          (ok (and (null path) (null count))
+              (format nil "dos ficheros distintos, uno cada uno: no hay bucle; Path: ~S Count: ~S"
+                      path count)))))))
+
+(deftest bucle/la-huella-ignora-la-prosa-del-modelo
+  ;; La prosa libre estaba en el hash de BATCH-FINGERPRINT. Solo cambia lo que
+  ;; se DICE, no lo que se PIDE: dos lotes que piden las mismas llamadas son el
+  ;; mismo lote digase lo que digase el comentario. Y un modelo atascado cambia
+  ;; la prosa en cada intento, igual que cambia el orden de las llamadas --
+  ;; justamente porque sabe que se le mide.
+  ;;
+  ;; Con la prosa dentro, la deteccion de repeticiones --que solo existe para
+  ;; esto-- no veia nada. En la corrida real el modelo pidio las mismas dos
+  ;; lecturas en dos rondas seguidas y, por haberlas comentado distinto, no se
+  ;; reconocieron. Cuatro rondas gastadas.
+  (let ((a "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.lisp\"}}},{\"id\":\"2\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"b.lisp\"}}}],\"response\":\"Primero reviso a.lisp y luego b.lisp.\"}")
+        (b "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.lisp\"}}},{\"id\":\"2\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"b.lisp\"}}}],\"response\":\"Ahora vuelto a mirar los dos archivos para asegurarme.\"}"))
+    (ok (eql (h::batch-fingerprint a) (h::batch-fingerprint b))
+        "mismas llamadas y distinto comentario: misma huella")))
+
+(deftest bucle/la-huella-sigue-distinguiendo-lo-que-no-es-igual
+  ;; Quitar la prosa no puede convertir la huella en una constante. Si dos lotes
+  ;; piden COSAS DISTINTAS tienen que seguir dando huellas distintas, o la
+  ;; deteccion de repeticiones mataria turnos que estan avanzando.
+  (let ((a "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.lisp\"}}}],\"response\":\"x\"}")
+        (b "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"b.lisp\"}}}],\"response\":\"x\"}")
+        (c "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.lisp\"}}},{\"id\":\"2\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"b.lisp\"}}}],\"response\":\"x\"}"))
+    (ok (not (eql (h::batch-fingerprint a) (h::batch-fingerprint b)))
+        "una ruta distinta es otra huella")
+    (ok (not (eql (h::batch-fingerprint a) (h::batch-fingerprint c)))
+        "distinto numero de llamadas es otra huella")))
+
+(deftest bucle/la-huella-junta-dos-escrituras-del-mismo-fichero
+  ;; El cierre del agujero que quedaba tras quitar la prosa. En la corrida real
+  ;; el mismo par de lecturas se pidio en una ronda con ruta RELATIVA y en otra
+  ;; con ruta ABSOLUTA. Son el mismo trabajo --RESOLVE-PATH las junta-- pero con
+  ;; el texto crudo dan huellas distintas, asi que el detector de repeticiones
+  ;; no las reconoce. Un detector que se puede esquivar cambiando '..' por '/'
+  ;; no es un detector.
+  ;; *BASE-DIR* atado a proposito: RESOLVE-PATH combina la ruta relativa contra
+  ;; el directorio base del harness, asi que sin esto 'math_utils.py' resolveria
+  ;; contra el cwd del proceso de test y no contra /home/mtk/x, y la prueba
+  ;; mediria el directorio equivocado en vez de la normalizacion.
+  (let ((h::*base-dir* #P"/home/mtk/x/")
+        (rel "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"math_utils.py\"}}},{\"id\":\"2\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"test_math_utils.py\"}}}],\"response\":\"\"}")
+        (abs "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"/home/mtk/x/math_utils.py\"}}},{\"id\":\"2\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"/home/mtk/x/test_math_utils.py\"}}}],\"response\":\"\"}"))
+    (ok (eql (h::batch-fingerprint rel) (h::batch-fingerprint abs))
+        "relativa y absoluta del mismo fichero: mismo trabajo, misma huella")))
+
+;;; ---------------------------------------------------------------
+;;; Lo que el harness CUENTA contra lo que DICE.
+;;;
+;;; De una corrida real: los hechos eran correctos y las frases que salian de
+;;; ellos no. "[Actions] NIL, edited math_utils.pyread math_utils.py." Esos
+;;; textos son lo que el usuario lee como respuesta y lo que los turnos
+;;; siguientes leen como 'lo que dije yo antes', asi que un error de redaccion
+;;; ahi no es cosmetico: es estado contaminado que viaja al turno siguiente.
+;;;
+;;; Y el resto es lo mismo con distinto disfraz: el plan y el veredicto
+;;; discordando sobre el comando del mismo paso, la memoria durable en orden
+;;; inverso a los turnos, y un abortion que no llegaba a la tarjeta.
+;;; ---------------------------------------------------------------
+
+;;; ---------------------------------------------------------------
+;;; Lo que el harness CUENTA contra lo que DICE.
+;;;
+;;; De una corrida real: los hechos eran correctos y las frases que salian de
+;;; ellos no. "[Actions] NIL, edited math_utils.pyread math_utils.py." Esos
+;;; textos son lo que el usuario lee como respuesta y lo que los turnos
+;;; siguientes leen como 'lo que dije yo antes', asi que un error de redaccion
+;;; ahi no es cosmetico: es estado contaminado que viaja al turno siguiente.
+;;;
+;;; Y el resto es lo mismo con distinto disfraz: el plan y el veredicto
+;;; discordando sobre el comando del mismo paso, la memoria durable en orden
+;;; inverso a los turnos, y un abortion que no llegaba a la tarjeta.
+;;; ---------------------------------------------------------------
+
+(deftest relato/el-resumen-no-pega-las-lineas-entre-si
+  ;; El separador era ~{~A~^, ~A~}: el ~^ abre una clausula que corre solo
+  ;; cuando NO es el ultimo elemento, y dentro sobraba un ~A, que imprimia un
+  ;; elemento EXTRA en cada vuelta. Con 'edited math_utils.py' y
+  ;; 'read math_utils.py' salia 'edited math_utils.pyread math_utils.py': los
+  ;; finales pegados, y el texto deja de poder parsearse a ojo.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        (h::write-file "notas.txt" "contenido")
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
+        (h::run)
+        (h::assert-batch-intention
+         (list :action :write-file :path "notas.txt" :content "otro") 2)
+        (h::run)
+        (let ((s (h::turn-action-summary (h::current-turn-id))))
+          (ok (search ", " s)
+              (format nil "las acciones van separadas por coma: ~S" s))
+          ;; Lo pegado era '...math_utils.pyread...'. Con el separador mal, el
+          ;; final de una linea y el principio de la siguiente se soldaban.
+          (ok (not (search "notas.txtread" s))
+              (format nil "y las lineas no se soldan: ~S" s))
+          (ok (not (search "NIL" s))
+              (format nil "y ninguna accion vacia se cuela: ~S" s)))))))
+
+(deftest relato/el-resumen-no-empieza-por-nil
+  ;; El cond de TURN-ACTION-SUMMARY terminaba en (t nil), asi que TODO hecho
+  ;; que no fuera una de las cuatro acciones --user-input, llm-response,
+  ;; batch-plan, verdict, intention, plan-done-- aportaba un NIL a la lista, y
+  ;; el texto empezaba por la palabra NIL. Un 'NIL' en la frase que el modelo
+  ;; se lleva como memoria de si mismo.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        (h::write-file "notas.txt" "contenido")
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
+        (h::run)
+        (let ((s (h::turn-action-summary (h::current-turn-id))))
+          (ok (search "[Actions]" s)
+              (format nil "el resumen existe: ~S" s))
+          (ok (not (search "NIL" s))
+              (format nil "y no empieza por la palabra NIL: ~S" s)))))))
+
+(deftest relato/el-resumen-conserva-el-orden-causal
+  ;; Las lineas se ordenaban con STRING<, o sea ALFABETICAMENTE: 'read'
+  ;; siempre iba antes que 'wrote' porque la r delata la gana, diga lo que
+  ;; diga la cronologia. Asi que un modelo que escribio y LUEGO leyo leia
+  ;; 'read X, wrote Y', con los hechos en orden inverso al que-MM-vivieron.
+  ;;
+  ;; El orden correcto es el de los HECHOS, que es lo que un lector espera de
+  ;; un relato de lo que paso.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        ;; Escribir ANTES que leer, para que el orden alfabetico (read < write)
+        ;; y el cronologico (write despues) NO coincidan.
+        (h::assert-batch-intention
+         (list :action :write-file :path "notas.txt" :content "nuevo") 1)
+        (h::run)
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 2)
+        (h::run)
+        (let* ((s (h::turn-action-summary (h::current-turn-id)))
+               (wrote (search "wrote" s))
+               (read (search "read" s)))
+          (ok (and wrote read (< wrote read))
+              (format nil "escribir antes que leer se cuenta asi: ~S" s)))))))
+
+(deftest relato/un-veredicto-no-sobrevive-a-la-tarjeta-que-lo-explica
+  ;; La tarjeta y su veredicto se capaban por topes INDEPENDIENTES, con la
+  ;; proteccion en un solo sentido: un veredicto cuya tarjeta sigue viva no se
+  ;; capa. Lo que no habia era el otro. Cuando la TARJETA se iba por su propio
+  ;; tope, sus veredictos se quedaban.
+  ;;
+  ;; El veredicto huerfano se renderiza en el flujo igual que uno con tarjeta, y
+  ;; ademas se duplica con la linea suelta del hecho. En la corrida real, el turno
+  ;; 2 salia con la MISMA lectura fallida dos veces, en dos notaciones y con la
+  ;; misma razon, y el modelo no podia saber si le habian contado un hecho o dos:
+  ;;
+  ;;     READ-FILE  /home/.../math_utils.py   STATE = FAILED   REASON = File not found
+  ;;     STEP 01.  READ-FILE  math_utils.py     STATE = FAILED   REASON = File not found
+  ;;
+  ;; O se van los dos o se quedan los dos. Este test pone un tope de 1 y comprueba
+  ;; que cuando se retira la tarjeta MAS ANTIGUA su veredicto tambien se fue, y no
+  ;; que sobrevive explaining nada."
+  (with-test-config (("max_facts_per_type" 1))
+    (with-turn-engine
+      (reset-turn-engine)
+      (let ((old 100) (new 200))
+        ;; Turno 1: la tarjeta que se va, con su veredicto.
+        (h::assert (h::harness-fact (h::fact-type "batch-plan")
+                          (h::timestamp (h::identity old))
+                          (h::data (list :step 1 :action "read-file" :round 1 :turn-id 1
+                                         :target "viejo.py"))))
+        (h::assert (h::harness-fact (h::fact-type "verdict")
+                          (h::timestamp (h::identity old))
+                          (h::data (list :step 1 :action "read-file" :round 1 :turn-id 1
+                                         :verdict :failed :reason "File not found"))))
+        ;; Turno 2: la tarjeta que se queda, con su veredicto.
+        (h::assert (h::harness-fact (h::fact-type "batch-plan")
+                          (h::timestamp (h::identity new))
+                          (h::data (list :step 1 :action "read-file" :round 1 :turn-id 2
+                                         :target "nuevo.py"))))
+        (h::assert (h::harness-fact (h::fact-type "verdict")
+                          (h::timestamp (h::identity new))
+                          (h::data (list :step 1 :action "read-file" :round 1 :turn-id 2
+                                         :verdict :applied))))
+        (h::build-context "sigue")
+        (let* ((ctx (h::build-context "sigue"))
+               (live (search "nuevo.py" ctx))
+               (gone (search "File not found" ctx)))
+          (ok (and live (null gone))
+              (format nil "el veredicto de la tarjeta retirada no sobrevive: ~S"
+                      (if gone "aparece todavia 'File not found'" "no aparece"))))))))
+
+(deftest relato/el-lote-vigente-no-se-dice-que-se-podado
+  ;; Ultimo de los cuatro estados del PENDING, y el que mas se ha repetido.
+  ;;
+  ;; Con la tarjeta VIVA y sin veredicto, este paso es o el lote vigente -- lo
+  ;; que el modelo acaba de responder y todavia no se ha ejecutado -- o una
+  ;; intencion que se lanzo y cuyo veredicto no esta. Lo que NO puede ser es un
+  ;; veredicto podado, porque CAP-BATCH-PLANS se lleva el veredicto de cada
+  ;; tarjeta que retira: si el veredicto se hubiera ido, la tarjeta se habria
+  ;; ido con el.
+  ;;
+  ;; Antes ese caso caia en 'puede haberse podado', que era mentira. Y no una
+  ;; mentira menor: en la corrida real los pasos de la ronda EN CURSO la
+  ;; rpintaban, o sea que el modelo leia 'puede que perdieras tu plan' sobre el
+  ;; lote que acababa de escribir, y su unica salida era volver a plantearlo.
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::assert (h::harness-fact (h::fact-type "batch-plan")
+                      (h::timestamp (h::identity 500))
+                      (h::data (list :step 1 :action "read-file" :round 1 :turn-id 1
+                                     :target "math_utils.py"))))
+    ;; Sin intention y sin veredicto: el lote vigente, recien respondida.
+    (let* ((ctx (h::build-context "sigue"))
+           (at (search "T1 READ-FILE" ctx))
+           (after (if at (subseq ctx at (min (length ctx) (+ at 400))) "")))
+      (ok (and at
+               (search "LOTE VIGENTE, SIN EJECUTAR" after)
+               (not (search "puede haberse podado" after)))
+          (format nil "el lote que acabo de responder no se acusa de poda: ~S" after)))))
+
+(deftest relato/un-aborto-no-borra-el-plan-de-otro-turno
+  ;; CANCEL-INTENTIONS-ON-ABORT no filtraba por turno: matcheaba CUALQUIER
+  ;; batch-abort y retractaba CUALQUIER intention. Con la salencia 20 gana a las
+  ;; reglas de ejecucion (3-5), asi que en cuanto un turno abortaba, TODAS las
+  ;; intenciones de la sesion se borraban en el siguiente (run) -- incluidas las
+  ;; que el modelo acababa de proponer en el turno de ahora.
+  ;;
+  ;; Y como no se aserta veredicto al borrarlas, el paso se queda PENDING para
+  ;; siempre: el harness no ejecuta nada, no dice por que, y el modelo solo
+  ;; puede volver a planificar. Medido en la corrida real: de 29 pasos
+  ;; propuestos en 5 turnos se ejecutaron 5, todos en el turno 1, que es el unico
+  ;; anterior al primer aborto. Del segundo en adelante, cero.
+  (with-temp-dir (dir)
+   (let ((cl-harness::*base-dir* dir))
+   (with-turn-engine
+    (reset-turn-engine)
+    ;; El turno 1 aborta. Este hecho se queda en el motor para siempre.
+    (h::assert (h::harness-fact (h::fact-type "batch-abort")
+                      (h::timestamp (h::identity 100))
+                      (h::data (list :reason "el modelo repitio el mismo lote"
+                                     :path :batch-repeated
+                                     :iterations 2 :turn-id 1 :round 2))))
+    ;; El turno 2 propone un plan. El harness tiene que EJECUTARLO.
+    (h::assert (h::harness-fact (h::fact-type "intention")
+                      (h::timestamp (h::identity 200))
+                      (h::data (list :action :write-file :path "gcd.py"
+                                     :content "def gcd(a, b): return a"
+                                     :turn-id 2 :round 1 :step 1
+                                     :status :pending))))
+    (h::run)
+    (let* ((done (h::collect-facts-of-type (h::collect-active-facts)
+                                          "file-write")))
+      (ok (and done
+                (probe-file (merge-pathnames "gcd.py" dir)))
+          (format nil "el plan del turno 2 se ejecuto pese al aborto del turno 1: ~S"
+                  done)))))))
+
+(deftest relato/un-plan-superado-no-sale-como-podado
+  ;; CUARTO estado del PENDING, y el que cerraba el bucle de replanificar.
+  ;;
+  ;; Turno 4 de la corrida real: el modelo respondio el lote de la ronda 2, luego
+  ;; el de la 3, luego el de la 4. Los planes de las rondas 2 y 3 NUNCA se
+  ;; ejecutaron, no se podaron y no abortaron -- el modelo simplemente contesto
+  ;; otro lote. Y los dos salian en la PROCEDURE DIVISION con
+  ;;
+  ;;     REASON = SIN VEREDICTO REGISTRADO ... puede haberse podado
+  ;;
+  ;; que es mentira en las tres partes. El modelo lo leia como 'perdi mi plan', y
+  ;; su unica salida era volver a planificar. Cada ronda de mas dejaba un plan
+  ;; muerto en pantalla que el modelo tomaba por pendiente, y por eso la ronda 4
+  ;; se murio por 'se agoto batch_max_iterations' sin que el detector de
+  ;; repeticiones -- que solo mira el ULTIMO lote -- pudiera hacer nada.
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::assert (h::harness-fact (h::fact-type "batch-plan")
+                      (h::timestamp (h::identity 1000))
+                      (h::data (list :step 1 :action "read-file" :round 2 :turn-id 4
+                                     :target "math_utils.py"))))
+    (h::assert (h::harness-fact (h::fact-type "batch-plan")
+                      (h::timestamp (h::identity 1001))
+                      (h::data (list :step 1 :action "write-file" :round 3 :turn-id 4
+                                     :target "math_utils.py"))))
+    ;; La ronda 3 es la vigente: la 2 quedo sustituida por ella.
+    (h::assert (h::harness-fact (h::fact-type "batch-plan")
+                      (h::timestamp (h::identity 1002))
+                      (h::data (list :step 1 :action "read-file" :round 4 :turn-id 4
+                                     :target "math_utils.py"))))
+    (let* ((ctx (h::build-context "sigue"))
+           ;; Lo que sale justo detras de la tarjeta de la ronda 2: su REASON.
+           (at (search "T4 R2" ctx))
+           (after (if at (subseq ctx at (min (length ctx) (+ at 300))) "")))
+      (ok (and at (search "SUSTITUIDO" after) (not (search "puede haberse podado" after)))
+          (format nil "el lote de la ronda 2 se lee como sustituido, no como podado: ~S"
+                  after)))))
+
+(deftest relato/la-memoria-durable-va-en-el-mismo-sentido-que-los-turnos
+  ;; MEMORY-CONTEXT-BLOCK hacia SORT ascendente y luego NREVERSE, o sea
+  ;; descendente, mientras la DATA DIVISION va de menor a mayor turno. Y sus
+  ;; entradas NO llevan etiqueta de turno, asi que el modelo no tiene forma de
+  ;; saber cual manda.
+  ;;
+  ;; El efecto real: la ULTIMA linea que se leia era la mas antigua, y se leia
+  ;; como si fuera el estado actual. En la corrida real, 'WROTE.
+  ;; math_utils.py / BYTES = 294' sobre un fichero de 587 bytes.
+  ;;
+  ;; Los dos hechos llevan EL MISMO timestamp a proposito: asi se prueba que el
+  ;; orden no viene del reloj --que en una ronda no ordena nada-- sino del
+  ;; contador de insercion de Rete, que es el desempate de FACT-ORDER-KEY. Con
+  ;; timestamps distintos, el test pasaria tambien con un orden cronologico mal
+  ;; implementado.
+  ;;
+  ;; Los hechos se asertan en el motor de TURNO y se PROMUEVEN, porque es ese
+  ;; el camino real: PROMOTE-DURABLE-FACTS lee del motor de turno y escribe en
+  ;; el de memoria. Asertarlos directamente en el de memoria no probaria nada
+  ;; del mecanismo que se quiere cubrir.
+  (with-turn-engine
+    (reset-turn-engine)
+    (reset-mem-engine)
+    (let ((ts (get-universal-time)))
+      (h::assert (h::harness-fact (h::fact-type "file-write")
+                        (h::timestamp (h::identity ts))
+                        (h::data (list :path "/tmp/proyecto/p1.py" :bytes 294
+                                       :applied t :turn-id 1))))
+      (h::assert (h::harness-fact (h::fact-type "file-write")
+                        (h::timestamp (h::identity ts))
+                        (h::data (list :path "/tmp/proyecto/p2.py" :bytes 587
+                                       :applied t :turn-id 1))))
+      (h::promote-durable-facts)
+      (let* ((mem (with-mem-engine (h::mem-context-block)))
+             (p1 (or (search "p1.py" mem) 0))
+             (p2 (or (search "p2.py" mem) 0)))
+        (ok (and (plusp p1) (plusp p2) (< p1 p2))
+            (format nil "p1 antes que p2, como los turnos: ~S" mem))))))
+
+(deftest relato/plan-y-veredicto-dicen-el-mismo-comando
+  ;; El plan se normalizaba con STRIP-CD-PREFIX y el veredicto se quedaba con
+  ;; el texto crudo. Era la mitad de un arreglo a medias, y se veía en la misma
+  ;; tarjeta:
+  ;;
+  ;;   STEP 03.  EXEC-COMMAND  cd /home/mtk/... && python -m unittest
+  ;;
+  ;; junto a un 'COMMAND = python -m unittest' de otra parte. Dos comandos
+  ;; distintos para el mismo paso, y el modelo sin manera de saber cual se
+  ;; ejecuto.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-test-config (("tool_timeout_seconds" 30))
+      (h::assert-batch-intention
+       (list :action :exec-command
+             :command "cd /tmp/proyecto && echo hola")
+       1)
+      (h::run)
+      (let* ((plans (h::collect-facts-of-type (h::collect-active-facts) "batch-plan"))
+             (verdicts (h::collect-facts-of-type (h::collect-active-facts) "verdict"))
+             (plan-target (h::data-get (car plans) :target))
+             (verdict-target (h::data-get (car verdicts) :target)))
+        (ok (string= "echo hola" plan-target)
+            (format nil "el plan ya va normalizado: ~S" plan-target))
+        (ok (string= plan-target verdict-target)
+            (format nil "y el veredicto dice lo mismo: plan=~S veredicto=~S"
+                    plan-target verdict-target))))))
+
+(deftest relato/un-verdicto-no-normaliza-un-fichero-que-empieza-por-cd
+  ;; La normalizacion es solo para :exec-command, en el plan y ahora tambien en
+  ;; el veredicto. Una ruta con espacios o con un 'cd' legitimo en el nombre
+  ;; no se toca: si se normalizara aqui, el fix habria creado un bug espejo.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-test-config (("tool_timeout_seconds" 30))
+      (h::assert-batch-intention
+       (list :action :write-file :path "cd notas/plan.md" :content "x")
+       1)
+      (h::run)
+      (let* ((verdicts (h::collect-facts-of-type (h::collect-active-facts) "verdict"))
+             (tgt (h::data-get (car verdicts) :target)))
+        (ok (string= "cd notas/plan.md" tgt)
+            (format nil "una ruta no se normaliza: ~S" tgt))))))
+
+(deftest relato/el-aborto-se-lee-como-aborto-y-no-como-poda
+  ;; Un PENDING sin veredicto tiene dos causas que para el modelo son
+  ;; OPUESTAS: se podo, o el turno aborto. Lo segundo no es una perdida, es una
+  ;; decision del harness, y se comporta distinto: lo podado se reintenta, lo
+  ;; abortado hay que replantearlo. Decirle 'puede haberse podado' de un turno
+  ;; que el propio harness mato deja al modelo sin manera de decidir.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        (h::write-file "notas.txt" "contenido")
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
+        (h::run)
+        ;; El turno aborta con estos pasos sin veredicto.
+        (h::assert-batch-intention (list :action :write-file :path "otro.txt"
+                                         :content "x") 2)
+        (let ((steps (mapcar (lambda (d) (h::plan-step-identity d))
+                             (h::collect-facts-of-type
+                              (h::collect-active-facts) "batch-plan"))))
+          (h::assert
+           (h::harness-fact (h::fact-type "batch-abort")
+                             (h::timestamp (h::identity 1700000000.0))
+                             (h::data (list :reason "el modelo repitio el mismo lote"
+                                            :path :batch-repeated
+                                            :iterations 3
+                                            :turn-id (h::current-turn-id)
+                                            :round (h::current-batch-round)
+                                            :steps steps))))
+          (let ((ctx (card-section (build-context "sigue"))))
+            (ok (search "ABORTO" ctx)
+                (format nil "el motivo dice que el turno aborto:~%~A" ctx))
+            (ok (search "repitio el mismo lote" ctx)
+                "y dice POR QUE, no solo que aborto")
+            (ok (not (search "puede haberse podado" ctx))
+                (format nil "y no lo disfraza de poda:~%~A" ctx))))))))
+
+(deftest relato/el-abarto-no-arrastra-a-los-pasos-que-si-se-ejecutaron
+  ;; El motivo de aborto se aplica a los pasos SIN VEREDICTO. Si se colgara de
+  ;; todos los del turno, un turno abortado en su ultima ronda marcaria como
+  ;; 'nunca ejecutado' el paso 1 que si se ejecuto, y el modelo releeria su
+  ;; propio trabajo como perdido.
+  (with-turn-engine
+    (reset-turn-engine)
+    (with-temp-dir (dir)
+      (let ((h::*base-dir* dir))
+        (h::write-file "notas.txt" "contenido")
+        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
+        (h::run)
+        (h::assert-batch-intention
+         (list :action :write-file :path "otro.txt" :content "x") 2)
+        (let* ((plans (h::collect-facts-of-type
+                       (h::collect-active-facts) "batch-plan"))
+               ;; Solo el paso sin veredicto entra en la lista del aborto.
+               (orphan (find-if (lambda (d)
+                                  (string= "otro.txt"
+                                           (h::path-basename (h::data-get d :target))))
+                                plans)))
+          (h::assert
+           (h::harness-fact (h::fact-type "batch-abort")
+                             (h::timestamp (h::identity 1700000000.0))
+                             (h::data (list :reason "se agoto batch_max_iterations"
+                                            :path :iterations
+                                            :turn-id (h::current-turn-id)
+                                            :round (h::current-batch-round)
+                                            :steps (list (h::plan-step-identity orphan))))))
+          (let ((ctx (card-section (build-context "sigue"))))
+            (ok (search "ABORTO" ctx)
+                (format nil "el paso huerfano si nombra el aborto:~%~A" ctx))
+            ;; El paso 1 tiene veredicto APPLIED, asi que la tarjeta lo muestra
+            ;; como tal y no como abortado.
+            (ok (search "STATE = APPLIED" ctx)
+                (format nil "y el que si se ejecuto sigueApplied:~%~A" ctx))))))))
+
+(deftest relato/la-repeticion-no-mata-el-turno
+  ;; Un modelo que pide lo mismo cada ronda NO se corta: cada ronda se ejecuta.
+  ;; Todo en informatica es batch, y repetir no es un error de compilacion.
+  ;;
+  ;; Lo que se comprueba aqui es lo que se pierde si se corta. Con la repeticion
+  ;; como aborto, la ronda repetida no llegaba a ejecutarse y lo unico que el
+  ;; modelo recibia era el motivo del aborto. Sin el, la ronda repetida pasa por
+  ;; Rete como cualquier otra y deja veredicto: el turno tiene una respuesta por
+  ;; cada ronda que se dio, y el corte que queda es el tope de iteraciones, que
+  ;; es una cosa del LLM y no del harness.
+  (with-turn-engine
+    (reset-turn-engine)
+    (h::metrics-reset)
+    (with-test-config (("llm_provider" "batch")
+                       ("llm_stream" nil)
+                       ("batch_repeat_tolerance" 1)
+                       ("batch_max_iterations" 3))
+      (with-mocked-call-llm
+          ((h::parse-llm-batch-to-intentions
+            "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"notas.txt\",\"content\":\"hola\"}}}]}")
+           "otra vez")
+        (h::process-turn "hola" nil))
+      (let* ((aborts (h::collect-facts-of-type
+                      (h::collect-active-facts) "batch-abort"))
+             (verdicts (h::collect-facts-of-type
+                        (h::collect-active-facts) "verdict")))
+        (ok aborts "el corte que queda es el tope de iteraciones, y se aserta")
+        (ok (not (eq :batch-repeated (h::data-get (car aborts) :path)))
+            (format nil "y su causa NO es la repeticion: ~S"
+                    (h::data-get (car aborts) :path)))
+        ;; CADA RONDA QUE ENTRA AL COMPILADOR DEJA VEREDICTO. Con el abortion por
+        ;; repeticion, la segunda ronda no se ejecutaba y esto era 0: el modelo
+        ;; proponia y nadie le contestaba. Eso era la invariante I1 rota.
+        (ok verdicts
+            (format nil "las rondas repetidas dejan veredicto, no silencio: ~D"
+                    (length verdicts)))))))
+
+
+;;;; ===============================================================
+;;;; La .cob se genera desde la memoria de largo plazo
+;;;; ===============================================================
+
+(deftest memoria/el-cob-se-construye-desde-la-memoria-y-no-desde-el-turno
+  "La integracion completa: promover, perder el turno, y construir el .cob.
+
+   Esta es la prueba que ata las tres piezas. Antes, la .cob se armaba con
+   COLLECT-ACTIVE-FACTS --los hechos efimeros del turno en curso-- mientras la
+   memoria de largo plazo guardaba otra cosa. Y la promocion vivia en el
+   LLAMADOR, al final del turno, de modo que dentro del propio turno el modelo
+   estaba leyendo la verdad de antes de empezar.
+
+   Aqui el turno se vacia por completo (RESET-TURN-ENGINE) antes de construir el
+   .cob. Si la .cob saliera de los hechos del turno, saldria vacia; si sale de
+   la memoria, sale entera. Y las tres cosas que el modelo necesita para no
+   perder coherencia --una lectura con su contenido, un plan con su veredicto, y
+   la peticion del usuario-- tienen que estar las tres."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir) (h:*session-id* "s"))
+      (with-turn-engine
+        (reset-turn-engine)
+        (h::add-todo "mirar el fichero" :status "in-progress")
+        (let ((t0 (get-universal-time))
+              (path (format nil "~A/a.txt" dir)))
+          (h::assert (h::harness-fact (h::fact-type "user-input")
+                                      (h::timestamp (identity t0))
+                                      (h::data (list :text "lee a.txt"
+                                                     :turn-id 1))))
+          (h::assert (h::harness-fact (h::fact-type "file-read")
+                                      (h::timestamp (identity (+ t0 1)))
+                                      (h::data (list :path path
+                                                     :applied t
+                                                     :contents "contenido real"
+                                                     :turn-id 1))))
+          (h::assert-batch-intention (list :action :read-file :path "a.txt") 1)
+          (h::assert (h::harness-fact (h::fact-type "verdict")
+                                      (h::timestamp (identity (+ t0 3)))
+                                      (h::data (list :command (format nil "READ-FILE ~A" path)
+                                                     :step 1
+                                                     :round 1
+                                                     :turn-id 1
+                                                     :status "APPLIED"
+                                                     :result "contenido real")))))
+        ;; SE ACABA EL TURNO: se promueve y se vacia. Es el cierre real de
+        ;; PROCESS-TURN -- promover antes de volcar la sesion-- y a partir de
+        ;; aqui no queda ningun hecho efimero.
+        (h::promote-durable-facts)
+        (reset-turn-engine)
+        (ok (null (h::collect-active-facts))
+            "el turno se vacio: no queda ningun hecho vivo")
+        (let ((cobol (build-context "sigue")))
+          (ok (search "contenido real" cobol)
+              (format nil "la lectura cruza con su CONTENIDO:~%~A" cobol))
+          (ok (search "lee a.txt" cobol)
+              (format nil "y el modelo sabe que se le pidio:~%~A" cobol))
+          (ok (search "APPLIED" cobol)
+              (format nil "y el veredicto del paso cruza:~%~A" cobol)))))))
+
+(deftest memoria/promover-es-idempotente-y-el-cob-no-duplica
+  "Promover dos veces no puede cambiar lo que el modelo ve.
+
+   PROMOTE-DURABLE-FACTS se llama una vez por ronda y el motor de turno no se
+   vacia entre rondas: el user-input del turno sigue ahi en la ronda 3. Sin la
+   guarda de la huella (tipo, timestamp y datos), cada ronda volvia a copiarlo
+   a la memoria y el modelo leia N veces la misma peticion.
+
+   Y aqui no se cuenta veces: se compara el .cob entero. Es la invariante que de
+   verdad importa --promover mas no puede cambiar el programa-- y cuenta las
+   repeticiones de cada cosa, que es como se manifesto el defecto cuando
+   existio."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir) (h:*session-id* "s"))
+      (with-turn-engine
+        (reset-turn-engine)
+        (let ((t0 (get-universal-time)))
+          (h::assert (h::harness-fact (h::fact-type "user-input")
+                                      (h::timestamp (identity t0))
+                                      (h::data (list :text "lee a.txt" :turn-id 1))))
+          (h::assert (h::harness-fact (h::fact-type "file-read")
+                                      (h::timestamp (identity (+ t0 1)))
+                                      (h::data (list :path (format nil "~A/a.txt" dir)
+                                                     :applied t
+                                                     :contents "contenido real"
+                                                     :turn-id 1)))))
+        ;; Una promocion, y el .cob de una ronda.
+        (h::promote-durable-facts)
+        (let ((one-ronda (build-context "sigue")))
+          ;; Tres promociones mas, como tres rondas mas del mismo turno.
+          (h::promote-durable-facts)
+          (h::promote-durable-facts)
+          (h::promote-durable-facts)
+          (ok (= 2 (length (h::mem-engine-facts)))
+              (format nil "cuatro promociones, dos hechos: ~S"
+                      (mapcar #'h::fact-type-of (h::mem-engine-facts))))
+          (let ((cuatro-rondas (build-context "sigue")))
+            (ok (string= one-ronda cuatro-rondas)
+                (format nil "y el .cob es EXACTAMENTE el mismo:~%~A~%~A"
+                        one-ronda cuatro-rondas))))))))
+
+(deftest memoria/un-rechazo-tambien-es-durable-pero-nunca-sale-como-WROTE
+  "Lo que no ocurrio es un hecho, y el modelo tiene que poder aprendelo.
+
+   Filtrar la memoria por :applied sacaba de ella justamente los fallos, que es
+   lo unico que el modelo deberia acordarse de cambiar. Pero un rechazo pintado
+   como escritura es la mentira mas cara que puede decir esta division, asi que
+   el RENDER --no la promocion-- es el que tiene que distinguir."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir) (h:*session-id* "s"))
+      (with-turn-engine
+        (reset-turn-engine)
+        (let ((t0 (get-universal-time)))
+          (h::assert (h::harness-fact (h::fact-type "file-write")
+                                      (h::timestamp (identity t0))
+                                      (h::data (list :path (format nil "~A/nope.py" dir)
+                                                     :applied nil
+                                                     :refused t
+                                                     :reason "blind write refused"
+                                                     :turn-id 1)))))
+        (let ((cobol (build-context "sigue")))
+          (ok (search "REFUSED" cobol)
+              (format nil "el rechazo sale como REFUSED:~%~A" cobol))
+          (ok (not (search "WROTE." cobol))
+              (format nil "y NUNCA como WROTE:~%~A" cobol))
+          (ok (search "blind write refused" cobol)
+              (format nil "y el motivo llega al modelo:~%~A" cobol)))))))
+
+
+;;;; ===============================================================
+;;;; El bucle sin salida, y la meta que el veto dejaba abierta
+;;;; ===============================================================
+
+(deftest estancamiento/un-turno-que-no-avanza-no-se-quema-entero
+  "Dos rondas seguidas sin aplicar NADA cortan el turno, y no al final.
+
+   El tope de iteraciones dice cuanto se puede durar; no dice si se esta
+   avanzando. Un turno que se pasa entero proponiendo lo que el harness ya veto
+   cerraba por el mismo motivo que uno que hizo su trabajo, y el operador no
+   tenia forma de distinguir 'no le daba tiempo' de 'no hacia nada'.
+
+   En una corrida real el turno 2 propuso el MISMO READ-FILE en las rondas R2 a
+   R8. Las siete salieron CANCELLED y las siete costaron una llamada al
+   proveedor. Con este corte se para en la segunda."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir))
+      (with-open-file (s (merge-pathnames "notas.txt" dir)
+                         :direction :output :if-exists :supersede)
+        (write-string "hola" s))
+      (with-turn-engine
+        (reset-turn-engine)
+        (h::metrics-reset)
+        (with-test-config (("llm_provider" "batch")
+                           ("llm_stream" nil)
+                           ("batch_max_iterations" 8))
+          ;; Una lectura que se vuelve RANCI: el turno la pide, y luego un edit
+          ;; del mismo fichero la invalida. A partir de ahi, pedirla otra vez no
+          ;; tiene salida, que es exactamente el bucle.
+          (with-mocked-call-llm
+              ((h::parse-llm-batch-to-intentions
+                "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"notas.txt\"}}}]}")
+               "ya esta")
+            (h::process-turn "lee notas.txt" nil))
+          (let* ((aborts (h::collect-facts-of-type
+                          (h::collect-active-facts) "batch-abort"))
+                 (aborted (car aborts)))
+            (ok aborted "el turno sin salida se corta, y se aserta")
+            (ok (eq :estancado (h::data-get aborted :path))
+                (format nil "y el motivo es el estancamiento, no el tope: ~S"
+                        (h::data-get aborted :path)))
+            (ok (< (h::data-get aborted :iterations) 8)
+                (format nil "y no se quemaron las 8 rondas: uso ~D"
+                        (h::data-get aborted :iterations)))
+            (ok (search "sin aplicar nada" (h::data-get aborted :reason))
+                (format nil "y el motivo le dice al modelo QUE PASÓ:~%~A"
+                        (h::data-get aborted :reason)))))))))
+
+
+(deftest estancamiento/el-veto-de-lectura-rancia-no-invita-a-repetir
+  "El motivo de un veto que no entrega nada no puede pedir que se repita.
+
+   Es el unico de los tres vetos que NO reentrega contenido, y por eso es el
+   unico que puede empujar al modelo a un bucle: si le dices 'vuelve a
+   pedirlo', lo que le has dicho es que pedirlo es lo que tiene que hacer. En la
+   corrida real el modelo propuso la misma lectura siete veces seguidas,
+   obedecendo el motivo."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir) (h:*session-id* "s")
+          (path (namestring (merge-pathnames "notas.txt" dir))))
+      (with-open-file (s path :direction :output :if-exists :supersede)
+        (write-string "hola" s))
+      (with-turn-engine
+        (reset-turn-engine)
+        (h::metrics-reset)
+        ;; Leer, luego editar: la lectura queda rancia.
+        (h::read-file "notas.txt")
+        (h::edit-file "notas.txt" "hola" "hola mundo")
+        ;; Y pedirla otra vez.
+        (h::assert-batch-intention
+         (list :action :read-file :path "notas.txt") 1)
+        (let* ((ctx (build-context "sigue"))
+               (proc (procedure-section ctx))
+               (line (format nil "~A" ctx)))
+          (ok (search "CANCELLED" proc)
+              "la lectura rancia se cancela")
+          (ok (not (search "Vuelve a pedir la lectura" line))
+              (format nil "y el motivo NO le pide que la vuelva a pedir:~%~A" line))
+          (ok (search "NO LO PIDAS OTRA VEZ" line)
+              (format nil "y le dice explicitamente que no lo pida:~%~A" line)))))))
+
+
+(deftest estancamiento/el-detector-de-bucle-esta-conectado-al-camino-batch
+  "TOOL-LOOP-WARNING tiene que responder en el camino batch, no solo en el
+   imperativo.
+
+   Estaba conectado a CALL-LLM-WITH-TOOLS y a STREAM-LLM-WITH-TOOLS, los dos
+   del camino imperativo. El proveedor batch --el de la configuracion por
+   defecto-- no lo consultaba. Un detector que solo mira un camino no ve el
+   bucle del otro, y el del otro es el que se ejecuta.
+
+   En la corrida real el turno 2 leyo el mismo fichero 7 veces seguidas y
+   DETECT-READ-LOOP, que existe y esta probado, no dio una sola vez."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir))
+      (with-open-file (s (merge-pathnames "notas.txt" dir)
+                         :direction :output :if-exists :supersede)
+        (write-string "hola" s))
+      (with-turn-engine
+        (reset-turn-engine)
+        (h::metrics-reset)
+        (setf h::*loop-alerted-turn* nil)
+        ;; Umbral de 2 para que el detector llegue a hablar ANTES que el corte
+        ;; de estancamiento, que necesita dos rondas seguidas sin aplicar nada.
+        ;; Los dos compiten por el mismo turno y el que gana es el que tiene un
+        ;; mensaje mejor: el detector nombra el fichero y cuenta las veces. Con
+        ;; el umbral de 4 de produccion, el estancamiento llegaria antes, y eso
+        ;; estaria bien -- pero seria el corte de seguridad hablando, no el
+        ;; detector, y lo que se quiere comprobar aqui es el cableado.
+        (let ((h::*read-loop-min-count* 2))
+          (with-test-config (("llm_provider" "batch")
+                             ("llm_stream" nil)
+                             ("batch_max_iterations" 8))
+          ;; Un lote que SI se ejecuta, y luego siete que piden lo mismo.
+          (with-mocked-call-llm
+              ((h::parse-llm-batch-to-intentions
+                "{\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"notas.txt\"}}}]}")
+               "sigue")
+            (h::process-turn "lee notas.txt" nil))
+          (let* ((aborts (h::collect-facts-of-type
+                          (h::collect-active-facts) "batch-abort"))
+                 (aborted (car aborts)))
+            (ok aborted "el bucle se corta, y se aserta como hecho")
+            (ok (eq :tool-loop (h::data-get aborted :path))
+                (format nil "y el motivo es el bucle, no el tope: ~S"
+                        (h::data-get aborted :path)))
+            (ok (search "notas.txt" (h::data-get aborted :reason))
+                (format nil "y el motivo NOMBRA el fichero que se relee:~%~A"
+                        (h::data-get aborted :reason)))
+            (ok (< (h::data-get aborted :iterations) 8)
+                (format nil "y no se quemaron las 8 rondas: uso ~D"
+                        (h::data-get aborted :iterations))))))))))
+
+
+(deftest memoria/una-meta-no-se-queda-abierta-porque-su-evidencia-expirara
+  "La meta se cierra con la evidencia de la MEMORIA, no con la del motor de turno.
+
+   El .cob se genera desde la red de largo plazo. La reconciliacion de metas
+   seguia leyendo el motor de turno, o sea OTRA red para la misma verdad, y las
+   dos pueden discrepar. Discreparon.
+
+   En una corrida real: la meta 'Write utils.py' se abrio en el turno 2, la
+   escritura se aplico y quedo durable, y en el turno 5 la meta seguia
+   ABIERTA. Con fact_ttl_seconds = 120 y doce minutos entre uno y otro,
+   PRUNE-EXPIRED ya habia retractado el file-write del motor de turno, y una
+   meta cuya evidencia ya no existe no se cierra nunca.
+
+   Y no era cosmético: GOAL ABIERTO. N en cero es lo que habilita DONE. Una
+   meta que no se cierra nunca es una sesion que no puede terminar."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir)
+          (h:*session-id* "s")
+          (path (format nil "~A/utils.py" dir)))
+      (with-test-config (("fact_ttl_seconds" 120))
+        (with-turn-engine
+          (reset-turn-engine)
+          ;; La escritura del turno 2, con la HORA de entonces: hace diez
+          ;; minutos, o sea fuera del TTL de dos.
+          (let ((h::*turn-counter* 2))
+            (h::assert
+             (h::harness-fact (h::fact-type "file-write")
+                              (h::timestamp (identity (- (get-universal-time) 600)))
+                              (h::data (list :path path
+                                             :applied t
+                                             :bytes 6
+                                             :turn-id 2))))
+            ;; Y la meta que abrio ese mismo turno, sin cerrar. El turno importa:
+            ;; TODO-SATISFIED-P acepta evidencia del mismo turno aunque sea mas
+            ;; vieja que la meta, y por ahi se cierra una meta repetida dentro
+            ;; del mismo turno. Sin esa excepcion, una escritura de hace diez
+            ;; minutos no cerraria la meta que abrio hace cinco.
+            (h::add-todo (format nil "Write ~A" path) :status "in-progress"))
+          ;; PROMUEVE PRIMERO, que es lo que pasa en produccion: el cierre del
+          ;; turno promueve con el hecho fresco, y ya en el turno siguiente la
+          ;; copia del motor de turno caduca mientras la de la memoria larga no.
+          ;; Promover despues no serviria de nada, porque para entonces
+          ;; PRUNE-EXPIRED ya se habia llevado la unica copia.
+          (h::promote-durable-facts)
+          (h::run)
+          (ok (null (h::collect-facts-of-type (h::collect-active-facts)
+                                              "file-write"))
+              "la evidencia caduco en el motor de turno y ya no esta")
+          (let* ((h::*turn-counter* 5)
+                 (cobol (build-context "sigue")))
+            (ok (search "WROTE." cobol)
+                (format nil "pero el .cob la ve: sale de la memoria larga:~%~A" cobol))
+            (ok (search "GOAL ABIERTO. 0" cobol)
+                (format nil "y la meta se cierra con esa misma evidencia:~%~A" cobol))))))))
+
+
+(deftest metas/un-comando-que-sale-bien-cierra-su-meta
+  "Una meta de COMANDO se cierra en el momento en que el comando se ejecuta.
+
+   Reconciliar metas es buscar la evidencia de que se hicieron, y esa busqueda
+   tiene dos relojes que pueden borrar la respuesta antes de que llegue:
+   PRUNE-EXPIRED (fact_ttl_seconds = 120 en produccion) y el cap por tipo. Las
+   metas de comando son las que mas lo sufren porque un comando que sale
+   bien NO es durable -- con acierto, porque no cambia nada que el modelo no vea
+   -- asi que su unico registro es el veredicto, y el veredicto tambien se capa.
+
+   En una corrida real quedaron abiertas tres metas de comando ya ejecutadas:
+
+       todo-9  Run: ls -la ...              (turno 3, exit 0)
+       todo-25 Run: ls -la ...              (turno 4, exit 0)
+       todo-30 Run: python3 -m unittest ... (turno 5, exit 0)
+
+   Con GOAL ABIERTO. N en cero como condition de DONE, tres metas filtradas son
+   una sesion que no puede terminar."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir) (h:*session-id* "s"))
+      (with-test-config (("fact_ttl_seconds" 120))
+        (with-turn-engine
+          (reset-turn-engine)
+          ;; La meta, abierta.
+          (h::add-todo "Run: ls -la" :status "in-progress")
+          ;; El comando se ejecuta y sale bien.
+          (h::assert-step-verdict
+           (list :action :exec-command :command "ls -la" :step 1
+                 :turn-id 1 :round 1)
+           (list :exit-code 0))
+          ;; A los dos minutos la evidencia de la ejecucion es historica, y el
+          ;; comando que salio bien no es durable. Aun asi la meta se cerraba
+          ;; al instante, y por eso sigue cerrada mucho despues.
+          (let ((h::*turn-counter* 3))
+            (h::run)
+            (let ((cobol (build-context "sigue")))
+              (ok (search "GOAL ABIERTO. 0" cobol)
+                  (format nil "la meta del comando se cerro:~%~A" cobol))))
+          ;; Y una meta FALLIDA se queda abierta, que es lo que GOAL ABIERTO
+          ;; tiene que significar: el usuario pidio una cosa y no se hizo.
+          (h::add-todo "Run: rm -rf /" :status "in-progress")
+          (h::assert-step-verdict
+           (list :action :exec-command :command "rm -rf /" :step 2
+                 :turn-id 3 :round 1)
+           (list :exit-code 1 :output "permiso denegado"))
+          (h::run)
+          (let ((cobol (build-context "sigue")))
+            (ok (search "GOAL ABIERTO. 1" cobol)
+                (format nil "pero la que fallo sigue abierta:~%~A" cobol))))))))
+(deftest metas/un-paso-veteado-no-deja-una-meta-que-nunca-cierra
+  "Un paso que una regla impugna no puede dejar una meta abierta.
+
+   AUTO-CREATE-TODO-ON-ACTION tiene salience 20 y los vetos tienen 15, asi que
+   la meta se abre ANTES de que el veto decida. La intencion sigue viva cuando
+   la mira la regla de veto, y por eso crea su meta igual. Y como el veto no es
+   una ejecucion --no hay :applied-- esa meta no la cierra nadie nunca.
+
+   En una corrida real: el turno 6 ejecuto `python3 -m unittest test_all.py`
+   (APPLIED, y la meta de esa ronda se cerro), y en las rondas 2 y 3 propuso lo
+   mismo otra vez. Las dos se vetaron como duplicado, las dos abrieron meta, y
+   el .cob final cerro con GOAL ABIERTO. 1 -- con la tarea HECHA y los tests en
+   verde.
+
+   GOAL ABIERTO. N en cero es lo que habilita DONE: una meta que no cierra
+   nunca es una sesion que no puede terminar."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir) (h:*session-id* "s"))
+      (with-turn-engine
+        (reset-turn-engine)
+        (h::metrics-reset)
+        ;; Ronda 1: el comando sale bien y su meta se cierra.
+        (h::assert-batch-intention
+         (list :action :exec-command :command "echo listo") 1)
+        (h::run)
+        ;; Ronda 2: el MISMO comando, que el veto de duplicado impugna.
+        (h::assert-batch-intention
+         (list :action :exec-command :command "echo listo") 2)
+        (h::run)
+        (let ((cobol (build-context "sigue")))
+          (ok (search "CANCELLED" cobol)
+              "el repetido se veto")
+          (ok (search "GOAL ABIERTO. 0" cobol)
+              (format nil "y el veto NO deja una meta colgada:~%~A" cobol)))))))

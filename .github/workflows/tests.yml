@@ -1,0 +1,47 @@
+name: tests
+
+# El suite es OFFLINE por contrato: durante la corrida DEXADOR:POST se
+# sustituye por una señal, así que una fuga de red falla ruidosa en vez de
+# gastar una llamada real contra el proveedor. Esto significa que el CI no
+# necesita ninguna clave de API: corre entero sin secretos.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar SBCL
+        run: sudo apt-get update && sudo apt-get install -y sbcl
+
+      # run-tests.sh usa ~/quicklisp/setup.lisp si existe, y si no descarga
+      # Quicklisp a un temporal. En un runner limpio no existe: por eso el
+      # suite se queda autocontenido y este workflow no necesita secretos.
+      - name: Suite offline
+        run: ./run-tests.sh
+
+      - name: Compilar sin errores (warnings a la vista)
+        # Los style-warnings son la señal barata de un error latente: un
+        # "variable definida pero no usada" en un DEFUN suele ser un argumento
+        # que se leyó mal y una referencia que se leyó de más -- exactamente
+        # la forma que tomo el system-prompt ausente de su lambda list. Este
+        # paso deja la señal visible en el log; no falla el build porque SBCL
+        # no devuelve código distinto por avisos.
+        run: |
+          set -euo pipefail
+          QL="$(mktemp -d)"
+          curl -fsSL -o "$QL/quicklisp.lisp" https://beta.quicklisp.org/quicklisp.lisp
+          sbcl --noinform --non-interactive \
+            --eval '(require :asdf)' \
+            --eval "(load \"$QL/quicklisp.lisp\")" \
+            --eval '(ql:quickload :cl-harness)' \
+            2>&1 | tee "$QL/build.log"
+          echo "---"
+          echo "Errores fatales (deben ser 0):"
+          grep -cE "^; caught [0-9]+ (fatal )?ERROR" "$QL/build.log" || true
+          rm -rf "$QL"

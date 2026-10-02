@@ -30,6 +30,42 @@
           (babel:octets-to-string buf :encoding :utf-8 :errorp nil))))))
 
 
+(defun write-file-atomically (full contents)
+  "Write CONTENTS to FULL via a sibling temporary file plus RENAME(2).
+
+   Escribir directo sobre el destino con :IF-EXISTS :SUPERSEDE deja el archivo
+   en cero si el proceso muere a mitad del WRITE-STRING: SIGKILL, OOM, un
+   Ctrl-C en el instante equivocado. El harness escribe codigo fuente de
+   proyectos reales, asi que ese final no es una degradacion tolerable: es
+   perder el fichero del usuario.
+
+   El temporal va en el MISMO directorio que el destino porque RENAME(2) solo
+   es atomico dentro del mismo sistema de ficheros: entre directorios se
+   degrada a copiar-borrar, que es exactamente el fallo que se queria evitar.
+   El temporal se borra en el camino de error, o se acumularian .tmp-orphan
+   junto a cada fichero que no se pudo escribir.
+   Devuelve T."
+  (let* ((dir (merge-pathnames "" (or (uiop:pathname-directory-pathname full)
+                                       #P"./")))
+         (tmp (merge-pathnames
+               (format nil ".~A.~A.tmp"
+                       (or (pathname-name full) "out")
+                       (get-universal-time))
+               dir)))
+    (unwind-protect
+         (progn
+           (with-open-file (s tmp :direction :output :if-exists :supersede
+                                :if-does-not-exist :create)
+             (write-string contents s))
+           ;; RENAME(2) es atomico: un lector concurrente ve el fichero viejo
+           ;; entero o el nuevo entero, nunca un estado intermedio.
+           (rename-file tmp full))
+      ;; Solo cuando el rename NO llego a ocurrir. Si si ocurrio, TMP ya no
+      ;; existe y DELETE-FILE soloiria.
+      (when (probe-file tmp)
+        (ignore-errors (delete-file tmp))))))
+
+
 (defun resolve-path (path)
   "Resolve a RELATIVE PATH against the harness base directory, so the LLM
    can reference project files without absolute paths."
@@ -239,9 +275,8 @@
                                 new-string
                                 (subseq contents (+ pos (length old-string)))))
                  (hits (count-occurrences contents old-string)))
-            (ensure-directories-exist full)
-            (with-open-file (s full :direction :output :if-exists :supersede)
-              (write-string new-contents s))
+(ensure-directories-exist full)
+             (write-file-atomically full new-contents)
             (assert (harness-fact (fact-type "file-edit")
                                   (timestamp (get-universal-time))
                                   (data (list :path (namestring full)
@@ -249,6 +284,25 @@
                                               :replaced-chars (length old-string)
                                               :new-chars (length new-string)
                                               :matches hits
+                                              ;; LOS DOS TEXTOS, y no solo sus
+                                              ;; longitudes. PREVENT-DUPLICATE-EDIT
+                                              ;; compara el edit propuesto con el
+                                              ;; ya aplicado para decir 'este ya lo
+                                              ;; hiciste', y sin ellos la
+                                              ;; comparacion era (STRING= NIL NIL):
+                                              ;; CIERTA, osea que la regla podia
+                                              ;; impugnar cualquier edit del turno.
+                                              ;; Como no los llevaba, la regla
+                                              ;; NUNCA disparo y su test pasaba
+                                              ;; porque fabricaba a mano un
+                                              ;; file-edit que si los tenía.
+                                              ;;
+                                              ;; Dos edits del mismo archivo con
+                                              ;; la misma longitud no son el mismo
+                                              ;; edit, y confundirlos habria
+                                              ;; cancelado trabajo de verdad.
+                                              :old-string old-string
+                                              :new-string new-string
                                               :turn-id (current-turn-id)))))
             (list :path (namestring full)
                   :applied t
@@ -269,9 +323,35 @@
    them mid-way, corrupting the workspace."
   ;; ACÁ AGREGAMOS LA LIMPIEZA DE SALTOS DE LÍNEA:
   (let* ((full (resolve-path path))
-         (clean-content (cl-ppcre:regex-replace-all "\\\\n" content (string #\Newline)))
-         (clean-content (cl-ppcre:regex-replace-all "\\\\t" clean-content (string #\Tab))))
-    (when (probe-file full)
+         (ok (stringp content)))
+    ;; La validacion de TIPOS vivia solo en el normalizador batch, asi que la
+    ;; ruta de tools nativas podia llamar a WRITE-FILE con un CONTENT que no
+    ;; era string (el hash-table del JSON, un numero) y REGEX-REPLACE-ALL
+    ;; senialaba a mitad de la accion. La guarda que protege al usuario de un
+    ;; fichero corrupto tiene que vivir en la ACCION, no en uno de sus dos
+    ;; caminos de entrada: es la misma politica I2 que la del old_string vacio
+    ;; en EDIT-FILE.
+    (unless ok
+      (let ((why (format nil "write_file requires string content, got ~A: the content argument must be a JSON string."
+                             (type-of content))))
+        (assert (harness-fact (fact-type "file-write")
+                              (timestamp (get-universal-time))
+                              (data (list :path (namestring full)
+                                          :applied nil
+                                          :refused t
+                                          :reason why
+                                          :turn-id (current-turn-id)))))
+        (return-from write-file
+          (list :path (namestring full)
+                :applied nil
+                :refused t
+                :reason why))))
+    (let ((clean-content
+            (cl-ppcre:regex-replace-all
+             "\\\\t"
+             (cl-ppcre:regex-replace-all "\\\\n" content (string #\Newline))
+             (string #\Tab))))
+      (when (probe-file full)
       (let ((size (with-open-file (s full) (file-length s))))
         (when (> size 2000)
           ;; I2 + I6: la negativa se ASERTA y usa :reason, el mismo nombre que
@@ -292,17 +372,16 @@
                     :applied nil
                     :refused t
                     :reason why))))))
-    (ensure-directories-exist full)
-    ;; ACÁ USAMOS CLEAN-CONTENT EN VEZ DE CONTENT:
-    (with-open-file (s full :direction :output :if-exists :supersede)
-      (write-string clean-content s))
-    ;; ACÁ TAMBIÉN USAMOS CLEAN-CONTENT:
-    (let ((bytes (length clean-content)))
-      (assert (harness-fact (fact-type "file-write")
-                            (timestamp (get-universal-time))
-                            (data (list :path (namestring full)
-                                        :applied t
-                                        :bytes bytes
-                                        :turn-id (current-turn-id)))))
-      (list :path (namestring full) :applied t :bytes bytes))))
+      (ensure-directories-exist full)
+      ;; ACÁ USAMOS CLEAN-CONTENT EN VEZ DE CONTENT:
+      (write-file-atomically full clean-content)
+      ;; ACÁ TAMBIÉN USAMOS CLEAN-CONTENT:
+      (let ((bytes (length clean-content)))
+        (assert (harness-fact (fact-type "file-write")
+                              (timestamp (get-universal-time))
+                              (data (list :path (namestring full)
+                                          :applied t
+                                          :bytes bytes
+                                          :turn-id (current-turn-id)))))
+        (list :path (namestring full) :applied t :bytes bytes)))))
 

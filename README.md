@@ -310,18 +310,30 @@ archivo, pero hoy no está conectado a la detección; no cuenta como re-lectura.
 
 ### 4. Memoria a largo plazo (promoción y persistencia)
 
-Al final de cada turno, `process-turn` llama a `promote-durable-facts`:
+El `.cob` **se genera desde la red de largo plazo**, así que la promoción ocurre al
+principio de `build-context`, una vez por ronda, y no al final del turno: promoted al
+final, el modelo de la ronda 2 recibía un contexto hecho con la memoria del turno
+*anterior* — dentro del propio turno estaba leyendo la verdad de antes de empezar.
+Al cerrarse el turno se vuelve a promover, para volcar la sesión con la memoria completa.
 
-1. Recorre los hechos del motor de turno y, para cada uno **durable**
-   (`durable-type-p`), lo re-aserta en el motor de memoria.
+1. Recorre los hechos del motor de turno **en orden causal** y, para cada uno
+   **durable** (`durable-type-p`), lo re-aserta en el motor de memoria con el
+   timestamp **del hecho**, no el de ahora.
 2. Corre `(run)` en el motor de memoria (aplica `mem-dedup-durable`, que deja
    única la versión más nueva de cada clave).
-3. Re-aplica caps por tipo (`retract-oldest-of-type` sobre `command-exec` y
-   `file-write`) para que la memoria quede acotada.
+3. `prune-long-term-memory` acota la memoria por tipo y empareja la poda de las
+   tarjetas con la de sus veredictos.
 
-`durable-type-p` = **command-exec con error real** (`real-error-p`: exit ≠ 0,
-con evidencia, no timeout) **o** `file-write` (una acción realmente tomada sobre
-el proyecto). La conversación **no** es durable.
+`durable-type-p` no pregunta «¿esto es importante?», sino «¿sin esto puede el
+modelo seguir trabajando?`. Y hay tres cosas que necesita: **qué es verdad ahora**
+(`file-read` *con su contenido*, `file-write`, `file-edit`, aplicados o no), **qué
+pasó con lo que pidió** (`batch-plan` y `verdict`, la pareja que cierra el bucle) y
+**qué se le pidió y qué contestó** (`user-input`, `llm-response`). Los `command-exec`
+sólo cruzan si son **errores reales** (`real-error-p`: exit ≠ 0, con evidencia, no
+timeout): uno que fue bien no cambió nada que el modelo no pueda ver por su cuenta, y
+uno que falló es un muro que va a volver a encontrarse. El andamiaje intraturno no
+entra: `intention` —una intención que nunca se ejecutó es un borrador, no un hecho—,
+`batch-abort`, `tool-loop`.
 
 `boot-memory` (al arrancar un proceso/sesión nueva) resetea ambos motores, carga
 `dumps/longterm-mem.lisp` en el motor de memoria y corre sus reglas. Lo que
@@ -439,10 +451,16 @@ resultado como mensaje de rol `tool` y re-llama. Las herramientas expuestas son:
 - `write_file` (crear archivo): delega en `write-file`. **Guard:** si el destino
   ya existe con contenido significativo (> 2000 bytes), se **rechaza** y se
   indica usar `edit_file` (evita que modelos débiles re-emitan archivos grandes
-  y los trunquen).
+  y los trunquen). Otro guard: si `content` no es un string, se rechaza con
+  motivo en lugar de señalar a mitad de la escritura.
 - `edit_file` (edición quirúrgica): delega en `edit-file`; reemplaza la primera
   ocurrencia exacta de `old_string` por `new_string`. Es la vía principal para
   modificar archivos existentes (cuesta pocos tokens y no reescribe todo).
+
+Ambas escrituras pasan por `write-file-atomically`: temporal hermano +
+`rename(2)`. Escribir directo sobre el destino deja el archivo en cero si el
+proceso muere a mitad, y aquí los archivos son código fuente del proyecto del
+usuario.
 
 De este modo *toda* salida observable que el modelo ve pasa también por la
 memoria de hechos y alimenta el pruning de turnos futuros.
@@ -506,11 +524,14 @@ El flujo es:
    intenciones pendientes cuando aparece un error real de comando, y
    `cancel-intentions-on-abort` consume cualquier `batch-abort`.
 
-`detect-blind-writes` se ejecuta en cada ronda: un `write_file` o `edit_file`
-sobre un archivo existente sin una lectura previa genera `batch-abort` y evita
-reescribir archivos a ciegas. Las lecturas, escrituras y comandos siguen
-alimentando los mismos hechos, reglas de podado y detección de loops que el
-modo normal.
+`detect-blind-writes` se ejecuta en cada ronda: una intención `edit_file` sobre
+un archivo sin una lectura previa en el turno genera `batch-abort` y evita
+reescribir archivos a ciegas. Solo cubre `edit_file`, no `write_file` — y no por
+descuido: `write_file` es para archivos **nuevos** por diseño, y lleva su propio
+guard (rechaza destinos existentes de más de 2 000 bytes). Editar un fichero que
+no se ha leído sí es el caso peligroso, y es el que la regla corta. Las lecturas,
+escrituras y comandos siguen alimentando los mismos hechos, reglas de podado y
+detección de loops que el modo normal.
 
 ### 8. Streaming en vivo (opencode-style)
 
@@ -836,16 +857,20 @@ dependencias.
 
 ## Validación realizada
 
-- *Offline (0 llamadas API)*: **suite automatizada de 96 tests / 335 checks, `RESULTADO: OK`**
+- *Offline (0 llamadas API)*: **suite automatizada de 108 tests, `RESULTADO: OK`**
   (`./run-tests.sh`, código 0). Cubre aislamiento entre motores, reglas
   por engine (incl. `mem-dedup-durable` en el motor de memoria), detección de
   loops, sin falsos positivos, promoción durable (se conservan
   errores/escrituras, no la conversación), `MEMORY DIVISION` en el
   contexto, dump/restore/boot-memory, parser y normalización batch, dedup/TTL,
-  topes por tipo, guardas de escritura, métricas, topes del bucle batch y
-  política de reintentos HTTP. El suite es offline **por contrato**: durante la
-  corrida `dexador:post` se sustituye por una señal, de modo que una fuga de
-  red falle en vez de gastar una llamada real.
+  topes por tipo, guardas de escritura, métricas, topes del bucle batch,
+  política de reintentos HTTP, **el path de transporte** (los constructores de
+  mensajes y el orden de tool-calls) y **la escritura atómica**. El suite es
+  offline **por contrato**: durante la corrida `dexador:post` se sustituye por
+  una señal, de modo que una fuga de red falle en vez de gastar una llamada real.
+  **CI:** `.github/workflows/tests.yml` lo corre en cada push y PR, y no
+  necesita ninguna clave de API. `run-tests.sh` instala Quicklisp en un
+  temporal si no encuentra `~/quicklisp/setup.lisp`.
 - *En vivo (OpenRouter/DeepSeek)*:
   - arreglar un test que fallaba → `pytest` 32/32 PASS;
   - **levantar un servicio** uvicorn y **verificarlo** por HTTP (`/api/state`
@@ -925,9 +950,10 @@ Arranque directo con SBCL + Quicklisp (el proyecto se encuentra vía
 - **Suite de tests** (offline, sin llamadas al proveedor):
 
   ```shell
-  ./run-tests.sh              # 96 casos; exit 0 = todo pasó
+  ./run-tests.sh              # 108 casos; exit 0 = todo pasó
   ./run-tests.sh metrics      # sólo los casos cuyo nombre coincide
   ./run-tests.sh config/retry # sólo los de reintentos HTTP
+  ./run-tests.sh transport/   # sólo los del path de transporte
   ```
 
 - **Config/dir base alternativos** vía entorno:
