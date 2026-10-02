@@ -559,12 +559,12 @@ y desde entonces nadie lo ha leido.
                                              :test #'string=)
                                    (string= (path-basename (data-get d :path)) base))
                            collect (cons type f)))
-         (applied-writes (loop for entry in touching
-                               when (and (eql (car entry) "file-write")
+(applied-writes (loop for entry in touching
+                               when (and (string= (car entry) "file-write")
                                          (data-get (fact-data-of (cdr entry)) :applied))
-                                 collect (cdr entry)))
+                                  collect (cdr entry)))
          (newer-reads (loop for entry in touching
-                             when (and (eql (car entry) "file-read")
+                             when (and (string= (car entry) "file-read")
                                        (loop for w in applied-writes
                                              thereis (fact-order-before-p
                                                       (fact-order-key (cdr entry))

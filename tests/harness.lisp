@@ -160,6 +160,31 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
 (defun read-temp (path)
   (h::read-file-contents path))
 
+(defun seed-file (dir name content)
+  "Pone NAME en DIR con CONTENT SIN pasar por la acción WRITE-FILE.
+
+   Importa porque las pruebas de veto tienen dos fixtures que parecen el mismo y
+   no lo son. '(H::WRITE-FILE \"notas.txt\" ...)' aserta un hecho FILE-WRITE con
+   :applied t, y ese hecho es lo que hace que WRITTEN-UNREAD-P diga T: PREVENT-
+   REDUNDANT-READ-AFTER-WRITE cancela la lectura y NO reentrega, porque el
+   contenido lo puso el propio modelo y ya esta en su write_file.
+
+   Las pruebas de REENTREGA no van de eso. Van de 'el harness YA LEYO este
+   fichero y se lo vuelve a entregar', que es el caso de PREVENT-DUPLICATE-READ, y
+   ese veto no cancela por un write sino por un READ. Con el fixture viejo --
+   escribir y luego leer -- las dos reglas empataban a proposito y ganaba la
+   nueva, asi que la prueba dejo de probar lo que dice que probar.
+
+   Con este helper el fichero aparece en disco sin que nadie lo escribiera en este
+   turno, que es justo la situacion que prueba el veto de reentrega: el fichero ya
+   estaba ahi antes de que el modelo empezara."
+  (let ((full (merge-pathnames name dir)))
+    (ensure-directories-exist full)
+    (with-open-file (s full :direction :output :if-exists :supersede
+                        :if-does-not-exist :create)
+      (write-string content s))
+    full))
+
 (defun jzon-list (value)
   "Coerce VALUE to a list. Jzon devuelve los arrays JSON como vectores y en este
    Lisp CAR/FIRST/MAPCARE no aceptan vectores, hay que pasarlos por LIST."
@@ -3398,11 +3423,18 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
   ;; turno: en vez de un no seco, recibe lo que ya tenia. El veto sigue siendo
   ;; un veto -- la lectura no se repite -- pero ahora hay algo que hacer con lo
   ;; que ya se sabia.
+  ;;
+  ;; El fichero lo deja SEED-FILE y no WRITE-FILE, y no es un detalle: este veto
+  ;; cancela por un READ, no por un write. Si el fixture escribiera con WRITE-FILE,
+  ;; PREVENT-REDUNDANT-READ-AFTER-WRITE --que tiene mas salience-- cancelaria
+  ;; tambien esta lectura y sin reentregar, porque el contenido lo habria puesto
+  ;; el propio modelo. Entonces la prueba dejaria de medir el veto de
+  ;; reentrega. Ver SEED-FILE.
   (with-turn-engine
     (reset-turn-engine)
     (with-temp-dir (dir)
       (let ((h::*base-dir* dir))
-        (h::write-file "notas.txt" "contenido real de notas")
+        (seed-file dir "notas.txt" "contenido real de notas")
         (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
         (h::run)
         ;; Segunda peticion del mismo fichero, en el mismo turno.
@@ -3429,7 +3461,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
     (reset-turn-engine)
     (with-temp-dir (dir)
       (let ((h::*base-dir* dir))
-        (h::write-file "notas.txt" "contenido real")
+        (seed-file dir "notas.txt" "contenido real")
         (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
         (h::run)
         (h::assert-batch-intention (list :action :read-file :path "notas.txt") 2)
@@ -3453,10 +3485,14 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
     (reset-turn-engine)
     (with-temp-dir (dir)
       (let ((h::*base-dir* dir))
-        (h::write-file "notas.txt" "contenido ORIGINAL")
+        (seed-file dir "notas.txt" "contenido ORIGINAL")
         (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
         (h::run)
-        ;; El turno MODIFICA el fichero.
+        ;; El turno MODIFICA el fichero. Esta si tiene que ser WRITE-FILE: el
+        ;; veto que se prueba aqui es el de contenido RANCIADO, y para que el
+        ;; contenido este vencido tiene que existir un write NUEVO despues del
+        ;; read. Un SEED-FILE aqui no asertaria hecho y la lectura no se
+        ;; cancelaria.
         (h::assert-batch-intention
          (list :action :write-file :path "notas.txt" :content "contenido NUEVO")
          2)
@@ -3488,7 +3524,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
     (reset-turn-engine)
     (with-temp-dir (dir)
       (let ((h::*base-dir* dir))
-        (h::write-file "notas.txt" "contenido real de notas")
+        (seed-file dir "notas.txt" "contenido real de notas")
         (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
         (h::run)
         (h::assert-batch-intention (list :action :read-file :path "notas.txt") 2)
@@ -3509,8 +3545,7 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
     (with-temp-dir (dir)
       (with-test-config (("max_tool_result_chars" 200))
         (let ((h::*base-dir* dir))
-          (h::write-file "grande.txt"
-                         (make-string 5000 :initial-element #\x))
+          (seed-file dir "grande.txt" (make-string 5000 :initial-element #\x))
           (h::assert-batch-intention (list :action :read-file :path "grande.txt") 1)
           (h::run)
           (h::assert-batch-intention (list :action :read-file :path "grande.txt") 2)
@@ -3700,6 +3735,15 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
   ;;
   ;; El orden correcto es el de los HECHOS, que es lo que un lector espera de
   ;; un relato de lo que paso.
+  ;;
+  ;; Los dos ficheros son DISTINTOS a proposito. Releer el mismo que se acaba de
+  ;; escribir es justo lo que veta PREVENT-REDUNDANT-READ-AFTER-WRITE --el
+  ;; contenido lo puso el modelo y ya lo tiene-- y ese read no llega a ejecutarse,
+  ;; asi que no habria linea que ordenar. Aqui lo que se prueba es el ORDEN, asi
+  ;; que el segundo fichero se siembra con SEED-FILE: la lectura se ejecuta de
+  ;; verdad y las dos acciones coexisten. La asimetria que importa sigue intacta:
+  ;; alfabeticamente 'read' va antes que 'wrote', y el resumen tiene que decir al
+  ;; reves.
   (with-turn-engine
     (reset-turn-engine)
     (with-temp-dir (dir)
@@ -3709,7 +3753,8 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
         (h::assert-batch-intention
          (list :action :write-file :path "notas.txt" :content "nuevo") 1)
         (h::run)
-        (h::assert-batch-intention (list :action :read-file :path "notas.txt") 2)
+        (seed-file dir "otro.txt" "lo que se lee")
+        (h::assert-batch-intention (list :action :read-file :path "otro.txt") 2)
         (h::run)
         (let* ((s (h::turn-action-summary (h::current-turn-id)))
                (wrote (search "wrote" s))
@@ -3992,11 +4037,15 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
   ;; todos los del turno, un turno abortado en su ultima ronda marcaria como
   ;; 'nunca ejecutado' el paso 1 que si se ejecuto, y el modelo releeria su
   ;; propio trabajo como perdido.
+  ;;
+  ;; SEED-FILE y no WRITE-FILE en el paso 1 por lo mismo de siempre: tiene que
+  ;; LLEGAR A EJECUTARSE para dejar veredicto APPLIED, y releer un fichero que el
+  ;; propio test acaba de escribir lo veta PREVENT-REDUNDANT-READ-AFTER-WRITE.
   (with-turn-engine
     (reset-turn-engine)
     (with-temp-dir (dir)
       (let ((h::*base-dir* dir))
-        (h::write-file "notas.txt" "contenido")
+        (seed-file dir "notas.txt" "contenido")
         (h::assert-batch-intention (list :action :read-file :path "notas.txt") 1)
         (h::run)
         (h::assert-batch-intention
@@ -4546,10 +4595,6 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
          (list :action :read-file :path "app.py") 2)
         (h::run)
         (let ((cobol (build-context "sigue")))
-          (ok (h::written-unread-p "app.py")
-              (format nil "DIAGNOSTICO: la funcion dice que el fichero esta escrito y sin leer. Tipos presentes: ~A"
-                      (mapcar #'h::fact-type-of
-                              (h::collect-active-facts))))
           (ok (search "CANCELLED" cobol)
               (format nil "una relectura de lo que el modelo escribio se veta:~%~A" cobol))
           (ok (search "TU escribiste ese fichero" cobol)
