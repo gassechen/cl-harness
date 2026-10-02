@@ -4463,3 +4463,131 @@ Devuelve (fallos . total) leyendo las estadísticas de Rove."
               "el repetido se veto")
           (ok (search "GOAL ABIERTO. 0" cobol)
               (format nil "y el veto NO deja una meta colgada:~%~A" cobol)))))))
+
+(deftest protocolo/el-protocolo-batch-nunca-autoriza-una-respuesta-vacia
+  "El protocolo batch NO puede ofrecerle al modelo la opcion de no contestar.
+
+   Decirlo era UNA FRASE en GET-BATCH-INSTRUCTIONS:
+
+     'An empty \"response\" is also valid when the actions speak for themselves.'
+
+   Y el modelo la uso. En una corrida real el turno 6 ejecuto los tests y el
+   modelo, al cerrar, devolvio las dos ultimas rondas con 43 tokens cada una y
+   un 'response' vacio. Sin respuesta no hay nada que mostrarle a quien pregunta,
+   y el .cob cerraba con un parte de operaciones en vez de un informe: los tests
+   habian pasado con exit 0 y eso no llego a existir como frase.
+
+   Lo peligroso de esa frase es que era una AUTORIZACION, no una sugerencia.
+   Cualitativamente es lo mismo que el ejemplo copiable de 'the final answer' que
+   ya se elimino de este mismo protocolo: las dos son senioras que el modelo
+   puede copiar literalmente, y las dos produceron un turno mudo.
+
+   Y el comentario tiene que ser del porque, no del qué: sin el motivo, la
+   proxima persona que lea el protocolo va a pensar que una respuesta vacia es
+   una optimizacion legitima y la vuelve a escribir."
+  (let ((instructions (h::get-batch-instructions)))
+    (ng (search "An empty" instructions)
+        "el protocolo ya no ofrece la respuesta vacia como opcion valida")
+    ;; OJO: lo que se busca es la AUTORIZACION --'is also valid'-- y no la
+    ;; expresion 'speak for themselves', que sobrevive a proposito en la frase
+    ;; nueva ('When the actions speak for themselves, still say their RESULT').
+    ;; Buscar la expresion entera haria que el test obligara a Prohibir el
+    ;; lenguaje en vez de la excepcion, y el proximo que lo tocara volveria a
+    ;; autorizar el silencio con otra redaccion.
+    (ng (search "is also valid" instructions)
+        "y desaparecio la clausula que la autorizaba, no solo su primera mitad")
+    ;; La razon de por que la respuesta no puede estar vacia: quien pregunta no
+    ;; ve las tool_calls. Sin esto, la prohibicion parece arbitraria y el
+    ;; proxima que la escriba va a devolverla.
+    (ok (search "never sees the tool calls" instructions)
+        (format nil "y el motivo queda escrito: quien pregunta no ve las tool_calls:~%~A"
+                instructions))
+    ;; Y una instruccion positiva: cuando las acciones ya hablan, el modelo dice
+    ;; el RESULTADO en palabras. Sin esto, quitar la prohibicion deja al modelo
+    ;; sin destino y vuelve a callarse.
+    (ok (search "still say their RESULT" instructions)
+        (format nil "y hay un destino: decir el resultado en palabras:~%~A"
+                instructions))))
+
+(deftest protocolo/una-relectura-de-lo-que-el-modelo-acaba-de-escribir-se-veta
+  "Escribir un fichero y volver a pedirlo en el mismo turno es una ida y vuelta
+   VACIA: los bytes los produjo el modelo hace un momento y estan en el contexto
+   de origen, en los argumentos de su propio write_file.
+
+   Las dos reglas de relectura que ya existian necesitan un hecho FILE-READ para
+   casar --('?fr-fact (harness-fact (fact-type \"file-read\") ...))-- asi que ahi no
+   hay nada que casar y la peticion pasaba de largo. El caso que cubrian es
+   read->read y read->write->read. El write->read se caia entre los dos.
+
+   En la corrida real el turno escribio interval_audit.py y test_interval_audit.py,
+   corrio los tests --que no tocan ficheros-- y en las rondas 5, 6, 7 y 8 los
+   pidio de nuevo a los dos. Cuatro rondas de releer lo que acababa de emitir. Con
+   el pool de modelos al 50% y 37 segundos por llamada fueron cuatro llamadas
+   enteras para obtener los mismos bytes dos veces.
+
+   Y el veto NO reentrega el contenido, y esa es la mitad del asunto. Reenviarlo
+   seria mandarle dos veces el mismo texto: el modelo lo emitio, ya esta en su
+   contexto. En PREVENT-DUPLICATE-READ reenviar SI es necesario --el texto venia
+   de fuera y hace rondas que no lo tiene a mano--, pero aqui seria tirar tokens.
+   La ida y vuelta no cuesta el contenido, cuesta la ronda."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir) (h:*session-id* "s"))
+      (with-turn-engine
+        (reset-turn-engine)
+        (h::metrics-reset)
+        ;; El modelo escribe el fichero.
+        (h::assert-batch-intention
+         (list :action :write-file :path "app.py" :content "print(1)") 1)
+        (h::run)
+        (ok (probe-file (merge-pathnames "app.py" dir))
+            "el fichero se escribio de verdad")
+        ;; Y ahora lo pide de vuelta. Esto es lo que antes pasaba de largo.
+        (h::assert-batch-intention
+         (list :action :read-file :path "app.py") 2)
+        (h::run)
+        (let ((cobol (build-context "sigue")))
+          (ok (h::written-unread-p "app.py")
+              (format nil "DIAGNOSTICO: la funcion dice que el fichero esta escrito y sin leer. Tipos presentes: ~A"
+                      (mapcar #'h::fact-type-of
+                              (h::collect-active-facts))))
+          (ok (search "CANCELLED" cobol)
+              (format nil "una relectura de lo que el modelo escribio se veta:~%~A" cobol))
+          (ok (search "TU escribiste ese fichero" cobol)
+              "y el motivo le dice DE QUE lo tiene, no solo que no puede pedirlo")
+          (ok (not (search "print(1)" cobol))
+              "y NO se reentrega el contenido: se lo mando dos veces si se hiciera")
+          (ok (search "GOAL ABIERTO. 0" cobol)
+              "el veto cierra la meta que el veto dejo abierta"))))))
+
+(deftest protocolo/una-relectura-tras-un-comando-si-pasa
+  "El veto de arriba tiene un caso legitimo que NO puede tocar: si algo toco el
+   fichero entre la escritura y la lectura, releer vale.
+
+   Aca el write_file lo ejecuto el harness, con su exit code, y no puede fallar a
+   medias. Si lo que cambio el disco fue un exec-command, un editor u otro
+   proceso, eso no es un hecho file-write de este turno: WRITTEN-UNREAD-P devuelve
+   NIL y la lectura pasa.
+
+   Un veto que se tragara este caso dejaria al modelo mirando un fichero que no
+   conoce, escribiendo a ciegas. Es el modo de fallo caro de endurecer de mas: no
+   es una ronda desperdiciada, es trabajo equivocado."
+  (with-temp-dir (dir)
+    (let ((h::*base-dir* dir) (h:*session-id* "s"))
+      (with-turn-engine
+        (reset-turn-engine)
+        (h::metrics-reset)
+        (h::assert-batch-intention
+         (list :action :write-file :path "app.py" :content "print(1)") 1)
+        (h::run)
+        ;; Un comando que PODIA haber tocado el fichero, entre la escritura y la
+        ;; lectura. No lo reescribe, pero el harness no puede saberlo.
+        (h::assert-batch-intention
+         (list :action :exec-command :command "echo hola") 2)
+        (h::run)
+        ;; La lectura sigue siendo razonable.
+        (h::assert-batch-intention
+         (list :action :read-file :path "app.py") 3)
+        (h::run)
+        (let ((cobol (build-context "sigue")))
+          (ok (search "APPLIED" cobol)
+              (format nil "con un comando en medio, la relectura NO se veta:~%~A" cobol)))))))

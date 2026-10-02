@@ -522,6 +522,77 @@
         t
         nil)))
 
+(defun written-unread-p (path)
+  "T si lo ULTIMO que toco PATH en este turno fue el propio modelo ESCRIBIENDOLO,
+y desde entonces nadie lo ha leido.
+
+   Es el hermano de STALE-READ-P, y cubre el caso que ahi no aparece: una lectura
+   de un fichero que el modelo acaba de escribir y que nunca ha leido. Las otras
+   dos reglas necesitan un hecho file-read para casar, asi que ahi no hay nada
+   que casar y la peticion pasa: el modelo escribe el fichero y tres rondas
+   despues lo vuelve a pedir.
+
+   La corrida real que lo motivo: el turno escribio interval_audit.py y
+   test_interval_audit.py, corrio los tests --que no tocan ficheros-- y en las
+   rondas 5, 6, 7 y 8 los pidio de nuevo a los dos. Cuatro rondas de ida y vuelta
+   sobre bytes que el modelo acababa de emitir, sin que nada entre medias
+   hubiera cambiado el disco. Con el pool de modelos al 50% --37 segundos por
+   llamada-- fueron cuatro llamadas enteras.
+
+   Y aqui NO se reentrega el contenido, a diferencia de PREVENT-DUPLICATE-READ, y
+   es deliberado por una razon de tokens: el texto lo produjo el propio modelo en
+   el turno, esta en el contexto de origen --los argumentos de su write_file--, y
+   reenviarlo se lo mandaria DOS VECES. La ida y vuelta no cuesta el contenido,
+   cuesta la ronda.
+
+   Ojo al caso legitimo que este veto NO puede tocar: escribir un fichero y
+   releerlo para comprobar que quedo bien. Aqui no hay nada que comprobar porque
+   el harness ejecuto la escritura y tiene el exit code; la escritura no puede
+   fallar a medias. Si el fichero lo cambio OTRO actor --un exec-command, un
+   editor, otro proceso-- eso no es un hecho file-write de este turno, asi que la
+   funcion devuelve NIL y la lectura pasa."
+  (let* ((base (path-basename path))
+         (touching (loop for f in (mapcar #'first (retrieve (?f) (?f (harness-fact))))
+                         for d = (fact-data-of f)
+                         for type = (fact-type-of f)
+                         when (and (member type '("file-write" "file-edit" "file-read")
+                                             :test #'string=)
+                                   (string= (path-basename (data-get d :path)) base))
+                           collect (cons type f)))
+         (applied-writes (loop for entry in touching
+                               when (and (eql (car entry) "file-write")
+                                         (data-get (fact-data-of (cdr entry)) :applied))
+                                 collect (cdr entry)))
+         (newer-reads (loop for entry in touching
+                             when (and (eql (car entry) "file-read")
+                                       (loop for w in applied-writes
+                                             thereis (fact-order-before-p
+                                                      (fact-order-key (cdr entry))
+                                                      (fact-order-key w))))
+                               collect (cdr entry))))
+    (and applied-writes (null newer-reads) t)))
+
+(defrule prevent-redundant-read-after-write (:salience 17)
+  "El modelo pide leer un fichero que EL MISMO escribio en este turno y que desde
+   entonces nadie ha leido. Es una ida y vuelta vacia: los bytes ya estan en su
+   contexto de origen.
+
+   Salience 17: por encima de 16 para ganarle a PREVENT-DUPLICATE-READ-AFTER-WRITE
+   cuando las dos casan, y por debajo de 20 para no adelantarse a la creacion de
+   metas --si dispara antes, el veto deja una meta colgada--. Cuando ambas pueden
+   disparar --hubo una lectura ANTES de la escritura-- gana esta, y gana bien: la
+   otra cancela sin reentregar porque el texto que tiene es rancio, y esta
+   cancela sin reentregar porque el texto que tiene es NUEVO y esta en la llamada
+   del propio modelo. La misma decision, mejor informada."
+  (?intent (harness-fact (fact-type "intention") (data ?d)))
+  (test (eql (data-get ?d :action) :read-file))
+  (test (written-unread-p (data-get ?d :path)))
+  =>
+  (assert-step-cancelled
+   ?d
+   "CANCELADO, y NO se reenvia el contenido: TU escribiste ese fichero en este turno, asi que el texto esta en tu propia llamada a write_file, no se pierde al cancelar. Nada lo ha tocado desde entonces. Si lo que quieres es otra cosa --un fragmento, una comprobacion-- dilo en el texto de tu respuesta en vez de volver a pedir el fichero entero, que reread no lo va a hacer mas barato.")
+  (retract ?intent))
+
 (defun detect-read-loop ()
   "Scan the CURRENT turn for repeated *reads/probes* of the SAME file:
    - file-read facts (keyed by basename of the resolved path),

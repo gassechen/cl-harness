@@ -1070,7 +1070,7 @@ batch_execution_mode:
     - Use the ToolUse-compatible shape: {\"tool_calls\":[{\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"file.py\"}}}],\"response\":\"\"}.
     - Allowed function names: read_file, write_file, edit_file, exec_command.
     - Arguments must be a JSON object with exactly the fields required by that function.
-    - For a final answer with no more actions, return {\"tool_calls\":[],\"response\":\"<your answer to the user>\"}. Put the real answer there, written for the person who asked: never a placeholder, never the word "final", and never a copy of this instruction. An empty \"response\" is also valid when the actions speak for themselves.
+    - For a final answer with no more actions, return {\"tool_calls\":[],\"response\":\"<your answer to the user>\"}. Put the real answer there, written for the person who asked: never a placeholder, never the word \"final\", and never a copy of this instruction. The \"response\" must NOT be empty. The person asking never sees the tool calls: an empty answer leaves them with no answer at all, only a log of what was touched. When the actions speak for themselves, still say their RESULT in words -- an exit code that means success is the answer, not an omission.
   rules:
     - Emit actions, not descriptions. Order tool_calls from first action to last.
     - Do not repeat actions already present in the context.
