@@ -400,6 +400,24 @@
   (retract ?intent))
 
 
+(defrule prevent-read-of-just-written-file (:salience 17)
+  "Si el LLM pide leer un archivo que acaba de escribir (y nadie lo ha leído desde entonces),
+   se cancela la lectura. El modelo ya conoce el contenido porque lo generó.
+   Conecta la función WRITTEN-UNREAD-P con el motor de intenciones."
+  (?intent (harness-fact (fact-type "intention") (data ?d)))
+  (test (eql (data-get ?d :action) :read-file))
+  (test (written-unread-p (data-get ?d :path)))
+  =>
+  (assert-step-cancelled
+   ?d
+   (format nil "STATE_CONFIRMED: El archivo '~A' fue escrito exitosamente en este turno y aún no ha sido leído. Ya posees su contenido en tu contexto porque tú lo generaste. No es necesario leerlo de nuevo. PROCEDE AL SIGUIENTE PASO de tu plan."
+           (data-get ?d :path))
+   nil)
+  (retract ?intent))
+
+
+
+
 (defun detect-tool-loop ()
   "Scan the CURRENT turn's command-exec facts for a repeating failing family.
    Returns three values (FAMILY COUNT COMMANDS) when at least *loop-min-count*
