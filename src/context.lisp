@@ -1134,7 +1134,48 @@
                    (format s "        EVIDENCE = ~A~%"
                            (cobol-block (truncate-payload
                                          (or (data-get data :output) "")))))
-                 ((string= type "file-write")
+;; LO QUE EL MODELO YA LEYO, y por que ahora viaja aqui.
+                  ;;
+                  ;; FILE-READ ya era durable (ENGINES.LISP lo lista) pero esta
+                  ;; division no lo imprimia: de una lectura solo salia su
+                  ;; carpeta en la DATA DIVISION, y como los hechos se podan con
+                  ;; MAX-FACTS-PER-TYPE, al turno siguiente el modelo se
+                  ;; encontraba con 'BYTES = 8951' y nada mas. Veia el tamano de
+                  ;; un fichero que no tenia delante.
+                  ;;
+                  ;; Con eso el modelo tiene que releer, y releer cuesta una
+                  ;; llamada entera para recibir algo que el harness ya tiene en
+                  ;; la mano. Y peor: entre la lectura y la siguiente respuesta el
+                  ;; contenido vuelve a quedarse fuera, asi que el turno N+1
+                  ;; vuelve a empezar sin el fichero. Medido en cuatro corridas:
+                  ;; el modelo escribio, leyo, vio el error exacto de una linea,
+                  ;; y aun asi reescribio el fichero entero porque en el momento
+                  ;; de arreglarlo ya no tenia el contenido delante.
+                  ;;
+                  ;; La razon de fondo no es de economia sino de geometria del
+                  ;; contexto: con el contenido a la vista, el modelo puede
+                  ;; ENFRENTAR lo que tiene con lo que le pasa --una linea con un
+                  ;; corchete de mas, un assert que no cuadra-- y decidir el
+                  ;; cambio minimo. Sin el, solo le queda reemitir, que es
+                  ;; precisamente lo que hacen bien cuando les funciona.
+                  ;;
+                  ;; SIN TRUNCAR, a proposito. Un fichero a medias --cortado por
+                  ;; el presupuesto a la mitad de una linea-- es peor que no
+                  ;; verlo: el modelo razona sobre codigo que no existe y
+                  ;; Arregla un fichero que no es el suyo. Si el presupuesto
+                  ;; aprieta, el recorte tiene que caer entero, fuera del bloque,
+                  ;; no por dentro.
+                  ((string= type "file-read")
+                   (if (data-get data :applied)
+                       (progn
+                         (format s "    READ. ~A~%" (cobol-value (or (data-get data :path) "")))
+                         (format s "        CONTENTS =~%~A~%"
+                                 (cobol-block (or (data-get data :contents) ""))))
+                       (progn
+                         (format s "    READ-FAILED. ~A~%" (cobol-value (or (data-get data :path) "")))
+                         (when (data-get data :reason)
+                           (format s "        REASON = ~A~%" (data-get data :reason))))))
+                  ((string= type "file-write")
                   (if (data-get data :applied)
                       (progn
                         (format s "    WROTE. ~A~%" (cobol-value (or (data-get data :path) "")))

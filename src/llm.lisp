@@ -246,11 +246,15 @@
 (defun gemini-p ()
   (string-equal (llm-provider) "gemini"))
 
+(defun freellm-p ()
+  (string-equal (llm-provider) "freellm"))
+
 (defun openai-compat-endpoint ()
   (or (llm-endpoint)
       (cond
         ((openrouter-p) "https://openrouter.ai/api/v1/chat/completions")
         ((groq-p) "https://api.groq.com/openai/v1/chat/completions")
+        ((freellm-p) (error "FreeLLM requiere llm_endpoint configurado"))
         (t "https://api.openai.com/v1/chat/completions"))))
 
 (defun openai-compat-headers ()
