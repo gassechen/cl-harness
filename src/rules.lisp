@@ -362,23 +362,10 @@
                        :turn-id (data-get ?da :turn-id))))))
 
 
+
 (defrule prevent-duplicate-read (:salience 15)
-  "Si el LLM pide leer un archivo que ya leyó en este turno, se le devuelve el
-   contenido que YA TENEMOS en vez de un no.
-
-   Se aserta el CANCELADO antes de retractar. Antes retractaba y no escribía
-   nada: el paso se quedaba sin veredicto, la tarjeta caía al fallback
-   PENDING y el REASON culpaba a una poda que no había pasado. El paso
-   tenía que llegar a un estado terminal para que PENDING significara una sola
-   cosa.
-
-   Y el CANCELADO lleva el :CONTENTS del file-read que lo motivo. Un no sin
-   contenido es un callejon sin salida: en una corrida real el modelo pidio
-   cinco veces el mismo fichero, recibio cinco veces 'ya se leyo en este turno',
-   y las cinco rondas se gastaron en un rechazo que no le advancingaba nada --
-   con el fichero entero en la memoria del harness. Elmotivo del veto esta a
-   la vista en el patron (?fr-data), asi que devolverlo es lo unico que
-   convierte el rechazo en respuesta."
+  "Si el LLM pide leer un archivo que ya leyó en este turno, se le confirma 
+   el estado y se le guía al siguiente paso en lugar de solo negar."
   (?intent (harness-fact (fact-type "intention") (data ?d)))
   (test (eql (data-get ?d :action) :read-file))
   (?fr-fact (harness-fact (fact-type "file-read") (data ?fr-data)))
@@ -387,42 +374,16 @@
                       (path-basename (data-get ?d :path)))))
   (test (not (stale-read-p ?fr-fact)))
   =>
-  (assert-step-cancelled
-   ?d
-   "CANCELADO y REENTREGADO: el archivo ya se leyó en este turno y su contenido está más abajo. No hace falta volver a pedirlo."
-   (data-get ?fr-data :contents))
+  (assert-step-cancelled  ?d
+			  (format nil "STATE_CONFIRMED: Ya posees el contenido de '~A' en tu contexto. No es necesario leerlo de nuevo. PROCEDE AL SIGUIENTE PASO DE TU PLAN"
+				  (data-get ?d :path))
+			  (data-get ?fr-data :contents))
   (retract ?intent))
 
+
 (defrule prevent-duplicate-read-after-write (:salience 16)
-  "El mismo veto, pero cuando el fichero SE ESCRIBIO despues de la lectura.
-
-   Sale en la regla de al lado y no como un (TEST (NOT ...)) en esta porque el
-   veto tiene que ocurrir SIEMPRE: lo unico que cambia es si ademas entrega el
-   contenido. Con un solo patron mas un (TEST ...) se tendria que decidir el
-   motivo antes de firrar el paso, y Rete no puede.
-
-   Sin este caso, escribir un fichero y releerlo para comprobarlo daba un
-   'CANCELADO' con el texto ANTERIOR. El modelo se creia que tenia el fichero
-   actualizado cuando lo que tenia era la version a la que acababa de
-   sustituir -- el peor de los dos fallos, porque para que el modelo se entere
-   hay queDSMANTELAR algo que parece una entrega.
-
-   Y EL MOTIVO NO INVITA A REPETIR. Este es el unico veto de los tres que NO
-   reentrega contenido, y por eso es el unico que puede empujar al modelo a un
-   bucle: si le dices 'vuelve a pedirlo', lo que le has dicho es que pedirlo es
-   lo que tiene que hacer. En una corrida real el turno 2 propuso
-   READ-FILE math_utils.py en las rondas R2 a R8 -- siete rondas, siete
-   llamadas al proveedor -- y las siete salieron CANCELLED con este mismo
-   texto, byte a byte. El modelo estaba obedeciendo.
-
-   El veto no se puede satisfacer dentro del turno: cualquier edit vuelve
-   rancio para siempre cualquier lectura posterior de ese fichero, asi que la
-   unica salida es dejar de pedirlo. El motivo dice eso, y no lo contrario.
-
-   Y el bucle, ademas, ya no es la unica red de seguridad: DETECTAR-ESTANCAMIENTO
-   en el bucle de rondas corta el turno cuando dos rondas seguidas no aplican
-   nada. Aca se dice la verdad del paso; alla se paga el coste de no hacer
-   caso."
+  "Cuando el fichero se escribió después de la lectura, se confirma el éxito 
+   de la escritura y se instruye avanzar, sin asumir el lenguaje de programación."
   (?intent (harness-fact (fact-type "intention") (data ?d)))
   (test (eql (data-get ?d :action) :read-file))
   (?fr-fact (harness-fact (fact-type "file-read") (data ?fr-data)))
@@ -433,10 +394,10 @@
   =>
   (assert-step-cancelled
    ?d
-   "CANCELADO, y el contenido NO se reentrega: el archivo se modificó en este turno después de leerlo, así que lo que se leyó ya está rancio. NO LO PIDAS OTRA VEZ en este turno: no hay forma de que se te entregue, porque la última modificación es la que lo vuelve rancio. Si necesitas el texto actual, termina el turno y dilo en el siguiente."
+   (format nil "STATE_CONFIRMED: El archivo '~A' fue modificado exitosamente en este turno. Ya posees su contenido completo en tu contexto porque tú mismo lo generaste. No es necesario leerlo de nuevo. PROCEDE AL SIGUIENTE PASO de tu plan "
+           (data-get ?d :path))
    nil)
   (retract ?intent))
-
 
 
 (defun detect-tool-loop ()
@@ -572,26 +533,6 @@ y desde entonces nadie lo ha leido.
                                collect (cdr entry))))
     (and applied-writes (null newer-reads) t)))
 
-(defrule prevent-redundant-read-after-write (:salience 17)
-  "El modelo pide leer un fichero que EL MISMO escribio en este turno y que desde
-   entonces nadie ha leido. Es una ida y vuelta vacia: los bytes ya estan en su
-   contexto de origen.
-
-   Salience 17: por encima de 16 para ganarle a PREVENT-DUPLICATE-READ-AFTER-WRITE
-   cuando las dos casan, y por debajo de 20 para no adelantarse a la creacion de
-   metas --si dispara antes, el veto deja una meta colgada--. Cuando ambas pueden
-   disparar --hubo una lectura ANTES de la escritura-- gana esta, y gana bien: la
-   otra cancela sin reentregar porque el texto que tiene es rancio, y esta
-   cancela sin reentregar porque el texto que tiene es NUEVO y esta en la llamada
-   del propio modelo. La misma decision, mejor informada."
-  (?intent (harness-fact (fact-type "intention") (data ?d)))
-  (test (eql (data-get ?d :action) :read-file))
-  (test (written-unread-p (data-get ?d :path)))
-  =>
-  (assert-step-cancelled
-   ?d
-   "CANCELADO, y NO se reenvia el contenido: TU escribiste ese fichero en este turno, asi que el texto esta en tu propia llamada a write_file, no se pierde al cancelar. Nada lo ha tocado desde entonces. Si lo que quieres es otra cosa --un fragmento, una comprobacion-- dilo en el texto de tu respuesta en vez de volver a pedir el fichero entero, que reread no lo va a hacer mas barato.")
-  (retract ?intent))
 
 (defun detect-read-loop ()
   "Scan the CURRENT turn for repeated *reads/probes* of the SAME file:

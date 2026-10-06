@@ -1079,6 +1079,9 @@ batch_execution_mode:
     - Emit actions, not descriptions. Order tool_calls from first action to last.
     - Do not repeat actions already present in the context.
     - Before write_file or edit_file on an existing path, include a read_file action for that path in the same batch; never overwrite a file you have not read.
+    - If you just wrote or edited a file, you already know its content. Do not request a read_file for it in the next round; proceed directly to the next logical action (e.g., executing the code or tests).
+    - COMPLETENESS & VERIFICATION: Creating or modifying code is only the first half of the task. If the user's request implies execution, testing, or verification, you MUST include an exec_command action to execute and verify it.
+    - Do not emit an empty tool_calls array (which signals task completion) until you have executed the necessary verification steps and observed a successful outcome.
     - For specific function or variable searches inside files, use (exec-command \"grep -n 'pattern' file\") instead of read_file. Only use read_file when you need the full context of a small file.
     - read_file arguments: {\"path\":\"absolute or relative path\"}.
     - write_file arguments: {\"path\":\"new file path\",\"content\":\"full file content\"}.
@@ -1095,6 +1098,7 @@ batch_execution_mode:
     final: |
       {\"tool_calls\":[],\"response\":\"All requested work is complete.\"}
 ~%"))
+
 
 
 (defun batch-blank-string-p (value)
